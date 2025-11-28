@@ -309,7 +309,9 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       if (!mip.current_round_tensor_list.empty() && round >= 0 &&
           round < static_cast<int32_t>(mip.current_round_tensor_list.size())) {
         mip.current_round_tensor = mip.current_round_tensor_list[round];
+        mip.current_round = round;
       }
+      mip.beam_width = inputs.micro_inputs[0].beam_width;
     }
     auto hidden_states =
         model_executor_->forward(flatten_tokens_micro_batches,
@@ -345,7 +347,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
                             top_tokens,
                             top_logprobs,
                             sequence_group,
-                            round_tensor,
+                            round,
                             out_token_ids,
                             out_token_index,
                             out_log_probs,
@@ -395,7 +397,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
                                unshared_v_cache,
                                inputs.concated_block_tables,
                                out_beam_count_prefix_sums,
-                               round_tensor,
+                               round,
                                beam_width,
                                layer_num);
       }
