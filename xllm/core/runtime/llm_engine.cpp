@@ -269,6 +269,9 @@ Engine::KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   } else {
     slot_size = 2 * dtype_size * head_dim_ * n_local_kv_heads_;
   }
+  if (FLAGS_max_decode_rounds > 0) {
+    slot_size *= FLAGS_max_decode_rounds;
+  }
   kv_cache_cap.slot_size = slot_size;
   kv_cache_cap.n_layers = args_.n_layers();
 
@@ -312,16 +315,34 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, block_size, 1, args_.qk_rope_head_dim()});
   } else {
-#if defined(USE_NPU) || defined(USE_CUDA)
+#if defined(USE_CUDA)
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
+#elif defined(USE_NPU)
+    if (FLAGS_max_decode_rounds > 0) {
+      kv_cache_shape.emplace_back(std::vector<int64_t>{kv_cache_cap.n_blocks,
+                                                       block_size,
+                                                       n_local_kv_heads_,
+                                                       FLAGS_max_decode_rounds,
+                                                       head_dim_});
+      kv_cache_shape.emplace_back(std::vector<int64_t>{kv_cache_cap.n_blocks,
+                                                       block_size,
+                                                       n_local_kv_heads_,
+                                                       FLAGS_max_decode_rounds,
+                                                       head_dim_});
+    } else {
+      kv_cache_shape.emplace_back(std::vector<int64_t>{
+          kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
+      kv_cache_shape.emplace_back(std::vector<int64_t>{
+          kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
+    }
 #elif defined(USE_MLU)
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, n_local_kv_heads_, block_size, head_dim_});
     kv_cache_shape.emplace_back(std::vector<int64_t>{
-        kv_cache_cap.n_blocks, n_local_kv_heads_, block_size, head_dim_});
+        kv_cache_cap.n_blocks, n_local_kv_heads_, block_size, , head_dim_});
 #endif
   }
 
@@ -330,13 +351,20 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
 
   // initialize block manager
   BlockManagerPool::Options options;
+  // simplify when use max_decode round.
+  bool enable_prefix_cache =
+      options_.enable_prefix_cache() && FLAGS_max_decode_rounds == 0;
+  bool enable_kvcache_store =
+      options_.enable_kvcache_store() && FLAGS_max_decode_rounds == 0;
+  auto host_blocks_factor =
+      FLAGS_max_decode_rounds == 0 ? options_.host_blocks_factor() : 0.0;
   options.num_blocks(kv_cache_cap.n_blocks)
       .block_size(block_size)
-      .host_num_blocks(kv_cache_cap.n_blocks * options_.host_blocks_factor())
-      .enable_prefix_cache(options_.enable_prefix_cache())
+      .host_num_blocks(kv_cache_cap.n_blocks * host_blocks_factor)
+      .enable_prefix_cache(enable_prefix_cache)
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_cache_upload(options_.enable_cache_upload())
-      .enable_kvcache_store(options_.enable_kvcache_store());
+      .enable_kvcache_store(enable_kvcache_store);
   kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 
   // init kv cache for each worker in parallel
@@ -654,10 +682,58 @@ bool LLMEngine::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
   return true;
 }
 
+ForwardOutput LLMEngine::step_multi_round(std::vector<Batch>& batch) {
+  Timer timer;
+  DCHECK(dp_size_ == batch.size())
+      << "Split DP batch failed with dp_size as " << dp_size_
+      << " and actual batch size as " << batch.size() << ".";
+  auto batched_raw_forward_inputs = prepare_inputs(batch);
+  DCHECK(dp_size_ == batched_raw_forward_inputs.size())
+      << "The processed raw forward inputs size "
+      << batched_raw_forward_inputs.size() << " is not equal to dp size "
+      << dp_size_ << ".";
+  std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
+  futures.reserve(worker_clients_num_);
+  for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
+    auto dp_rank = worker_rank / dp_local_tp_size_;
+    futures.emplace_back(worker_clients_[worker_rank]->step_async(
+        batched_raw_forward_inputs[dp_rank]));
+  }
+  auto results = folly::collectAll(futures).get();
+  size_t dp_rank = 0;
+  for (auto worker_rank = 0; worker_rank < worker_clients_num_;
+       worker_rank += dp_local_tp_size_) {
+    auto result = results[worker_rank].value();
+    if (result.has_value()) {
+      if (result.value().outputs.empty() && layer_forward_interrupted_) {
+        throw ForwardInterruptedException();
+      }
+      auto& raw = result.value();
+      if (!raw.beam_sequence_group.empty()) {
+        batch[dp_rank].process_beam_sequence_group(raw);
+      } else {
+        batch[dp_rank].process_decode_beam_search_output(raw, false);
+      }
+    } else {
+      LOG(FATAL) << "Failed to execute model, result has no value";
+    }
+    ++dp_rank;
+  }
+  COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
+  // finish all sequences in the batch
+  for (auto& b : batch) {
+    b.finish();
+  }
+  return {};
+}
+
 ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
   if (worker_clients_.empty()) {
     // empty worker, return
     return {};
+  }
+  if (FLAGS_max_decode_rounds > 0) {
+    return step_multi_round(batch);
   }
   Timer timer;
   DCHECK(dp_size_ == batch.size())
@@ -667,6 +743,8 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
   // prepare input with DP and multi-stream parallel, 2-D micro batches
   // batched_raw_forward_inputs[dp_size][micro_batch_size]
   // currently we use two batch overlap(TBO), each micro_batch_size is 2.
+  // step_uid removed
+
   auto batched_raw_forward_inputs = prepare_inputs(batch);
   DCHECK(dp_size_ == batched_raw_forward_inputs.size())
       << "The processed raw forward inputs size "
@@ -676,7 +754,7 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
 
-  // update dp related global paramters and then execute model
+  // prefill stage: update dp related global paramters and then execute model
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
     auto dp_rank = worker_rank / dp_local_tp_size_;
     futures.emplace_back(worker_clients_[worker_rank]->step_async(
@@ -692,6 +770,7 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
 
   assert(dp_size_ == worker_clients_num_ / dp_local_tp_size_);
   size_t dp_rank = 0;
+
   for (auto worker_rank = 0; worker_rank < worker_clients_num_;
        worker_rank += dp_local_tp_size_) {
     auto result = results[worker_rank].value();
@@ -699,21 +778,85 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
       if (result.value().outputs.empty() && layer_forward_interrupted_) {
         throw ForwardInterruptedException();
       }
-      // if src_seq_idxes is not empty, skip sample output processing and
-      // process beam search output instead
       if (result.value().src_seq_idxes.size() == 0) {
-        // set second input param enable_schedule_overlap to false,
-        // if it's not enabled, process_sample_output will append the real
-        // token, if it's enabled, this false here will append the fake token in
-        // process_sample_output
+        // 普通采样路径：更新序列，追加1个生成token
+        VLOG(1) << "process_sample_output after prefill"
+                << ", outputs.size=" << result.value().outputs.size();
         batch[dp_rank].process_sample_output(result.value(), false);
       } else {
+        // Beam-search 预填充路径：需要将预填充输出写回序列，
+        // 以保证进入beam解码时 q_seq_len=1（使用刚生成的token）
+        LOG(INFO) << "process_beam_search_output after prefill";
         batch[dp_rank].process_beam_search_output(result.value(), false);
       }
     } else {
       LOG(FATAL) << "Failed to execute model, result has no value";
     }
     ++dp_rank;
+  }
+  dp_rank = 0;
+  int32_t max_decode_rounds = FLAGS_max_decode_rounds;
+  int32_t head_num =
+      static_cast<int32_t>(args_.n_kv_heads().value_or(args_.n_heads()));
+  int32_t head_dim = args_.head_dim();
+  // derive beam width from sequences in current step and validate consistency
+  int32_t beam_width = batch[0][0]->sampling_param()->beam_width;
+  if (beam_width <= 0) {
+    beam_width = 1;  // default to 1 when beam search is disabled
+  }
+  int32_t batch_size = batch.size();
+
+  // decode stage: execute model
+  // 标记所有序列进入 step-level decode 轮次（禁止全局 KV 递增）
+  for (auto dp = 0; dp < batch.size(); ++dp) {
+    for (size_t si = 0; si < batch[dp].size(); ++si) {
+      batch[dp][si]->set_in_step_decode_round(true);
+    }
+  }
+  for (int i = 0; i < max_decode_rounds; ++i) {
+    VLOG(1) << "decode_rounds=" << i << " beam_width=" << beam_width
+            << " batch_size=" << batch_size;
+    auto model_inputs = prepare_inputs(batch);
+    // Fill step-level metadata for decode rounds
+    for (auto dp = 0; dp < model_inputs.size(); ++dp) {
+      for (auto& micro : model_inputs[dp]) {
+        micro.beam_width = beam_width;
+        micro.total_round = i + 1;
+        micro.shared_kv_shape = {
+            static_cast<int64_t>(batch_size * FLAGS_max_token_per_req),
+            static_cast<int64_t>(head_num),
+            static_cast<int64_t>(head_dim)};
+      }
+    }
+    std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
+    futures.reserve(worker_clients_num_);
+    for (auto worker_rank = 0; worker_rank < worker_clients_num_;
+         ++worker_rank) {
+      auto dp_rank = worker_rank / dp_local_tp_size_;
+      futures.emplace_back(
+          worker_clients_[worker_rank]->step_async(model_inputs[dp_rank]));
+    }
+    results = folly::collectAll(futures).get();
+    dp_rank = 0;
+    for (auto worker_rank = 0; worker_rank < worker_clients_num_;
+         worker_rank += dp_local_tp_size_) {
+      auto result = results[worker_rank].value();
+      if (result.has_value()) {
+        if (result.value().outputs.empty() && layer_forward_interrupted_) {
+          throw ForwardInterruptedException();
+        }
+        batch[dp_rank].process_decode_beam_search_output(result.value(), false);
+      } else {
+        LOG(FATAL) << "Failed to execute model, result has no value";
+      }
+      ++dp_rank;
+    }
+  }
+  // 清除标记：离开 step-level decode 轮次
+  for (auto dp = 0; dp < batch.size(); ++dp) {
+    for (size_t si = 0; si < batch[dp].size(); ++si) {
+      batch[dp][si]->set_in_step_decode_round(false);
+    }
   }
 
   COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
@@ -840,9 +983,16 @@ std::vector<std::vector<RawForwardInput>> LLMEngine::prepare_inputs(
     auto split_seq_index = xllm::util::cal_vec_split_index(
         batch[dp_rank].size(), micro_batches_num);
     for (auto i = 0; i < micro_batches_num; ++i) {
-      batched_inputs[dp_rank].push_back(
-          std::move(batch[dp_rank].prepare_forward_input(
-              split_seq_index[i], split_seq_index[i + 1], threadpool_.get())));
+      if (FLAGS_max_decode_rounds > 0) {
+        batched_inputs[dp_rank].push_back(
+            std::move(batch[dp_rank].prepare_multi_step_forward_input(
+                split_seq_index[i], split_seq_index[i + 1], &args_)));
+      } else {
+        batched_inputs[dp_rank].push_back(std::move(
+            batch[dp_rank].prepare_forward_input(split_seq_index[i],
+                                                 split_seq_index[i + 1],
+                                                 threadpool_.get())));
+      }
       dp_global_token_nums[i][dp_rank] =
           batched_inputs[dp_rank][i].flatten_tokens_vec.size();
       global_empty_kv_cache =

@@ -28,8 +28,11 @@ namespace xllm_ops {
 void beam_search(const torch::Tensor& logprobs,
                  const torch::Tensor& top_tokens,
                  const torch::Tensor& top_logprobs,
-                 torch::Tensor& src_seq_idxes,
-                 torch::Tensor& out_logprobs,
+                 torch::Tensor& sequence_group,
+                 torch::Tensor& round_tensor,
                  torch::Tensor& out_token_ids,
-                 torch::Tensor& group_offset);
+                 torch::Tensor& out_token_index,
+                 torch::Tensor& out_log_probs,
+                 torch::Tensor& out_beam_count_prefix_sums,
+                 torch::Tensor& out_sequence);
 }  // namespace xllm_ops

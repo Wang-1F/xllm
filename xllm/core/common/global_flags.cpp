@@ -378,6 +378,8 @@ DEFINE_int64(buffer_size_per_seq,
              0,
              "Buffer size per sequence in bytes, default 0.");
 
+DEFINE_int64(max_token_per_req, 1024, "Max token per request, default 0.");
+
 // --- beam search config ---
 
 DEFINE_bool(enable_beam_search_kernel,
@@ -410,3 +412,11 @@ DEFINE_bool(
     "Whether to enable prefetch weight,only applicable to Qwen3-dense model."
     "The default prefetching ratio for gateup weight is 40%."
     "If adjustments are needed, e.g. export PREFETCH_COEFFOCIENT=0.5");
+
+DEFINE_int32(beam_width, 1, "Beam width for beam search.");
+
+// --- multi-step decode config ---
+DEFINE_int32(max_decode_rounds,
+             0,
+             "Maximum number of decode rounds for multi-step decoding. 0 means "
+             "disabled.");
