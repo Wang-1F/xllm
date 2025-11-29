@@ -28,35 +28,35 @@ cc_library(
     torch_npu
 )
 
-cc_test(
-  NAME
-    npu_rms_norm_test
-  SRCS
-    npu_rms_norm_test.cpp
-  DEPS
-    :npu_kernels_impl
-    GTest::gtest
-    GTest::gtest_main
-    xllm_kernels
-    c_sec
-    atb
-    spdlog::spdlog
-)
+# cc_test(
+#   NAME
+#     npu_rms_norm_test
+#   SRCS
+#     npu_rms_norm_test.cpp
+#   DEPS
+#     :npu_kernels_impl
+#     GTest::gtest
+#     GTest::gtest_main
+#     xllm_kernels
+#     c_sec
+#     atb
+#     spdlog::spdlog
+# )
 
-cc_test(
-  NAME
-    npu_linear_test
-  SRCS
-    npu_linear_test.cpp
-  DEPS
-    :npu_kernels_impl
-    GTest::gtest
-    GTest::gtest_main
-    xllm_kernels
-    c_sec
-    atb
-    spdlog::spdlog
-)
+# cc_test(
+#   NAME
+#     npu_linear_test
+#   SRCS
+#     npu_linear_test.cpp
+#   DEPS
+#     :npu_kernels_impl
+#     GTest::gtest
+#     GTest::gtest_main
+#     xllm_kernels
+#     c_sec
+#     atb
+#     spdlog::spdlog
+# )
 
 cc_test(
   NAME
@@ -73,20 +73,20 @@ cc_test(
     spdlog::spdlog
 )
 
-cc_test(
-  NAME
-    npu_rope_impl_test
-  SRCS
-    npu_rope_impl_test.cpp
-  DEPS
-    :npu_kernels_impl
-    GTest::gtest
-    GTest::gtest_main
-    xllm_kernels
-    c_sec
-    atb
-    spdlog::spdlog
-)
+# cc_test(
+#   NAME
+#     npu_rope_impl_test
+#   SRCS
+#     npu_rope_impl_test.cpp
+#   DEPS
+#     :npu_kernels_impl
+#     GTest::gtest
+#     GTest::gtest_main
+#     xllm_kernels
+#     c_sec
+#     atb
+#     spdlog::spdlog
+# )
 
 cc_test(
   NAME

@@ -286,6 +286,191 @@ ForwardInput MultiStepBatchInputBuilder::state_to_forward_input() {
   return forward_input;
 }
 
+namespace {
+void PrintRawForwardInput(const RawForwardInput& input) {
+  LOG(INFO) << "=== RawForwardInput Debug Info ===";
+
+  // Basic vectors
+  LOG(INFO) << "flatten_tokens_vec size: " << input.flatten_tokens_vec.size();
+  if (!input.flatten_tokens_vec.empty()) {
+    LOG(INFO) << "flatten_tokens_vec: [";
+    for (size_t i = 0;
+         i < std::min(input.flatten_tokens_vec.size(), size_t(10));
+         ++i) {
+      LOG(INFO) << "  " << input.flatten_tokens_vec[i];
+    }
+    if (input.flatten_tokens_vec.size() > 10) {
+      LOG(INFO) << "  ... (showing first 10 of "
+                << input.flatten_tokens_vec.size() << ")";
+    }
+    LOG(INFO) << "]";
+  }
+
+  LOG(INFO) << "flatten_positions_vec size: "
+            << input.flatten_positions_vec.size();
+  if (!input.flatten_positions_vec.empty()) {
+    LOG(INFO) << "flatten_positions_vec: [";
+    for (size_t i = 0;
+         i < std::min(input.flatten_positions_vec.size(), size_t(10));
+         ++i) {
+      LOG(INFO) << "  " << input.flatten_positions_vec[i];
+    }
+    if (input.flatten_positions_vec.size() > 10) {
+      LOG(INFO) << "  ... (showing first 10 of "
+                << input.flatten_positions_vec.size() << ")";
+    }
+    LOG(INFO) << "]";
+  }
+
+  // Sampling params
+  LOG(INFO) << "sampling_params size: " << input.sampling_params.size();
+  LOG(INFO) << "selected_token_idxes size: "
+            << input.selected_token_idxes.size();
+  LOG(INFO) << "sample_idxes size: " << input.sample_idxes.size();
+
+  // Unique token info
+  LOG(INFO) << "unique_token_ids_vec size: "
+            << input.unique_token_ids_vec.size();
+  LOG(INFO) << "unique_token_counts_vec size: "
+            << input.unique_token_counts_vec.size();
+  LOG(INFO) << "unique_token_lens_vec size: "
+            << input.unique_token_lens_vec.size();
+  if (!input.unique_token_lens_vec.empty()) {
+    LOG(INFO) << "unique_token_lens_vec: [";
+    for (size_t i = 0; i < input.unique_token_lens_vec.size(); ++i) {
+      LOG(INFO) << "  " << input.unique_token_lens_vec[i];
+    }
+    LOG(INFO) << "]";
+  }
+
+  // Decode sampling params
+  LOG(INFO) << "decode_sampling_params size: "
+            << input.decode_sampling_params.size();
+  LOG(INFO) << "decode_selected_token_idxes size: "
+            << input.decode_selected_token_idxes.size();
+  LOG(INFO) << "decode_sample_idxes size: " << input.decode_sample_idxes.size();
+  LOG(INFO) << "decode_unique_token_ids_vec size: "
+            << input.decode_unique_token_ids_vec.size();
+  LOG(INFO) << "decode_unique_token_counts_vec size: "
+            << input.decode_unique_token_counts_vec.size();
+  LOG(INFO) << "decode_unique_token_lens_vec size: "
+            << input.decode_unique_token_lens_vec.size();
+
+  // Boolean flags
+  LOG(INFO) << "empty_kv_cache: " << (input.empty_kv_cache ? "true" : "false");
+  LOG(INFO) << "global_empty_kv_cache: "
+            << (input.global_empty_kv_cache ? "true" : "false");
+
+  // Sequence info
+  LOG(INFO) << "max_seq_len: " << input.max_seq_len;
+  LOG(INFO) << "q_max_seq_len: " << input.q_max_seq_len;
+  LOG(INFO) << "num_sequences: " << input.num_sequences;
+  LOG(INFO) << "prefill_seq_len: " << input.prefill_seq_len;
+
+  // Sequence lengths
+  LOG(INFO) << "seq_lens size: " << input.seq_lens.size();
+  if (!input.seq_lens.empty()) {
+    LOG(INFO) << "seq_lens: [";
+    for (size_t i = 0; i < input.seq_lens.size(); ++i) {
+      LOG(INFO) << "  " << input.seq_lens[i];
+    }
+    LOG(INFO) << "]";
+  }
+
+  LOG(INFO) << "q_seq_lens size: " << input.q_seq_lens.size();
+  LOG(INFO) << "decode_seq_lens size: " << input.decode_seq_lens.size();
+  LOG(INFO) << "decode_q_seq_lens size: " << input.decode_q_seq_lens.size();
+
+  // Token slot info
+  LOG(INFO) << "new_token_slot_ids size: " << input.new_token_slot_ids.size();
+  if (!input.new_token_slot_ids.empty()) {
+    LOG(INFO) << "new_token_slot_ids: [";
+    for (size_t i = 0;
+         i < std::min(input.new_token_slot_ids.size(), size_t(10));
+         ++i) {
+      LOG(INFO) << "  " << input.new_token_slot_ids[i];
+    }
+    if (input.new_token_slot_ids.size() > 10) {
+      LOG(INFO) << "  ... (showing first 10 of "
+                << input.new_token_slot_ids.size() << ")";
+    }
+    LOG(INFO) << "]";
+  }
+
+  // Block tables
+  LOG(INFO) << "block_tables_vec size: " << input.block_tables_vec.size();
+  for (size_t i = 0; i < input.block_tables_vec.size(); ++i) {
+    LOG(INFO) << "block_tables_vec[" << i
+              << "] size: " << input.block_tables_vec[i].size();
+  }
+
+  // DP info
+  LOG(INFO) << "dp_global_token_nums size: "
+            << input.dp_global_token_nums.size();
+  if (!input.dp_global_token_nums.empty()) {
+    LOG(INFO) << "dp_global_token_nums: [";
+    for (size_t i = 0; i < input.dp_global_token_nums.size(); ++i) {
+      LOG(INFO) << "  " << input.dp_global_token_nums[i];
+    }
+    LOG(INFO) << "]";
+  }
+
+  // Transfer and embedding info
+  LOG(INFO) << "transfer_kv_infos size: " << input.transfer_kv_infos.size();
+  LOG(INFO) << "embeddings size: " << input.embeddings.size();
+  LOG(INFO) << "embedding_ids size: " << input.embedding_ids.size();
+
+  // Extra tokens
+  LOG(INFO) << "extra_token_ids size: " << input.extra_token_ids.size();
+  if (!input.extra_token_ids.empty()) {
+    LOG(INFO) << "extra_token_ids: [";
+    for (size_t i = 0; i < input.extra_token_ids.size(); ++i) {
+      LOG(INFO) << "  " << input.extra_token_ids[i];
+    }
+    LOG(INFO) << "]";
+  }
+
+  // Cache block info
+  LOG(INFO) << "async_copy_out_blocks size: "
+            << input.async_copy_out_blocks.size();
+  LOG(INFO) << "copy_out_blocks size: " << input.copy_out_blocks.size();
+  LOG(INFO) << "copy_in_blocks size: " << input.copy_in_blocks.size();
+  LOG(INFO) << "swap_blocks size: " << input.swap_blocks.size();
+
+  // Block indices
+  LOG(INFO) << "src_block_indices size: " << input.src_block_indices.size();
+  LOG(INFO) << "dst_block_indices size: " << input.dst_block_indices.size();
+  LOG(INFO) << "cum_sum size: " << input.cum_sum.size();
+
+  // Cache offsets
+  LOG(INFO) << "new_cache_slot_offsets size: "
+            << input.new_cache_slot_offsets.size();
+  LOG(INFO) << "kv_cache_start_offsets size: "
+            << input.kv_cache_start_offsets.size();
+
+  // Beam search info
+  LOG(INFO) << "acc_logprob_vec size: " << input.acc_logprob_vec.size();
+  LOG(INFO) << "decode_positions_vec size: "
+            << input.decode_positions_vec.size();
+  LOG(INFO) << "beam_width: " << input.beam_width;
+  LOG(INFO) << "current_round: " << input.current_round;
+  LOG(INFO) << "total_round: " << input.total_round;
+
+  // Shared KV shape
+  LOG(INFO) << "shared_kv_shape size: " << input.shared_kv_shape.size();
+  if (!input.shared_kv_shape.empty()) {
+    LOG(INFO) << "shared_kv_shape: [";
+    for (size_t i = 0; i < input.shared_kv_shape.size(); ++i) {
+      LOG(INFO) << "  " << input.shared_kv_shape[i];
+    }
+    LOG(INFO) << "]";
+  }
+
+  LOG(INFO) << "=== End RawForwardInput Debug Info ===";
+}
+
+}  // namespace
+
 RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
     BatchInputBuilder::BuilderState* state_ptr) {
   // First call the base class implementation to get the basic RawForwardInput
@@ -361,6 +546,7 @@ RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
         multi_step_state.decode_sampling_params.begin(),
         multi_step_state.decode_sampling_params.end());
   }
+  // PrintRawForwardInput(raw_forward_input);
   return raw_forward_input;
 }
 

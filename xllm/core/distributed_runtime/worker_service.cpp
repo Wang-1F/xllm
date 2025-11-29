@@ -166,7 +166,9 @@ void WorkerService::step_multi_round(BatchedForwardInputs& batched_fwd_inputs,
                                      int32_t& prepared_layer_id,
                                      torch::Tensor& src_seq_idxes,
                                      torch::Tensor& out_tokens,
-                                     torch::Tensor& out_logprobs) {
+                                     torch::Tensor& out_logprobs,
+                                     std::vector<int32_t>* beam_group_flat,
+                                     bool* has_beam_group) {
   // execute model
   auto future = worker_->step_async(batched_fwd_inputs);
 
@@ -230,9 +232,9 @@ void WorkerService::step_multi_round(BatchedForwardInputs& batched_fwd_inputs,
               forward_outputs.value().beam_sequence_group, torch::kCPU, true);
           if (bsg.defined()) {
             auto flat = bsg.flatten();
-            beam_group_flat.assign(flat.data_ptr<int32_t>(),
+            beam_group_flat->assign(flat.data_ptr<int32_t>(),
                                     flat.data_ptr<int32_t>() + flat.numel());
-            has_beam_group = true;
+            *has_beam_group = true;
           }
         }
       }
@@ -589,6 +591,215 @@ void WorkerService::UnlinkCluster(::google::protobuf::RpcController* controller,
   return;
 }
 
+namespace {
+// 辅助函数：打印 torch::Tensor 信息
+void PrintTensorInfo(const torch::Tensor& tensor, const std::string& name) {
+  if (tensor.defined()) {
+    LOG(INFO) << name << " - shape: [";
+    for (int i = 0; i < tensor.dim(); ++i) {
+      LOG(INFO) << (i > 0 ? ", " : "") << tensor.size(i);
+    }
+    LOG(INFO) << "], dtype: " << tensor.dtype()
+              << ", device: " << tensor.device();
+  } else {
+    LOG(INFO) << name << " - undefined tensor";
+  }
+}
+
+// 打印 SamplingParameters
+void PrintSamplingParameters(const SamplingParameters& params,
+                             const std::string& prefix = "") {
+  LOG(INFO) << prefix << "SamplingParameters:";
+
+  // Tensor 成员
+  PrintTensorInfo(params.selected_token_idxes,
+                  prefix + "  selected_token_idxes");
+  PrintTensorInfo(params.frequency_penalties, prefix + "  frequency_penalties");
+  PrintTensorInfo(params.presence_penalties, prefix + "  presence_penalties");
+  PrintTensorInfo(params.repetition_penalties,
+                  prefix + "  repetition_penalties");
+  PrintTensorInfo(params.temperatures, prefix + "  temperatures");
+  PrintTensorInfo(params.top_p, prefix + "  top_p");
+  PrintTensorInfo(params.top_k, prefix + "  top_k");
+  PrintTensorInfo(params.unique_token_ids, prefix + "  unique_token_ids");
+  PrintTensorInfo(params.unique_token_counts, prefix + "  unique_token_counts");
+  PrintTensorInfo(params.unique_token_ids_lens,
+                  prefix + "  unique_token_ids_lens");
+  PrintTensorInfo(params.sample_idxes, prefix + "  sample_idxes");
+  PrintTensorInfo(params.do_sample, prefix + "  do_sample");
+
+  // 基本类型成员
+  LOG(INFO) << prefix << "  all_random_sample: "
+            << (params.all_random_sample ? "true" : "false");
+  LOG(INFO) << prefix << "  all_greedy_sample: "
+            << (params.all_greedy_sample ? "true" : "false");
+  LOG(INFO) << prefix << "  logprobs: " << (params.logprobs ? "true" : "false");
+  LOG(INFO) << prefix
+            << "  is_embeddings: " << (params.is_embeddings ? "true" : "false");
+  LOG(INFO) << prefix << "  max_top_logprobs: " << params.max_top_logprobs;
+  LOG(INFO) << prefix << "  use_beam_search: "
+            << (params.use_beam_search ? "true" : "false");
+}
+
+// 打印 ModelInputParams
+void PrintModelInputParams(const ModelInputParams& params,
+                           const std::string& prefix = "") {
+  LOG(INFO) << prefix << "ModelInputParams:";
+
+  // 基本类型成员
+  LOG(INFO) << prefix << "  empty_kv_cache: "
+            << (params.empty_kv_cache ? "true" : "false");
+  LOG(INFO) << prefix
+            << "  is_prefill: " << (params.is_prefill ? "true" : "false");
+  LOG(INFO) << prefix << "  num_sequences: " << params.num_sequences;
+  LOG(INFO) << prefix << "  kv_max_seq_len: " << params.kv_max_seq_len;
+  LOG(INFO) << prefix << "  q_max_seq_len: " << params.q_max_seq_len;
+  LOG(INFO) << prefix << "  global_empty_kv_cache: "
+            << (params.global_empty_kv_cache ? "true" : "false");
+  LOG(INFO) << prefix << "  prefill_seq_len: " << params.prefill_seq_len;
+  LOG(INFO) << prefix << "  beam_width: " << params.beam_width;
+  LOG(INFO) << prefix << "  current_round: " << params.current_round;
+  LOG(INFO) << prefix << "  total_round: " << params.total_round;
+
+  // Tensor 成员
+  PrintTensorInfo(params.q_seq_lens, prefix + "  q_seq_lens");
+  PrintTensorInfo(params.kv_seq_lens, prefix + "  kv_seq_lens");
+  PrintTensorInfo(params.decode_q_seq_lens, prefix + "  decode_q_seq_lens");
+  PrintTensorInfo(params.decode_kv_seq_lens, prefix + "  decode_kv_seq_lens");
+  PrintTensorInfo(params.new_cache_slots, prefix + "  new_cache_slots");
+  PrintTensorInfo(params.block_tables, prefix + "  block_tables");
+  PrintTensorInfo(params.input_embedding, prefix + "  input_embedding");
+  PrintTensorInfo(params.src_block_indices, prefix + "  src_block_indices");
+  PrintTensorInfo(params.dst_block_indices, prefix + "  dst_block_indices");
+  PrintTensorInfo(params.cum_sum, prefix + "  cum_sum");
+  PrintTensorInfo(params.new_cache_slot_offsets,
+                  prefix + "  new_cache_slot_offsets");
+  PrintTensorInfo(params.kv_cache_start_offsets,
+                  prefix + "  kv_cache_start_offsets");
+  PrintTensorInfo(params.graph_buffer, prefix + "  graph_buffer");
+  PrintTensorInfo(params.beam_width_tensor, prefix + "  beam_width_tensor");
+  PrintTensorInfo(params.current_round_tensor,
+                  prefix + "  current_round_tensor");
+
+  // 向量成员
+  LOG(INFO) << prefix
+            << "  kv_seq_lens_vec size: " << params.kv_seq_lens_vec.size();
+  LOG(INFO) << prefix
+            << "  q_seq_lens_vec size: " << params.q_seq_lens_vec.size();
+  LOG(INFO) << prefix << "  decode_kv_seq_lens_vec size: "
+            << params.decode_kv_seq_lens_vec.size();
+  LOG(INFO) << prefix << "  decode_q_seq_lens_vec size: "
+            << params.decode_q_seq_lens_vec.size();
+  LOG(INFO) << prefix << "  dp_global_token_nums size: "
+            << params.dp_global_token_nums.size();
+  LOG(INFO) << prefix
+            << "  embedding_ids size: " << params.embedding_ids.size();
+  LOG(INFO) << prefix
+            << "  extra_token_ids size: " << params.extra_token_ids.size();
+  LOG(INFO) << prefix << "  async_copy_out_blocks size: "
+            << params.async_copy_out_blocks.size();
+  LOG(INFO) << prefix
+            << "  copy_out_blocks size: " << params.copy_out_blocks.size();
+  LOG(INFO) << prefix
+            << "  copy_in_blocks size: " << params.copy_in_blocks.size();
+  LOG(INFO) << prefix << "  swap_blocks size: " << params.swap_blocks.size();
+  LOG(INFO) << prefix
+            << "  shared_k_caches size: " << params.shared_k_caches.size();
+  LOG(INFO) << prefix
+            << "  shared_v_caches size: " << params.shared_v_caches.size();
+  LOG(INFO) << prefix << "  current_round_tensor_list size: "
+            << params.current_round_tensor_list.size();
+  LOG(INFO) << prefix << "  decode_positions_tensor_list size: "
+            << params.decode_positions_tensor_list.size();
+
+  // decode_seq_range
+  LOG(INFO) << prefix << "  decode_seq_range: ["
+            << params.decode_seq_range.first << ", "
+            << params.decode_seq_range.second << "]";
+
+  // 无法打印的复杂类型
+  LOG(INFO) << prefix << "  mm_data: [UNPRINTABLE - MMData type]";
+  LOG(INFO) << prefix
+            << "  dp_ep_padding_data: [UNPRINTABLE - DpEpPaddingData type]";
+  PrintTensorInfo(params.expert_load_data, prefix + "  expert_load_data");
+
+#if defined(USE_NPU)
+  LOG(INFO)
+      << prefix
+      << "  layer_synchronizer: [UNPRINTABLE - NPULayerSynchronizerImpl type]";
+#endif
+}
+
+// 打印 ForwardInput
+void PrintForwardInput(const ForwardInput& input,
+                       const std::string& prefix = "") {
+  LOG(INFO) << prefix << "ForwardInput:";
+
+  // Tensor 成员
+  PrintTensorInfo(input.token_ids, prefix + "  token_ids");
+  PrintTensorInfo(input.positions, prefix + "  positions");
+  PrintTensorInfo(input.acc_logprob, prefix + "  acc_logprob");
+
+  // 嵌套结构体
+  PrintModelInputParams(input.input_params, prefix + "  ");
+  PrintSamplingParameters(input.sampling_params,
+                          prefix + "  sampling_params - ");
+  PrintSamplingParameters(input.decoder_sampling_params,
+                          prefix + "  decoder_sampling_params - ");
+
+  // 基本类型成员
+  LOG(INFO) << prefix << "  beam_width: " << input.beam_width;
+  LOG(INFO) << prefix << "  current_round: " << input.current_round;
+  LOG(INFO) << prefix << "  total_round: " << input.total_round;
+
+  // 向量成员
+  LOG(INFO) << prefix << "  decode_positions_vec size: "
+            << input.decode_positions_vec.size();
+  LOG(INFO) << prefix
+            << "  shared_kv_shape size: " << input.shared_kv_shape.size();
+  if (!input.shared_kv_shape.empty()) {
+    LOG(INFO) << prefix << "  shared_kv_shape: [";
+    for (size_t i = 0; i < input.shared_kv_shape.size(); ++i) {
+      LOG(INFO) << (i > 0 ? ", " : "") << input.shared_kv_shape[i];
+    }
+    LOG(INFO) << "]";
+  }
+  LOG(INFO) << prefix
+            << "  transfer_kv_infos size: " << input.transfer_kv_infos.size();
+
+  // 无法打印的复杂类型
+  LOG(INFO) << prefix
+            << "  transfer_kv_infos: [UNPRINTABLE - TransferKVInfo vector]";
+  LOG(INFO) << prefix << "  eplb_info: [UNPRINTABLE - EplbInfo type]";
+}
+
+// 主函数：打印 BatchedForwardInputs
+void PrintBatchedForwardInputs(const BatchedForwardInputs& inputs) {
+  LOG(INFO) << "=== BatchedForwardInputs Debug Info ===";
+
+  // micro_inputs
+  LOG(INFO) << "micro_inputs size: " << inputs.micro_inputs.size();
+  for (size_t i = 0; i < inputs.micro_inputs.size(); ++i) {
+    LOG(INFO) << "micro_inputs[" << i << "]:";
+    PrintForwardInput(inputs.micro_inputs[i], "  ");
+  }
+
+  // SamplingParameters
+  LOG(INFO) << "concated_sampling_params:";
+  PrintSamplingParameters(inputs.concated_sampling_params, "  ");
+
+  LOG(INFO) << "concated_decoder_sampling_params:";
+  PrintSamplingParameters(inputs.concated_decoder_sampling_params, "  ");
+
+  // Tensor 成员
+  PrintTensorInfo(inputs.acc_logprob, "acc_logprob");
+  PrintTensorInfo(inputs.concated_block_tables, "concated_block_tables");
+
+  LOG(INFO) << "=== End BatchedForwardInputs Debug Info ===";
+}
+
+}  // namespace
+
 void WorkerService::ExecuteModel(
     ::google::protobuf::RpcController* controller,
     const proto::BatchedForwardInputs* pb_batched_fwd_inputs,
@@ -701,7 +912,7 @@ void WorkerService::ExecuteModel(
 
     std::vector<int32_t> beam_group_flat;
     bool has_beam_group = false;
-
+    // PrintBatchedForwardInputs(batched_fwd_inputs);
     step_multi_round(batched_fwd_inputs,
                      next_tokens,
                      logprobs,
@@ -712,9 +923,12 @@ void WorkerService::ExecuteModel(
                      prepared_layer_id,
                      src_seq_idxes,
                      out_tokens,
-                     out_logprobs);
+                     out_logprobs,
+                     &beam_group_flat,
+                     &has_beam_group);
     // convert to proto output
-
+    LOG(INFO) << "beam_group_flat: " << beam_group_flat;
+    LOG(INFO) << "has_beam_group: " << has_beam_group;
     forward_output_to_proto(next_tokens,
                             logprobs,
                             top_tokens,

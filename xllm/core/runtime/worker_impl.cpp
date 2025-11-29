@@ -532,14 +532,10 @@ void WorkerImpl::prepare_work_before_execute(
   }
   processed_inputs.concated_sampling_params =
       inputs.concated_sampling_params.to(device_, dtype_);
-
-  if (inputs.acc_logprob.defined()) {
-    processed_inputs.acc_logprob =
-        inputs.acc_logprob.to(torch::kFloat32).to(device_);
-  }
   processed_inputs.concated_decoder_sampling_params =
       inputs.concated_decoder_sampling_params.to(device_, dtype_);
-
+  processed_inputs.acc_logprob =
+      inputs.acc_logprob.to(torch::kFloat32).to(device_);
   if (inputs.concated_block_tables.defined() &&
       inputs.concated_block_tables.numel() > 0) {
     processed_inputs.concated_block_tables =
@@ -585,9 +581,9 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
     const BatchedForwardInputs& inputs) {
   BatchedForwardInputs batched_inputs_on_device;
   batched_inputs_on_device.micro_inputs.reserve(inputs.micro_inputs.size());
-
+  LOG(INFO) << "before prepare_work_before_execute.";
   prepare_work_before_execute(inputs, batched_inputs_on_device);
-
+  LOG(INFO) << "after prepare_work_before_execute.";
   folly::Promise<std::optional<ForwardOutput>> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule([this,
