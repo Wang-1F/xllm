@@ -269,6 +269,9 @@ Engine::KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   } else {
     slot_size = 2 * dtype_size * head_dim_ * n_local_kv_heads_;
   }
+  if (FLAGS_max_decode_rounds > 0) {
+    slot_size *= FLAGS_max_decode_rounds;
+  }
   kv_cache_cap.slot_size = slot_size;
   kv_cache_cap.n_layers = args_.n_layers();
 
@@ -312,11 +315,32 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, block_size, 1, args_.qk_rope_head_dim()});
   } else {
-#if defined(USE_NPU) || defined(USE_CUDA)
+
+#if defined(USE_CUDA)
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
+
+#elif defined(USE_NPU)
+    if (FLAGS_max_decode_rounds > 0) {
+      kv_cache_shape.emplace_back(std::vector<int64_t>{kv_cache_cap.n_blocks,
+                                                       block_size,
+                                                       n_local_kv_heads_,
+                                                       FLAGS_max_decode_rounds,
+                                                       head_dim_});
+      kv_cache_shape.emplace_back(std::vector<int64_t>{kv_cache_cap.n_blocks,
+                                                       block_size,
+                                                       n_local_kv_heads_,
+                                                       FLAGS_max_decode_rounds,
+                                                       head_dim_});
+    } else {
+      kv_cache_shape.emplace_back(std::vector<int64_t>{
+          kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
+      kv_cache_shape.emplace_back(std::vector<int64_t>{
+          kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
+    }
+
 #elif defined(USE_MLU)
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, n_local_kv_heads_, block_size, head_dim_});
@@ -330,13 +354,20 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
 
   // initialize block manager
   BlockManagerPool::Options options;
+  // simplify when use max_decode round.
+  bool enable_prefix_cache =
+      options_.enable_prefix_cache() && FLAGS_max_decode_rounds == 0;
+  bool enable_kvcache_store =
+      options_.enable_kvcache_store() && FLAGS_max_decode_rounds == 0;
+  auto host_blocks_factor =
+      FLAGS_max_decode_rounds == 0 ? options_.host_blocks_factor() : 0.0;
   options.num_blocks(kv_cache_cap.n_blocks)
       .block_size(block_size)
-      .host_num_blocks(kv_cache_cap.n_blocks * options_.host_blocks_factor())
-      .enable_prefix_cache(options_.enable_prefix_cache())
+      .host_num_blocks(kv_cache_cap.n_blocks * host_blocks_factor)
+      .enable_prefix_cache(enable_prefix_cache)
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_cache_upload(options_.enable_cache_upload())
-      .enable_kvcache_store(options_.enable_kvcache_store());
+      .enable_kvcache_store(enable_kvcache_store);
   kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 
   // init kv cache for each worker in parallel
@@ -654,10 +685,58 @@ bool LLMEngine::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
   return true;
 }
 
+ForwardOutput LLMEngine::step_multi_round(std::vector<Batch>& batch) {
+  Timer timer;
+  DCHECK(dp_size_ == batch.size())
+      << "Split DP batch failed with dp_size as " << dp_size_
+      << " and actual batch size as " << batch.size() << ".";
+  auto batched_raw_forward_inputs = prepare_inputs(batch);
+  DCHECK(dp_size_ == batched_raw_forward_inputs.size())
+      << "The processed raw forward inputs size "
+      << batched_raw_forward_inputs.size() << " is not equal to dp size "
+      << dp_size_ << ".";
+  std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
+  futures.reserve(worker_clients_num_);
+  for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
+    auto dp_rank = worker_rank / dp_local_tp_size_;
+    futures.emplace_back(worker_clients_[worker_rank]->step_async(
+        batched_raw_forward_inputs[dp_rank]));
+  }
+  auto results = folly::collectAll(futures).get();
+  size_t dp_rank = 0;
+  for (auto worker_rank = 0; worker_rank < worker_clients_num_;
+       worker_rank += dp_local_tp_size_) {
+    auto result = results[worker_rank].value();
+    if (result.has_value()) {
+      if (result.value().outputs.empty() && layer_forward_interrupted_) {
+        throw ForwardInterruptedException();
+      }
+      auto& raw = result.value();
+      if (!raw.beam_sequence_group.empty()) {
+        batch[dp_rank].process_beam_sequence_group(raw);
+      } else {
+        batch[dp_rank].process_decode_beam_search_output(raw, false);
+      }
+    } else {
+      LOG(FATAL) << "Failed to execute model, result has no value";
+    }
+    ++dp_rank;
+  }
+  COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
+  // finish all sequences in the batch
+  for (auto& b : batch) {
+    b.finish();
+  }
+  return {};
+}
+
 ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
   if (worker_clients_.empty()) {
     // empty worker, return
     return {};
+  }
+  if (FLAGS_max_decode_rounds > 0) {
+    return step_multi_round(batch);
   }
   Timer timer;
   DCHECK(dp_size_ == batch.size())
@@ -699,9 +778,14 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
       if (result.value().outputs.empty() && layer_forward_interrupted_) {
         throw ForwardInterruptedException();
       }
-      // if src_seq_idxes is not empty, skip sample output processing and
-      // process beam search output instead
-      if (result.value().src_seq_idxes.size() == 0) {
+      // If both src_seq_idxes and out_tokens are populated, this step used
+      // the beam search kernel; otherwise, fall back to normal sample output
+      // processing. Note that proto serialization always fills src_seq_idxes
+      // with a fallback [0..num_seqs) when it is undefined, so we must also
+      // check out_tokens to distinguish real beam-kernel outputs.
+      if (result.value().src_seq_idxes.empty() ||
+          result.value().out_tokens.empty() ||
+          !FLAGS_enable_beam_search_kernel) {
         // set second input param enable_schedule_overlap to false,
         // if it's not enabled, process_sample_output will append the real
         // token, if it's enabled, this false here will append the fake token in
@@ -840,9 +924,16 @@ std::vector<std::vector<RawForwardInput>> LLMEngine::prepare_inputs(
     auto split_seq_index = xllm::util::cal_vec_split_index(
         batch[dp_rank].size(), micro_batches_num);
     for (auto i = 0; i < micro_batches_num; ++i) {
-      batched_inputs[dp_rank].push_back(
-          std::move(batch[dp_rank].prepare_forward_input(
-              split_seq_index[i], split_seq_index[i + 1], threadpool_.get())));
+      if (FLAGS_max_decode_rounds > 0) {
+        batched_inputs[dp_rank].push_back(
+            std::move(batch[dp_rank].prepare_multi_step_forward_input(
+                split_seq_index[i], split_seq_index[i + 1], &args_)));
+      } else {
+        batched_inputs[dp_rank].push_back(std::move(
+            batch[dp_rank].prepare_forward_input(split_seq_index[i],
+                                                 split_seq_index[i + 1],
+                                                 threadpool_.get())));
+      }
       dp_global_token_nums[i][dp_rank] =
           batched_inputs[dp_rank][i].flatten_tokens_vec.size();
       global_empty_kv_cache =
@@ -862,6 +953,19 @@ std::vector<std::vector<RawForwardInput>> LLMEngine::prepare_inputs(
       if (FLAGS_enable_eplb) {
         batched_inputs[dp_rank][i].eplb_info = eplb_info;
       }
+    }
+  }
+
+  // Debug: log basic shape info for each dp/micro batch.
+  for (auto dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+    for (auto i = 0; i < micro_batches_num; ++i) {
+      const auto& in = batched_inputs[dp_rank][i];
+      VLOG(1) << "[PREPARE_INPUTS] dp=" << dp_rank << ", micro_batch=" << i
+              << ", tokens=" << in.flatten_tokens_vec.size()
+              << ", q_max_seq_len=" << in.q_max_seq_len
+              << ", num_sequences=" << in.num_sequences
+              << ", beam_width=" << in.beam_width
+              << ", total_round=" << in.total_round;
     }
   }
 

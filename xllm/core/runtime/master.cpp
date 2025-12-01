@@ -51,9 +51,18 @@ namespace xllm {
 Master::Master(const Options& options, EngineType type) : options_(options) {
   LOG(INFO) << "Master init options: " << options.to_string();
 
+
   // Allow brpc receive SIGTREM and SIGINT signal.
   brpc::FLAGS_graceful_quit_on_sigterm = true;
   brpc::FLAGS_graceful_quit_on_sighup = true;
+
+  auto opt_block_size = options.block_size();
+  if (FLAGS_max_decode_rounds > 0) {
+    CHECK(FLAGS_beam_width > 0)
+        << "beam_width must be greater than 0 when max_decode_rounds > 0";
+    options_.block_size(FLAGS_beam_width);
+    opt_block_size = options_.block_size();
+  }
 
 #if defined(USE_NPU)
   if (options.rank_tablefile().has_value()) {
@@ -105,7 +114,7 @@ Master::Master(const Options& options, EngineType type) : options_(options) {
     runtime::Options eng_options;
     eng_options.model_path(options_.model_path())
         .devices(devices)
-        .block_size(options.block_size())
+        .block_size(opt_block_size)
         .max_cache_size(options.max_cache_size())
         .max_memory_utilization(options.max_memory_utilization())
         .enable_prefix_cache(options.enable_prefix_cache())

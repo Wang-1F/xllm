@@ -27,6 +27,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/common/global_flags.h"
 #include "core/common/metrics.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/util/slice.h"
@@ -454,6 +455,14 @@ Slice<int32_t> Sequence::get_generated_tokens() const {
             num_tokens_ - num_prompt_tokens_};
   }
   return {tokens_.data(), 0};
+}
+
+void Sequence::finish() {
+  finished_ = true;
+  finish_status_invalidated_ = false;
+  if (finish_reason_ == FinishReason::NONE) {
+    finish_reason_ = FinishReason::STOP;
+  }
 }
 
 }  // namespace xllm

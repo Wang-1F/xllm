@@ -50,6 +50,7 @@ struct CacheBlockInfo {
 struct ModelInputParams {
   ModelInputParams to(const torch::Device& device) const {
     ModelInputParams params;
+    params.is_prefill = is_prefill;
     params.empty_kv_cache = empty_kv_cache;
     params.global_empty_kv_cache = global_empty_kv_cache;
     params.num_sequences = num_sequences;
@@ -64,6 +65,10 @@ struct ModelInputParams {
     params.kv_seq_lens_vec = kv_seq_lens_vec;
     params.q_seq_lens_vec = q_seq_lens_vec;
     params.decode_seq_range = decode_seq_range;
+    params.decode_kv_seq_lens = safe_to(decode_kv_seq_lens, device, true);
+    params.decode_q_seq_lens = safe_to(decode_q_seq_lens, device, true);
+    params.decode_kv_seq_lens_vec = decode_kv_seq_lens_vec;
+    params.decode_q_seq_lens_vec = decode_q_seq_lens_vec;
 
     params.input_embedding = safe_to(input_embedding, device);
 
@@ -94,6 +99,29 @@ struct ModelInputParams {
     params.new_cache_slot_offsets = safe_to(new_cache_slot_offsets, device);
     params.kv_cache_start_offsets = safe_to(kv_cache_start_offsets, device);
 
+    // shared kv caches per layer (optional)
+    params.shared_k_caches.clear();
+    params.shared_v_caches.clear();
+    for (const auto& t : shared_k_caches) {
+      params.shared_k_caches.push_back(safe_to(t, device));
+    }
+    for (const auto& t : shared_v_caches) {
+      params.shared_v_caches.push_back(safe_to(t, device));
+    }
+    params.beam_width_tensor = safe_to(beam_width_tensor, device);
+    params.current_round_tensor = safe_to(current_round_tensor, device);
+    params.current_round_tensor_list.clear();
+    for (const auto& t : current_round_tensor_list) {
+      params.current_round_tensor_list.push_back(safe_to(t, device));
+    }
+    params.decode_positions_tensor_list.clear();
+    for (const auto& t : decode_positions_tensor_list) {
+      params.decode_positions_tensor_list.push_back(safe_to(t, device));
+    }
+
+    params.beam_width = beam_width;
+    params.current_round = current_round;
+    params.total_round = total_round;
     // Copy graph_buffer to device
     params.graph_buffer = safe_to(graph_buffer, device, true);
 
@@ -117,6 +145,8 @@ struct ModelInputParams {
     LOG(INFO) << "ModelInputParams: decode_seq_range is " << decode_seq_range;
     print_tensor(kv_seq_lens, "ModelInputParams: kv_seq_lens", 4);
     print_tensor(q_seq_lens, "ModelInputParams: q_seq_lens", 4);
+    print_tensor(decode_kv_seq_lens, "ModelInputParams: decode_kv_seq_lens", 4);
+    print_tensor(decode_q_seq_lens, "ModelInputParams: decode_q_seq_lens", 4);
     print_tensor(new_cache_slots, "ModelInputParams: new_cache_slots", 4);
     print_tensor(block_tables, "ModelInputParams: block_tables", 4);
     LOG(INFO) << "ModelInputParams: dp_global_token_nums is "
@@ -125,6 +155,9 @@ struct ModelInputParams {
   // whether the kv-cache is empty for all sequences.
   bool empty_kv_cache = true;
 
+  // whether this pass is prefill stage
+  bool is_prefill = true;
+
   // total number of sequences in the batch
   int32_t num_sequences = 0;
 
@@ -132,6 +165,10 @@ struct ModelInputParams {
   torch::Tensor kv_seq_lens;
   std::vector<int> kv_seq_lens_vec;
   std::vector<int> q_seq_lens_vec;
+  torch::Tensor decode_q_seq_lens;
+  torch::Tensor decode_kv_seq_lens;
+  std::vector<int> decode_kv_seq_lens_vec;
+  std::vector<int> decode_q_seq_lens_vec;
   // Range of decode sequence indices in the batch [start, end].
   // Decode sequences are identified by q_seq_lens == 1,
   // prefill sequences by  q_seq_lens > 1 .
@@ -207,6 +244,7 @@ struct ModelInputParams {
   // Used by ACL Graph Executor to avoid repeated memory allocation
   torch::Tensor graph_buffer;
 
+
   // the indptr of the paged kv-cache
   // used in flashinfer
   // IntTensor: [n_seq + 1]
@@ -221,6 +259,20 @@ struct ModelInputParams {
   // used in flashinfer
   // IntTensor: [n_seq]
   torch::Tensor paged_kv_last_page_len;
+
+  // shared kv caches provided by engine for step-level decode, per layer
+  std::vector<torch::Tensor> shared_k_caches;
+  std::vector<torch::Tensor> shared_v_caches;
+  torch::Tensor beam_width_tensor;
+  torch::Tensor current_round_tensor;
+  std::vector<torch::Tensor> current_round_tensor_list;
+  std::vector<torch::Tensor> decode_positions_tensor_list;
+  // beam width for step-level decode
+  int32_t beam_width = 1;
+  // current round for step-level decode
+  int32_t current_round = 0;
+  int32_t total_round = 0;
+
 };
 
 }  // namespace xllm
