@@ -26,8 +26,15 @@ Stream::Stream() : stream_(c10::cuda::getStreamFromPool()) {}
 #endif
 
 int Stream::synchronize() const {
+#if defined(USE_NPU)
+  return aclrtSynchronizeStream(stream_.stream());
+#elif defined(USE_MLU)
   stream_.unwrap().synchronize();
   return 0;
+#elif defined(USE_CUDA)
+  stream_.unwrap().synchronize();
+  return 0;
+#endif
 }
 
 c10::StreamGuard Stream::set_stream_guard() const {

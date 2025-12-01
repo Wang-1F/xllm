@@ -80,8 +80,9 @@ bool AclGraphRec::capture(CausalLM* model,
 
   // Block table tensors with maximum possible size
   const auto block_size = options.block_size();
-  const int64_t max_tokens =
-      FLAGS_max_decode_rounds == 0 ? FLAGS_max_tokens_per_seq : 1;
+  // const int64_t max_tokens =
+  //     FLAGS_max_decode_rounds == 0 ? FLAGS_max_tokens_per_seq : 1;
+  const int64_t max_tokens = 1;
   const int64_t max_block_table_len =
       (max_tokens + block_size - 1) / block_size + 1;
   block_tables_ =
@@ -239,9 +240,10 @@ torch::Tensor AclGraphRecExecutorImpl::run(
   const uint32_t bucket_size = get_bucket_size(actual_batch_size);
 
   // Check if conditions are suitable for graph execution (replay or capture)
-  const auto max_seq_len = FLAGS_max_tokens_per_seq > 0
-                               ? FLAGS_max_tokens_per_seq
-                               : args_.max_position_embeddings();
+  // const auto max_seq_len = FLAGS_max_tokens_per_seq > 0
+  //                              ? FLAGS_max_tokens_per_seq
+  //                              : args_.max_position_embeddings();
+  const auto max_seq_len = args_.max_position_embeddings();
   const bool seq_len_supported = params_single.kv_max_seq_len <= max_seq_len;
   // Each sequence has the same number of decoding tokens
   const bool same_num_decoding_tokens_single =

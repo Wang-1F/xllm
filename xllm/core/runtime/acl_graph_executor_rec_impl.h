@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "common/global_flags.h"
 #include "core/common/macros.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/causal_lm.h"
