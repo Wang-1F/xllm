@@ -349,16 +349,32 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
                          .reshape({-1, beam_width});
         top_logprobs = sample_output.top_logprobs.reshape({-1, beam_width});
       }
-      xllm_ops::beam_search(acc_logprob,
-                            top_tokens,
-                            top_logprobs,
-                            sequence_group,
-                            round,
-                            out_token_ids,
-                            out_token_index,
-                            out_log_probs,
-                            out_beam_count_prefix_sums,
-                            out_seqgroup);
+
+      // xllm_ops::beam_search(acc_logprob,
+      //                       top_tokens,
+      //                       top_logprobs,
+      //                       sequence_group,
+      //                       round,
+      //                       out_token_ids,
+      //                       out_token_index,
+      //                       out_log_probs,
+      //                       out_beam_count_prefix_sums,
+      //                       out_seqgroup);
+      #if defined(USE_CUDA)
+      LOG(INFO) << "before rec_triton_kernel_.beam_search.";
+      acc_logprob = acc_logprob.to(torch::kBFloat16);
+      rec_triton_kernel_.beam_search(acc_logprob, 
+                                     sequence_group, 
+                                     top_tokens, 
+                                     top_logprobs, 
+                                     out_log_probs, 
+                                     out_token_ids, 
+                                     out_token_index, 
+                                     out_beam_count_prefix_sums, 
+                                     out_seqgroup, 
+                                     total_rounds, 
+                                     round);
+      #endif
       sequence_group.copy_(out_seqgroup);
       acc_logprob.copy_(out_log_probs);
       // keep group offset contiguous across rounds (already in out_* tensors)

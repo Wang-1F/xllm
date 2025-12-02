@@ -29,6 +29,10 @@ limitations under the License.
 #include "options.h"
 #include "runtime/worker_impl.h"
 
+#if defined(USE_CUDA)
+#include "xllm/core/kernels/cuda/triton/rec/rec_triton.h"
+#endif
+
 namespace xllm {
 
 class LLMWorkerImpl : public WorkerImpl {
@@ -61,6 +65,9 @@ class LLMWorkerImpl : public WorkerImpl {
   std::unique_ptr<BeamSearcher> beam_searcher_;
   std::optional<ForwardOutput> step_multi_round(
       const BatchedForwardInputs& inputs);
+  #if defined(USE_CUDA)
+  kernel::cuda::triton::RecTritonKernel rec_triton_kernel_;
+  #endif
 };
 
 }  // namespace xllm
