@@ -77,6 +77,7 @@ void MultiStepBatchInputBuilder::process_single_sequence(
     int32_t seq_index,
     BuilderState* state_ptr,
     std::unordered_set<int32_t>* write_block_ids_ptr) {
+  LOG(INFO) << "inner MultiStepBatchInputBuilder::process_single_sequence.";
   MultiStepBuilderState& state = multi_step_state_;
   BuilderState& base_state = state.base_state;
 
@@ -162,6 +163,7 @@ void MultiStepBatchInputBuilder::process_single_sequence(
 RawForwardInput MultiStepBatchInputBuilder::build_raw_forward_input(
     uint32_t start_idx,
     uint32_t end_idx) {
+  LOG(INFO) << "inner MultiStepBatchInputBuilder::build_raw_forward_input.";
   // Reset multi-step state for this build
   multi_step_state_ = MultiStepBuilderState{};
   multi_step_state_.total_steps = FLAGS_max_decode_rounds;
@@ -173,7 +175,7 @@ RawForwardInput MultiStepBatchInputBuilder::build_raw_forward_input(
     process_single_sequence(
         i, &multi_step_state_.base_state, &write_block_ids_);
   }
-
+  LOG(INFO) << "before state_to_raw_forward_input.";
   return state_to_raw_forward_input(&multi_step_state_.base_state);
 }
 

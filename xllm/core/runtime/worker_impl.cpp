@@ -600,6 +600,7 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
           std::move(copy_out_blocks_async(input.input_params)));
     }
     if (!enable_schedule_overlap()) {
+      LOG(INFO) << "inner !enable_schedule_overlap() branch.";
       const auto output = this->step(inputs);
       std::for_each(copy_futures.begin(),
                     copy_futures.end(),

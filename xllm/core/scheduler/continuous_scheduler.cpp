@@ -372,6 +372,7 @@ void ContinuousScheduler::handle_decode_requests(
     // TODO: check if request is timeout
 
     const size_t num_sequences = request->sequences().size();
+    LOG(INFO) << "num_sequences: " << num_sequences;
     std::vector<Sequence*> candidate_sequences;
     std::vector<size_t> candidate_token_budgets;
     candidate_sequences.reserve(num_sequences);
@@ -411,6 +412,7 @@ void ContinuousScheduler::handle_decode_requests(
       // sequence token already appended
       size_t updated_num_tokens =
           sequence->num_tokens() + options_.num_speculative_tokens();
+      LOG(INFO) << "updated_num_tokens: " << updated_num_tokens;
       // no blocks left
       if (!kv_cache_manager_->allocate(sequence.get(), updated_num_tokens)) {
         has_enough_blocks = false;
@@ -743,6 +745,7 @@ std::vector<Batch> ContinuousScheduler::prepare_batch() {
   size_t num_online_decode_preempt_online_requests = 0;
   size_t num_online_prefill_preempt_offline_requests = 0;
   size_t num_online_decode_preempt_offline_requests = 0;
+  // LOG(INFO) << "before handle_prefill_requests.";
   // TO IMPROVE?: handle online decode request before prefill offline request
   handle_prefill_requests(latency_budget,
                           estimate_latency,

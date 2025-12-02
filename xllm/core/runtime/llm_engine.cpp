@@ -686,11 +686,14 @@ bool LLMEngine::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
 }
 
 ForwardOutput LLMEngine::step_multi_round(std::vector<Batch>& batch) {
+  LOG(INFO) << "inner LLMEngine::step_multi_round.";
   Timer timer;
   DCHECK(dp_size_ == batch.size())
       << "Split DP batch failed with dp_size as " << dp_size_
       << " and actual batch size as " << batch.size() << ".";
+  LOG(INFO) << "before prepare_inputs(batch).";
   auto batched_raw_forward_inputs = prepare_inputs(batch);
+  LOG(INFO) << "after prepare_inputs(batch).";
   DCHECK(dp_size_ == batched_raw_forward_inputs.size())
       << "The processed raw forward inputs size "
       << batched_raw_forward_inputs.size() << " is not equal to dp size "
@@ -735,6 +738,7 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
     // empty worker, return
     return {};
   }
+  LOG(INFO) << "inner LLMEngine::step.";
   if (FLAGS_max_decode_rounds > 0) {
     return step_multi_round(batch);
   }

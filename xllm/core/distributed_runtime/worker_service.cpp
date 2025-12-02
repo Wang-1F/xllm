@@ -709,8 +709,9 @@ void WorkerService::ExecuteModel(
       beam_group_flat.clear();
       has_beam_group = false;
     }
-
-    if (FLAGS_max_decode_rounds > 0) {
+    LOG(INFO) << "inner work_service.";
+    if (FLAGS_max_decode_rounds == 0) {
+      LOG(INFO) << "inner step branch.";
       step(batched_fwd_inputs,
          next_tokens,
          logprobs,
@@ -723,6 +724,7 @@ void WorkerService::ExecuteModel(
          out_tokens,
          out_logprobs);
     } else {
+      LOG(INFO) << "inner step_multi_round branch.";
       step_multi_round(batched_fwd_inputs,
                      next_tokens,
                      logprobs,
