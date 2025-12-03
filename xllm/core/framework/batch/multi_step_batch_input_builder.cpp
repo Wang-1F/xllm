@@ -115,7 +115,8 @@ void MultiStepBatchInputBuilder::process_single_sequence(
   base_state.q_seq_lens.push_back(q_seq_len);
   state.decode_seq_lens.push_back(decode_seq_len);
   state.decode_q_seq_lens.push_back(decode_q_seq_len);
-#elif defined(USE_MLU)
+#elif defined(USE_MLU) || defined(USE_CUDA)
+  LOG(INFO) << "inner use_cuda.";
   base_state.seq_lens.push_back(base_state.seq_lens.back() + seq_len);
   base_state.q_seq_lens.push_back(base_state.q_seq_lens.back() + q_seq_len);
   state.decode_seq_lens.push_back(state.decode_seq_lens.back() +
@@ -320,14 +321,57 @@ void MultiStepBatchInputBuilder::setup_kv_cache_info(
     uint32_t q_seq_len,
     BuilderState* state_ptr,
     std::unordered_set<int32_t>* write_block_ids_ptr) {
-  (void)write_block_ids_ptr;
+  // (void)write_block_ids_ptr;
+  // BuilderState& state = *state_ptr;
+  // const auto blocks = sequence->kv_state().kv_blocks();
+  // std::vector<int32_t> block_ids;
+  // block_ids.reserve(blocks.size());
+  // for (const auto& block : blocks) {
+  //   block_ids.push_back(block.id());
+  // }
+  // state.block_tables_vec.emplace_back(std::move(block_ids));
+
   BuilderState& state = *state_ptr;
+  std::unordered_set<int32_t>& write_block_ids =
+      write_block_ids_ptr ? *write_block_ids_ptr : write_block_ids_;
+
+  // update kv cache tokens num
+  sequence->kv_state().incr_kv_cache_tokens_num(/*size=*/q_seq_len);
+
   const auto blocks = sequence->kv_state().kv_blocks();
+  const auto slot_ids =
+      sequence->kv_state().kv_cache_slots(n_kv_cache_tokens, seq_len);
+  state.new_token_slot_ids.insert(
+      state.new_token_slot_ids.end(), slot_ids.begin(), slot_ids.end());
+
   std::vector<int32_t> block_ids;
+  std::vector<uint64_t> u_block_ids;
   block_ids.reserve(blocks.size());
+  int32_t block_size = 0;
   for (const auto& block : blocks) {
+    block_size = block.size();
     block_ids.push_back(block.id());
+    u_block_ids.emplace_back(block.id());
+    state.paged_kv_indices.push_back(block.id());
   }
+  state.paged_kv_indptr.push_back(state.paged_kv_indptr.back() + blocks.size());
+  int32_t last_page_len =
+      (seq_len % block_size == 0) ? block_size : seq_len % block_size;
+  state.paged_kv_last_page_len.push_back(last_page_len);
+
+  int32_t kv_cache_block_idx = n_kv_cache_tokens / block_size;
+  for (auto iter = block_ids.begin() + kv_cache_block_idx;
+       iter != block_ids.end();
+       ++iter) {
+    write_block_ids.insert(*iter);
+  }
+
+  auto& transfer_kv_info = sequence->kv_state().transfer_kv_info();
+  if (transfer_kv_info.has_value()) {
+    state.transfer_kv_infos.emplace_back(transfer_kv_info.value());
+    state.transfer_kv_infos.back().local_blocks_ids = std::move(u_block_ids);
+  }
+
   state.block_tables_vec.emplace_back(std::move(block_ids));
 }
 
@@ -425,6 +469,12 @@ RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
   raw_forward_input.num_sequences = num_sequences_;
   raw_forward_input.transfer_kv_infos = std::move(src.transfer_kv_infos);
   raw_forward_input.prefill_seq_len = src.prefill_seq_len;
+
+  // for flashinfer
+  raw_forward_input.paged_kv_indptr = std::move(src.paged_kv_indptr);
+  raw_forward_input.paged_kv_indices = std::move(src.paged_kv_indices);
+  raw_forward_input.paged_kv_last_page_len =
+      std::move(src.paged_kv_last_page_len);
 
   raw_forward_input.embedding_ids = std::move(src.embedding_ids);
   raw_forward_input.extra_token_ids = std::move(src.extra_token_ids);
