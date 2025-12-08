@@ -396,7 +396,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(
 
   return output;
 }
-
+// shared是从inputs里面拿的
+// unshared是从Kv_cache拿的
 std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
     const BatchedForwardInputs& inputs) {
   LOG(INFO) << "inner LLMWorkerImpl::step_multi_round.";
@@ -490,6 +491,71 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       return std::nullopt;
     }
 
+
+    // 验证triton kernel调用逻辑
+    // -----------------------
+    // 初始化tensor
+    {
+      auto device_options = 
+        torch::TensorOptions().device(device_);
+      auto bf16_options =
+        torch::TensorOptions().dtype(torch::kBFloat16).device(device_);
+      auto int32_options =
+        torch::TensorOptions().dtype(torch::kInt32).device(device_);
+      
+      uint32_t batch_size = 4;
+      uint32_t beam_width = 256;
+      uint32_t prompt_len = 512;
+      uint32_t num_heads = 8;
+      uint32_t head_dim = 128;
+
+      uint32_t total_beams = batch_size * beam_width;
+      auto q = torch::randn({total_beams, num_heads, head_dim}, bf16_options);
+
+      auto shared_k_cache = torch::randn({batch_size, num_heads, prompt_len, head_dim}, bf16_options);  
+      auto shared_v_cache = torch::randn({batch_size, num_heads, prompt_len, head_dim}, bf16_options); 
+      
+      uint32_t max_decode_step = 2;
+      auto unshared_k_cache = torch::randn({total_beams, num_heads, max_decode_step, head_dim}, bf16_options); 
+      auto unshared_v_cache = torch::randn({total_beams, num_heads, max_decode_step, head_dim}, bf16_options);  
+      
+      int decode_step = 1;  // current decode step
+      // int beam_size = 16;   // beam size
+
+      float sm_scale = 0.08838834764831843;  // 通常是 1/sqrt(head_dim)
+      bool warp_specialize = false;
+      // for (std::size_t i = 0 ; i < 10 ; ++i) {
+      auto ret = rec_triton_kernel_.xattention(q, 
+                                  shared_k_cache,
+                                  shared_v_cache, 
+                                  unshared_k_cache, 
+                                  unshared_v_cache, 
+                                  decode_step, 
+                                  beam_width, 
+                                  sm_scale, 
+                                  prompt_len);
+      // }
+      torch::Tensor tensor = torch::arange(beam_width, torch::dtype(torch::kInt32));
+      auto _unshared_k_cache = torch::randn({batch_size + 1, beam_width, num_heads, max_decode_step, head_dim}, bf16_options); 
+      auto _unshared_v_cache = torch::randn({batch_size + 1, beam_width, num_heads, max_decode_step, head_dim}, bf16_options); 
+
+      std::vector<torch::Tensor> _k{_unshared_k_cache};
+      std::vector<torch::Tensor> _v{_unshared_v_cache};
+
+      auto block_table = torch::arange(batch_size, torch::dtype(torch::kInt64));
+
+      rec_triton_kernel_.grouped_cache_select(out_token_index,
+                                              _k,
+                                              _v,
+                                              block_table,
+                                              decode_step);
+      LOG(INFO) << "after grouped_cache_select.";
+    }
+    
+
+    // -----------------------
+
+
     torch::Tensor logits;
     LOG(INFO) << "before model_->logits.";
     if (concated_sampling_params.selected_token_idxes.defined()) {
@@ -576,6 +642,16 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
             out_beam_count_prefix_sums.reshape({-1});
         output.beam_sequence_group = sequence_group;
       }
+
+#if defined(USE_CUDA)
+      // if (beam_width > 1 && round > 0) {
+      //   rec_triton_kernel_.grouped_cache_select(out_token_index,
+      //                                           unshared_k_cache,
+      //                                           unshared_v_cache,
+      //                                           inputs.concated_block_tables,
+      //                                           round);
+      // }
+#endif
 
 #if defined(USE_NPU)
       if (beam_width > 1 && round > 0) {
