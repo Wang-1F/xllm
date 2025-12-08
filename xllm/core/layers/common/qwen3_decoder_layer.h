@@ -31,6 +31,8 @@ limitations under the License.
 #include "layers/rms_norm.h"
 #include "qwen3_attention.h"
 
+
+
 namespace xllm {
 namespace layer {
 
@@ -55,6 +57,8 @@ class Qwen3DecoderImpl : public torch::nn::Module {
   RmsNorm post_norm_{nullptr};
 
   ParallelArgs parallel_args_;
+  ModelArgs model_args_;
+
 };
 
 }  // namespace layer

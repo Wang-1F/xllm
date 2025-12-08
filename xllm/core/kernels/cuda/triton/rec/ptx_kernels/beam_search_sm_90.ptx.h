@@ -11,7 +11,7 @@ constexpr std::array<std::array<int, 3>, 15> beam_search_sm_90_bf16_INPUT_DIM_AR
     { 1, 16, 2 },  // Index 5
     { 2, 32, 0 },  // Index 6
     { 2, 32, 1 },  // Index 7
-    { 2, 32, 2 },  // Index 8
+    { 2, 32, 4 },  // Index 8
     { 2, 512, 0 },  // Index 9
     { 2, 512, 1 },  // Index 10
     { 2, 512, 2 },  // Index 11

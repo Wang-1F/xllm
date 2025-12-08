@@ -76,9 +76,7 @@ torch::Tensor Qwen3DecoderImpl::forward(torch::Tensor& x,
   // Pre-attention norm
   auto residual = x;
   x = input_norm_->forward(x);
-
-  // Attention
-  x = attention_->forward(positions, x, attn_metadata, kv_cache);
+  x = attention_->forward(positions, x, attn_metadata, kv_cache, input_params);
   x = x + residual;
 
   // Post-attention norm

@@ -133,16 +133,16 @@ RecTritonKernel::create_tensor_map(const TensorDescriptor& tensor_descriptor,
 
   CUtensorMapDataType dtype = 
     get_target_tensor_map_dtype(tensor.scalar_type());
-  LOG(INFO) << "dtype: " << dtype;
+// LOG(INFO) << "dtype: " << dtype;
   cuuint32_t tensor_rank = tensor.dim();
-  LOG(INFO) << "tensor_rank: " << tensor_rank;
+// LOG(INFO) << "tensor_rank: " << tensor_rank;
   void* tensor_addr = tensor.data_ptr();
   const cuuint64_t* dims = metadata.shape;
-  LOG(INFO) << "dims: " << metadata.shape[0];
+// LOG(INFO) << "dims: " << metadata.shape[0];
   const cuuint64_t* strides = metadata.strides;
-  LOG(INFO) << "strides: " << metadata.strides[0];
+// LOG(INFO) << "strides: " << metadata.strides[0];
   const cuuint32_t* block_shape = metadata.block_shape;
-  LOG(INFO) << "block_shape: " << metadata.block_shape[0];
+// LOG(INFO) << "block_shape: " << metadata.block_shape[0];
   const cuuint32_t* element_strides = metadata.element_strides;
   CUresult result = cuTensorMapEncodeTiled(
         tensorMap,                    // 输出：填充这个结构体
@@ -182,17 +182,17 @@ void RecTritonKernel::beam_search(torch::Tensor log_probs,
                                   torch::Tensor out_sequence, 
                                   uint32_t max_decode_step, 
                                   uint32_t current_step) {
-  LOG(INFO) << "log_probs.shape: " << log_probs.sizes();
-  LOG(INFO) << "in_sequence.shape: " << in_sequence.sizes();
-  LOG(INFO) << "top_tokens.shape: " << top_tokens.sizes();
-  LOG(INFO) << "top_probs.shape: " << top_probs.sizes();
+// LOG(INFO) << "log_probs.shape: " << log_probs.sizes();
+// LOG(INFO) << "in_sequence.shape: " << in_sequence.sizes();
+// LOG(INFO) << "top_tokens.shape: " << top_tokens.sizes();
+// LOG(INFO) << "top_probs.shape: " << top_probs.sizes();
   
   CUfunction beam_search_kernel;
   uint32_t beam_search_shared_mem_bytes = 0;
 
   switch (log_probs.scalar_type()) {
     case torch::kBFloat16: {
-      LOG(INFO) << "inner log_probs is bf16.";
+// LOG(INFO) << "inner log_probs is bf16.";
       const auto input_dim =
           std::array<int, 3>{static_cast<int>(in_sequence.size(0)),
                              static_cast<int>(in_sequence.size(1)), 
@@ -231,16 +231,16 @@ void RecTritonKernel::beam_search(torch::Tensor log_probs,
       reinterpret_cast<CUdeviceptr>(out_beam_count_prefix_sums.data_ptr());
   CUdeviceptr out_sequence_ptr =
       reinterpret_cast<CUdeviceptr>(out_sequence.data_ptr());
-  LOG(INFO) << "before at::cuda::getCurrentCUDAStream().";
+// LOG(INFO) << "before at::cuda::getCurrentCUDAStream().";
   
   auto stream = at::cuda::getCurrentCUDAStream();
   uint32_t batch_size = in_sequence.size(0);
-  LOG(INFO) << "batch_size: " << batch_size;
-  LOG(INFO) << "current_step: " << current_step;
+// LOG(INFO) << "batch_size: " << batch_size;
+// LOG(INFO) << "current_step: " << current_step;
   uint32_t beam_size = in_sequence.size(1);
-  LOG(INFO) << "beam_size: " << beam_size;
+// LOG(INFO) << "beam_size: " << beam_size;
   uint32_t top_k = top_tokens.size(1);
-  LOG(INFO) << "top_k: " << top_k;
+// LOG(INFO) << "top_k: " << top_k;
   void* args[] = {(void*)&log_probs_ptr,
                   (void*)&in_sequence_ptr,
                   (void*)&top_tokens_ptr,
@@ -255,8 +255,8 @@ void RecTritonKernel::beam_search(torch::Tensor log_probs,
                   (void*)&current_step, 
                   (void*)&current_step};
   uint32_t thread_nums = get_default_thread_nums();
-  LOG(INFO) << "thread_nums: " << thread_nums;
-  LOG(INFO) << "before cuLaunchKernel.";
+// LOG(INFO) << "thread_nums: " << thread_nums;
+// LOG(INFO) << "before cuLaunchKernel.";
   CUDA_CHECK(cuLaunchKernel(beam_search_kernel,
                             batch_size,
                             1,
@@ -268,8 +268,8 @@ void RecTritonKernel::beam_search(torch::Tensor log_probs,
                             stream,
                             args,
                             NULL));
-  LOG(INFO) << "after cuLaunchKernel.";
-  cudaStreamSynchronize(stream);
+// LOG(INFO) << "after cuLaunchKernel.";
+  // cudaStreamSynchronize(stream);
 }
 
 void RecTritonKernel::grouped_cache_select(torch::Tensor beam_index, 
@@ -282,11 +282,12 @@ void RecTritonKernel::grouped_cache_select(torch::Tensor beam_index,
   CHECK_GE(unshared_v_cache.size(), 0) 
     << "kv_cache layer_num should be greater equal 0.";
 
-  LOG(INFO) << "beam_index.shape: " << beam_index.sizes();
-  LOG(INFO) << "unshared_k_cache.shape: " << unshared_k_cache[0].sizes();
-  LOG(INFO) << "unshared_v_cache.shape: " << unshared_v_cache[0].sizes();
-  LOG(INFO) << "block_table.shape: " << block_table.sizes();
-  
+// LOG(INFO) << "beam_index.shape: " << beam_index.sizes();
+// LOG(INFO) << "unshared_k_cache.shape: " << unshared_k_cache[0].sizes();
+// LOG(INFO) << "unshared_v_cache.shape: " << unshared_v_cache[0].sizes();
+// LOG(INFO) << "block_table.shape: " << block_table.sizes();
+  beam_index = torch::zeros_like(beam_index);
+  block_table = torch::zeros_like(block_table);
   uint32_t layer_num = unshared_k_cache.size();
 
   CUfunction grouped_cache_select_kernel;
@@ -295,13 +296,13 @@ void RecTritonKernel::grouped_cache_select(torch::Tensor beam_index,
   
   uint32_t batch_size = unshared_k_cache[0].size(0);
   uint32_t beam_size = unshared_k_cache[0].size(1);
-  LOG(INFO) << "batch_size: " << batch_size;
-  LOG(INFO) << "current_step: " << current_step;
-  LOG(INFO) << "beam_size: " << beam_size;
+// LOG(INFO) << "batch_size: " << batch_size;
+// LOG(INFO) << "current_step: " << current_step;
+// LOG(INFO) << "beam_size: " << beam_size;
 
   switch (unshared_k_cache[0].scalar_type()) {
     case torch::kBFloat16: {
-      LOG(INFO) << "inner unshared_k_cache is bf16.";
+// LOG(INFO) << "inner unshared_k_cache is bf16.";
       const auto input_dim =
           std::array<int, 3>{static_cast<int>(batch_size),
                              static_cast<int>(beam_size), 
@@ -340,15 +341,15 @@ void RecTritonKernel::grouped_cache_select(torch::Tensor beam_index,
   CUdeviceptr block_table_ptr =
       reinterpret_cast<CUdeviceptr>(block_table.data_ptr());
 
-  LOG(INFO) << "before at::cuda::getCurrentCUDAStream().";
+// LOG(INFO) << "before at::cuda::getCurrentCUDAStream().";
   // TODO
   auto stream = at::cuda::getCurrentCUDAStream();
   uint32_t head_num = unshared_k_cache[0].size(2);
-  LOG(INFO) << "head_num: " << head_num;
+// LOG(INFO) << "head_num: " << head_num;
   uint32_t max_decode_step = unshared_k_cache[0].size(3);
-  LOG(INFO) << "max_decode_step: " << max_decode_step;
+// LOG(INFO) << "max_decode_step: " << max_decode_step;
   uint32_t head_dim = unshared_k_cache[0].size(4);
-  LOG(INFO) << "head_dim: " << head_dim;
+// LOG(INFO) << "head_dim: " << head_dim;
   void* args[] = {(void*)&layer_num,
                   (void*)&batch_size,
                   (void*)&beam_index_ptr,
@@ -361,21 +362,21 @@ void RecTritonKernel::grouped_cache_select(torch::Tensor beam_index,
                   (void*)&max_decode_step, 
                   (void*)&head_dim};
   uint32_t thread_nums = get_default_thread_nums();
-  LOG(INFO) << "thread_nums: " << thread_nums;
-  LOG(INFO) << "before cuLaunchKernel.";
-  CUDA_CHECK(cuLaunchKernel(grouped_cache_select_kernel,
-                            layer_num,
-                            batch_size,
-                            head_num,
-                            thread_nums,
-                            1,
-                            1,
-                            grouped_cache_select_shared_mem_bytes,
-                            stream,
-                            args,
-                            NULL));
-  LOG(INFO) << "after cuLaunchKernel.";
-  cudaStreamSynchronize(stream);
+// LOG(INFO) << "thread_nums: " << thread_nums;
+// LOG(INFO) << "before cuLaunchKernel.";
+  // CUDA_CHECK(cuLaunchKernel(grouped_cache_select_kernel,
+  //                           layer_num,
+  //                           batch_size,
+  //                           head_num,
+  //                           thread_nums,
+  //                           1,
+  //                           1,
+  //                           grouped_cache_select_shared_mem_bytes,
+  //                           stream,
+  //                           args,
+  //                           NULL));
+// LOG(INFO) << "after cuLaunchKernel.";
+  // cudaStreamSynchronize(stream);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapper_forward(torch::Tensor q, 
@@ -398,7 +399,7 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
 
   // 获取q张量的形状
   auto q_shape = q.sizes();
-  LOG(INFO) << "q_shape: " << q_shape;
+// LOG(INFO) << "q_shape: " << q_shape;
   int64_t Z = q_shape[0];
   int64_t H = q_shape[1]; 
   int64_t N_CTX = q_shape[2];
@@ -406,7 +407,8 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
 
   // 获取k张量的形状
   auto k_shape = shared_k_cache.sizes();
-  int64_t N_KTX = k_shape[2];
+  // int64_t N_KTX = k_shape[2];
+  int64_t N_KTX = prompt_len;
 
   // 设置块大小并计算填充后的N_CTX
   int64_t BLOCK_M = 64;
@@ -424,7 +426,7 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
 
   // 获取q张量的形状
   q_shape = q.sizes();
-  LOG(INFO) << "q_new_shape: " << q_shape;
+// LOG(INFO) << "q_new_shape: " << q_shape;
   Z = q_shape[0];
   H = q_shape[1]; 
   // N_CTX = q_shape[2];
@@ -442,27 +444,27 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
   uint32_t y_dim = q_shape[0] * q_shape[1] * q_shape[2];
   uint32_t k_dim = k_shape[0] * k_shape[1] * k_shape[2];
 
-  LOG(INFO) << "shared_v_cache.shape: " << shared_v_cache.sizes();
-  LOG(INFO) << "q.shape: " << q.sizes();
-  LOG(INFO) << "shared_k_cache.shape: " << shared_k_cache.sizes();
-  LOG(INFO) << "o.shape: " << o.sizes();
+// LOG(INFO) << "shared_v_cache.shape: " << shared_v_cache.sizes();
+// LOG(INFO) << "q.shape: " << q.sizes();
+// LOG(INFO) << "shared_k_cache.shape: " << shared_k_cache.sizes();
+// LOG(INFO) << "o.shape: " << o.sizes();
   
-  LOG(INFO) << "y_dim: " << y_dim;
-  LOG(INFO) << "k_dim: " << k_dim;
+// LOG(INFO) << "y_dim: " << y_dim;
+// LOG(INFO) << "k_dim: " << k_dim;
 
-  LOG(INFO) << "HEAD_DIM: " << HEAD_DIM;
+// LOG(INFO) << "HEAD_DIM: " << HEAD_DIM;
 
-  LOG(INFO) << "desc_q: ";
+// LOG(INFO) << "desc_q: ";
   uint64_t q_shapes[2] = {y_dim, HEAD_DIM};
   uint64_t q_strides[2] = {HEAD_DIM * 2, 1};
   uint32_t q_block_shape[2] = {64, 64};
   uint32_t q_elem_strides[2] = {1, 1};
   q = q.view({y_dim, HEAD_DIM});
-  LOG(INFO) << "q.scalar_type(): " << q.scalar_type();
-  LOG(INFO) << "q.shape: " << q.sizes();
+// LOG(INFO) << "q.scalar_type(): " << q.scalar_type();
+// LOG(INFO) << "q.shape: " << q.sizes();
   TensorDescriptor desc_q{q, q_shapes, q_strides, q_block_shape, q_elem_strides, 2};
 
-  LOG(INFO) << "desc_k: ";
+// LOG(INFO) << "desc_k: ";
   uint64_t k_shapes[2] = {k_dim, HEAD_DIM};
   uint64_t k_strides[2] = {HEAD_DIM * 2, 1};
   uint32_t k_block_shape[2] = {64, 64};
@@ -470,7 +472,7 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
   shared_k_cache = shared_k_cache.view({k_dim, HEAD_DIM});
   TensorDescriptor desc_k{shared_k_cache, k_shapes, k_strides, k_block_shape, k_elem_strides, 2};
 
-  LOG(INFO) << "desc_v: ";
+// LOG(INFO) << "desc_v: ";
   uint64_t v_shapes[2] = {k_dim, HEAD_DIM};
   uint64_t v_strides[2] = {HEAD_DIM * 2, 1};
   uint32_t v_block_shape[2] = {64, 64};
@@ -478,7 +480,7 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
   shared_v_cache = shared_v_cache.view({k_dim, HEAD_DIM});
   TensorDescriptor desc_v{shared_v_cache, v_shapes, v_strides, v_block_shape, v_elem_strides, 2};
 
-  LOG(INFO) << "desc_o: ";
+// LOG(INFO) << "desc_o: ";
   uint64_t o_shapes[2] = {y_dim, HEAD_DIM};
   uint64_t o_strides[2] = {HEAD_DIM * 2, 1};
   uint32_t o_block_shape[2] = {64, 64};
@@ -486,12 +488,12 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
   o = o.view({y_dim, HEAD_DIM});
   TensorDescriptor desc_o{o, o_shapes, o_strides, o_block_shape, o_elem_strides, 2};
 
-  LOG(INFO) << "sm_scale: " << sm_scale;
-  LOG(INFO) << "M.sizes(): " << M.sizes();
-  LOG(INFO) << "q.sizes(): " << q.sizes();
-  LOG(INFO) << "shared_k_cache.sizes(): " << shared_k_cache.sizes();
-  LOG(INFO) << "shared_v_cache.sizes(): " << shared_v_cache.sizes();
-  LOG(INFO) << "o.sizes(): " << o.sizes();
+// LOG(INFO) << "sm_scale: " << sm_scale;
+// LOG(INFO) << "M.sizes(): " << M.sizes();
+// LOG(INFO) << "q.sizes(): " << q.sizes();
+// LOG(INFO) << "shared_k_cache.sizes(): " << shared_k_cache.sizes();
+// LOG(INFO) << "shared_v_cache.sizes(): " << shared_v_cache.sizes();
+// LOG(INFO) << "o.sizes(): " << o.sizes();
 
   auto [o_shared, M_shared] = attn_fwd_shared(sm_scale, 
                                               M, 
@@ -525,15 +527,15 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attn_fwd_shared(float 
                                       uint32_t batch_size, 
                                       uint32_t beam_width, 
                                       uint32_t prompt_len) {
-  LOG(INFO) << "sm_scale: " << sm_scale;
-  LOG(INFO) << "Z: " << Z;
-  LOG(INFO) << "H: " << H;
-  LOG(INFO) << "N_CTX: " << N_CTX;
-  LOG(INFO) << "N_KTX: " << N_KTX;
-  LOG(INFO) << "HEAD_DIM: " <<HEAD_DIM;
-  LOG(INFO) << "batch_size: " <<batch_size;
-  LOG(INFO) << "beam_width: " <<beam_width;
-  LOG(INFO) << "prompt_len: " <<prompt_len;
+// LOG(INFO) << "sm_scale: " << sm_scale;
+// LOG(INFO) << "Z: " << Z;
+// LOG(INFO) << "H: " << H;
+// LOG(INFO) << "N_CTX: " << N_CTX;
+// LOG(INFO) << "N_KTX: " << N_KTX;
+// LOG(INFO) << "HEAD_DIM: " <<HEAD_DIM;
+// LOG(INFO) << "batch_size: " <<batch_size;
+// LOG(INFO) << "beam_width: " <<beam_width;
+// LOG(INFO) << "prompt_len: " <<prompt_len;
   // 获取kernel配置
   CUfunction attn_fwd_shared_kernel;
   uint32_t attn_fwd_shared_shared_mem_bytes = 0;
@@ -554,23 +556,23 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attn_fwd_shared(float 
       LOG(FATAL) << "Unsupported dtype for shared attention: " << desc_k.base.scalar_type();
   }
 
-  LOG(INFO) << "before create_tensor_map.";
+// LOG(INFO) << "before create_tensor_map.";
   // unified_metadata_
 
-  LOG(INFO) << "tensor_map_q: ";
+// LOG(INFO) << "tensor_map_q: ";
   alignas(64) CUtensorMap tensor_map_q;
   CUDA_CHECK(create_tensor_map(desc_q, &tensor_map_q, 3));
-  LOG(INFO) << "tensor_map_k: ";
+// LOG(INFO) << "tensor_map_k: ";
   alignas(64) CUtensorMap tensor_map_k;
   CUDA_CHECK(create_tensor_map(desc_k, &tensor_map_k, 3));
-  LOG(INFO) << "tensor_map_v: ";
+// LOG(INFO) << "tensor_map_v: ";
   alignas(64) CUtensorMap tensor_map_v;
   CUDA_CHECK(create_tensor_map(desc_v, &tensor_map_v, 3));
-  LOG(INFO) << "tensor_map_o: ";
+// LOG(INFO) << "tensor_map_o: ";
   alignas(64) CUtensorMap tensor_map_o;
   CUDA_CHECK(create_tensor_map(desc_o, &tensor_map_o, 3));
 
-  LOG(INFO) << "after create_tensor_map.";
+// LOG(INFO) << "after create_tensor_map.";
 
   CUdeviceptr M_shared_ptr = 
     reinterpret_cast<CUdeviceptr>(M_shared.data_ptr());
@@ -634,8 +636,7 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attn_fwd_shared(float 
   auto stream = at::cuda::getCurrentCUDAStream();
   uint32_t thread_nums = get_default_thread_nums();
   
-  // thread_nums *= 2;
-  LOG(INFO) << "thread_nums: " << thread_nums;
+// LOG(INFO) << "thread_nums: " << thread_nums;
   CUDA_CHECK(cuLaunchKernel(attn_fwd_shared_kernel,
                             grid_x, 
                             grid_y, 
@@ -647,13 +648,13 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attn_fwd_shared(float 
                             stream,
                             args,
                             NULL));
-  cudaStreamSynchronize(stream);
+  // cudaStreamSynchronize(stream);
 
   
   auto o = desc_o.base;
   
   o = o.view({Z, H, N_CTX, HEAD_DIM});
-  LOG(INFO) << "o.shape: " << o.sizes();
+// LOG(INFO) << "o.shape: " << o.sizes();
   // 对 o 进行切片: o[:, :, :N_CTX, :]
   auto o_sliced = o.slice(2, 0, N_CTX);  // 在第2维(seq_len)上从0切到N_CTX
 
@@ -681,7 +682,7 @@ void RecTritonKernel::attention_unshared_wrapper_forward(torch::Tensor q_unshare
                                                          uint32_t N_KTX,
                                                          uint32_t batch_size, 
                                                          uint32_t prompt_length) {
-  LOG(INFO) << "desc_q: ";
+// LOG(INFO) << "desc_q: ";
   
   // uint64_t q_shapes[2] = {total_beams, num_heads * head_dim};
   // uint64_t q_strides[2] = {num_heads * head_dim * 2, 1};
@@ -694,7 +695,7 @@ void RecTritonKernel::attention_unshared_wrapper_forward(torch::Tensor q_unshare
 
   TensorDescriptor desc_q{q_unshared, q_shapes, q_strides, q_block_shape, q_elem_strides, 2};
 
-  LOG(INFO) << "desc_k: ";
+// LOG(INFO) << "desc_k: ";
   
   uint64_t k_shapes[2] = {kv_heads * head_dim, kv_total_size};
   uint64_t k_strides[2] = {k_shapes[0] * 2, k_shapes[0] * k_shapes[1] * 2};
@@ -704,7 +705,7 @@ void RecTritonKernel::attention_unshared_wrapper_forward(torch::Tensor q_unshare
   unshared_k_cache = unshared_k_cache.view({kv_total_size, kv_heads * head_dim});
   TensorDescriptor desc_k{unshared_k_cache, k_shapes, k_strides, k_block_shape, k_elem_strides, 2};
 
-  LOG(INFO) << "desc_v: ";
+// LOG(INFO) << "desc_v: ";
   
   uint64_t v_shapes[2] = {kv_heads * head_dim, kv_total_size};
   uint64_t v_strides[2] = {v_shapes[0] * 2, v_shapes[0] * v_shapes[1] * 2};
@@ -713,7 +714,7 @@ void RecTritonKernel::attention_unshared_wrapper_forward(torch::Tensor q_unshare
   unshared_v_cache = unshared_v_cache.view({kv_total_size, kv_heads * head_dim});
   TensorDescriptor desc_v{unshared_v_cache, v_shapes, v_strides, v_block_shape, v_elem_strides, 2};
 
-  LOG(INFO) << "desc_o: ";
+// LOG(INFO) << "desc_o: ";
   
   uint64_t o_shapes[2] = {num_heads * head_dim, total_beams};
   uint64_t o_strides[2] = {num_heads * head_dim * 2, num_heads * head_dim * total_beams * 2};
@@ -776,20 +777,20 @@ void RecTritonKernel::attn_fwd_unshared(const TensorDescriptor& desc_q,
   }
   
   // 准备kernel参数
-  LOG(INFO) << "tensor_map_q: ";
+// LOG(INFO) << "tensor_map_q: ";
   alignas(64) CUtensorMap tensor_map_q;
   CUDA_CHECK(create_tensor_map(desc_q, &tensor_map_q, 0));
-  LOG(INFO) << "tensor_map_k: ";
+// LOG(INFO) << "tensor_map_k: ";
   alignas(64) CUtensorMap tensor_map_k;
   CUDA_CHECK(create_tensor_map(desc_unshared_k, &tensor_map_k, 3));
-  LOG(INFO) << "tensor_map_v: ";
+// LOG(INFO) << "tensor_map_v: ";
   alignas(64) CUtensorMap tensor_map_v;
   CUDA_CHECK(create_tensor_map(desc_unshared_v, &tensor_map_v, 3));
-  LOG(INFO) << "tensor_map_o: ";
+// LOG(INFO) << "tensor_map_o: ";
   alignas(64) CUtensorMap tensor_map_o;
   CUDA_CHECK(create_tensor_map(desc_o, &tensor_map_o, 0));
 
-  LOG(INFO) << "after create_tensor_map.";
+// LOG(INFO) << "after create_tensor_map.";
   
   CUdeviceptr M_unshared_ptr = reinterpret_cast<CUdeviceptr>(M_unshared.data_ptr());
   CUdeviceptr L_unshared_ptr = reinterpret_cast<CUdeviceptr>(L_unshared.data_ptr());
@@ -816,38 +817,32 @@ void RecTritonKernel::attn_fwd_unshared(const TensorDescriptor& desc_q,
     (void*)&sm_scale,
     (void*)&M_unshared_ptr,
     (void*)&L_unshared_ptr,
-
     (void*)&kv_heads,
-
     (void*)&tensor_map_q,
     (void*)&q_shape_0,
     (void*)&q_shape_1,
     (void*)&desc_q.unified_metadata_.strides[0],
     (void*)&q_stride_1,
-    
     (void*)&tensor_map_k,
     (void*)&k_shape_0,
     (void*)&k_shape_1,
     (void*)&desc_unshared_k.unified_metadata_.strides[0],
     (void*)&k_stride_1,
-    
     (void*)&tensor_map_v,
     (void*)&v_shape_0,
     (void*)&v_shape_1,
     (void*)&desc_unshared_v.unified_metadata_.strides[0],
     (void*)&v_stride_1,
-    
     (void*)&tensor_map_o,
     (void*)&o_shape_0,
     (void*)&o_shape_1,
     (void*)&desc_o.unified_metadata_.strides[0],
     (void*)&o_stride_1,
-    
     (void*)&total_beams,
     (void*)&beam_size,
     (void*)&max_decode_step,
-    (void*)&current_step,
-
+    (void*)&current_step, 
+    (void*)&prompt_length,
     (void*)&current_step,  // fake param
     (void*)&current_step       // fake param
   };
@@ -866,7 +861,7 @@ void RecTritonKernel::attn_fwd_unshared(const TensorDescriptor& desc_q,
                             stream,
                             args,
                             NULL));
-  cudaStreamSynchronize(stream);
+  // cudaStreamSynchronize(stream);
 }
 
 void RecTritonKernel::combine_attention_kernel(torch::Tensor shared_out_2d, 
@@ -944,7 +939,7 @@ void RecTritonKernel::combine_attention_kernel(torch::Tensor shared_out_2d,
                             stream,
                             args,
                             NULL));
-  cudaStreamSynchronize(stream);
+  // cudaStreamSynchronize(stream);
 }
 
 torch::Tensor RecTritonKernel::xattention(torch::Tensor q, 
@@ -956,14 +951,14 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
                                  uint32_t beam_size, 
                                  float sm_scale, 
                                  uint32_t prompt_len) {
-  LOG(INFO) << "q.shape: " << q.sizes();
-  LOG(INFO) << "shared_k_cache.shape: " << shared_k_cache.sizes();
-  LOG(INFO) << "shared_v_cache.shape: " << shared_v_cache.sizes();
-  LOG(INFO) << "unshared_k_cache.shape: " << unshared_k_cache.sizes();
-  LOG(INFO) << "unshared_v_cache.shape: " << unshared_v_cache.sizes();
-  LOG(INFO) << "prompt_len: " << prompt_len;
-  LOG(INFO) << "decode_step: " << decode_step;
-  LOG(INFO) << "beam_size: " << beam_size;
+// LOG(INFO) << "q.shape: " << q.sizes();
+// LOG(INFO) << "shared_k_cache.shape: " << shared_k_cache.sizes();
+// LOG(INFO) << "shared_v_cache.shape: " << shared_v_cache.sizes();
+// LOG(INFO) << "unshared_k_cache.shape: " << unshared_k_cache.sizes();
+// LOG(INFO) << "unshared_v_cache.shape: " << unshared_v_cache.sizes();
+LOG(INFO) << "prompt_len: " << prompt_len;
+// LOG(INFO) << "decode_step: " << decode_step;
+// LOG(INFO) << "beam_size: " << beam_size;
   
   auto device = q.device();
   // ==================== 解析输入形状 ====================
@@ -999,20 +994,20 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
       LOG(FATAL) << "Unsupported query shape: " << q.sizes() << ". Expected 3D or 4D tensor.";
   }
   
-  LOG(INFO) << "batch: " << batch;
-  LOG(INFO) << "num_heads: " << num_heads;
-  LOG(INFO) << "head_dim: " << head_dim;
-  LOG(INFO) << "total_beams: " << total_beams;
+// LOG(INFO) << "batch: " << batch;
+// LOG(INFO) << "num_heads: " << num_heads;
+// LOG(INFO) << "head_dim: " << head_dim;
+// LOG(INFO) << "total_beams: " << total_beams;
 
   auto shared_k_shape = shared_k_cache.sizes();
   uint32_t kv_heads = shared_k_shape[1];
 
-  LOG(INFO) << "kv_heads: " << kv_heads; 
+// LOG(INFO) << "kv_heads: " << kv_heads; 
 
   // float sm_scale = 0.08838834764831843;
 
   auto unshared_k_shape = unshared_k_cache.sizes();
-  LOG(INFO) << "unshared_k_shape: " << unshared_k_shape;
+// LOG(INFO) << "unshared_k_shape: " << unshared_k_shape;
   if (unshared_k_shape.size() == 5) {
     int64_t batch_cache = unshared_k_shape[0];
     int64_t beamsize_cache = unshared_k_shape[1];
@@ -1021,10 +1016,18 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
     int64_t head_dim_cache = unshared_k_shape[4];
     
     // Assert batch/beam size match
-    assert(batch_cache == batch && beamsize_cache == beamsize && 
-           "Batch/beam size mismatch");
+    // assert(batch_cache == batch && beamsize_cache == beamsize && 
+    //        "Batch/beam size mismatch");
     
     // Reshape from 5D to 4D
+    // unshared_k_cache = unshared_k_cache.reshape({
+    //   batch * beam_size, kv_heads, max_decode_step_cache, head_dim_cache
+    // });
+    // unshared_v_cache = unshared_v_cache.reshape({
+    //   batch * beam_size, kv_heads, max_decode_step_cache, head_dim_cache
+    // });
+    unshared_k_cache = unshared_k_cache.slice(0, 0, batch);
+    unshared_v_cache = unshared_v_cache.slice(0, 0, batch);
     unshared_k_cache = unshared_k_cache.reshape({
       batch * beam_size, kv_heads, max_decode_step_cache, head_dim_cache
     });
@@ -1046,10 +1049,10 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
           );
       }
 
-      LOG(INFO) << "beam_total_cache: " << beam_total_cache;
-      LOG(INFO) << "kv_heads_cache: " << kv_heads_cache;
-      LOG(INFO) << "max_decode_step_cache: " << max_decode_step_cache;
-      LOG(INFO) << "head_dim_cache: " << head_dim_cache;
+// LOG(INFO) << "beam_total_cache: " << beam_total_cache;
+// LOG(INFO) << "kv_heads_cache: " << kv_heads_cache;
+// LOG(INFO) << "max_decode_step_cache: " << max_decode_step_cache;
+// LOG(INFO) << "head_dim_cache: " << head_dim_cache;
       
   } else {
       std::string shape_str = "[";
@@ -1066,26 +1069,33 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
   }
 
   
-  
   // ==================== Shared Attention ====================
-  // if (num_heads != kv_heads) {
-  //   int64_t repeat_factor = num_heads / kv_heads;
+  if (num_heads != kv_heads) {
+    int64_t repeat_factor = num_heads / kv_heads;
     
-  //   shared_k_cache = shared_k_cache.unsqueeze(2).repeat({1, 1, repeat_factor, 1, 1});
+    shared_k_cache = shared_k_cache.unsqueeze(2).repeat({1, 1, repeat_factor, 1, 1});
     
-  //   shared_k_cache = shared_k_cache.view({batch, num_heads, prompt_len, head_dim});
+    // prompt_len = shared_k_cache.numel() / (batch * num_heads * head_dim);
+    // prompt_len
+// LOG(INFO) << "prompt_len: " << prompt_len;
+    // LOG(INFO)
+    shared_k_cache = shared_k_cache.view({batch, num_heads, -1, head_dim});
+    shared_k_cache = shared_k_cache.slice(2, 0, prompt_len);
     
-  //   shared_v_cache = shared_v_cache.unsqueeze(2).repeat({1, 1, repeat_factor, 1, 1});
-  //   shared_v_cache = shared_v_cache.view({batch, num_heads, prompt_len, head_dim});
-  // }
+    
+    shared_v_cache = shared_v_cache.unsqueeze(2).repeat({1, 1, repeat_factor, 1, 1});
+    // shared_v_cache = shared_v_cache.view({batch, num_heads, prompt_len, head_dim});
+    shared_v_cache = shared_v_cache.view({batch, num_heads, -1, head_dim});
+    shared_v_cache = shared_v_cache.slice(2, 0, prompt_len);
+  }
 
   
   
-  LOG(INFO) << "q_shared.sizes(): " << q_shared.sizes();
-  LOG(INFO) << "shared_k_cache.sizes(): " << shared_k_cache.sizes();
-  LOG(INFO) << "shared_v_cache.sizes(): " << shared_v_cache.sizes();
-  LOG(INFO) << "sm_scale: " << sm_scale;
-  LOG(INFO) << "warp_specialize: " << warp_specialize;
+// LOG(INFO) << "q_shared.sizes(): " << q_shared.sizes();
+LOG(INFO) << "shared_k_cache.sizes(): " << shared_k_cache.sizes();
+LOG(INFO) << "shared_v_cache.sizes(): " << shared_v_cache.sizes();
+// LOG(INFO) << "sm_scale: " << sm_scale;
+// LOG(INFO) << "warp_specialize: " << warp_specialize;
   // Forward pass for shared attention
   // auto [o_shared, M_shared] = attention_shared_wrapper_forward(
   //     q, shared_k_cache, shared_v_cache, sm_scale, warp_specialize
@@ -1094,8 +1104,8 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
                                   q_shared, shared_k_cache, shared_v_cache, sm_scale, 
                                   batch, beam_size, prompt_len
                               );
-  LOG(INFO) << "o_shared.sizes(): " << o_shared.sizes();
-  LOG(INFO) << "M_shared.sizes(): " << M_shared.sizes();
+// LOG(INFO) << "o_shared.sizes(): " << o_shared.sizes();
+// LOG(INFO) << "M_shared.sizes(): " << M_shared.sizes();
   // ==================== 2. Unshared Attention ====================
   // torch.empty_like(q_unshared)
   auto o_unshared = torch::empty_like(q_unshared);
@@ -1108,18 +1118,19 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
   auto M_unshared = torch::empty({num_heads, total_beams, 1}, options);
   auto L_unshared = torch::empty({num_heads, total_beams, 1}, options);
 
-  LOG(INFO) << "o_unshared.sizes(): " << o_unshared.sizes();
-  LOG(INFO) << "M_unshared.sizes(): " << M_unshared.sizes();
-  LOG(INFO) << "L_unshared.sizes(): " << L_unshared.sizes();
-  LOG(INFO) << "unshared_k_cache.sizes(): " << unshared_k_cache.sizes();
-  LOG(INFO) << "unshared_v_cache.sizes(): " << unshared_v_cache.sizes();
+// LOG(INFO) << "o_unshared.sizes(): " << o_unshared.sizes();
+// LOG(INFO) << "M_unshared.sizes(): " << M_unshared.sizes();
+// LOG(INFO) << "L_unshared.sizes(): " << L_unshared.sizes();
+// LOG(INFO) << "unshared_k_cache.sizes(): " << unshared_k_cache.sizes();
+// LOG(INFO) << "unshared_v_cache.sizes(): " << unshared_v_cache.sizes();
 
-  uint32_t max_decode_step = 2;
+  uint32_t max_decode_step = 3;
   uint32_t kv_total_size = total_beams * max_decode_step;
-  uint32_t N_KTX = max_decode_step;
+  
+  uint32_t N_KTX = prompt_len;
 
-  LOG(INFO) << "N_KTX: " << N_KTX;
-  LOG(INFO) << "kv_total_size: " << kv_total_size;
+// LOG(INFO) << "N_KTX: " << N_KTX;
+// LOG(INFO) << "kv_total_size: " << kv_total_size;
 
   attention_unshared_wrapper_forward(q_unshared, 
                                      unshared_k_cache, 
@@ -1139,11 +1150,11 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
                                      N_KTX, 
                                      batch, 
                                      prompt_len);
-  LOG(INFO) << "after attention_unshared_wrapper_forward.";
+// LOG(INFO) << "after attention_unshared_wrapper_forward.";
 
-  LOG(INFO) << "o_unshared.sizes(): " << o_unshared.sizes() << ", scalar_type: " << o_unshared.scalar_type();
-  LOG(INFO) << "M_unshared.sizes(): " << M_unshared.sizes() << ", scalar_type: " << M_unshared.scalar_type();
-  LOG(INFO) << "L_unshared.sizes(): " << L_unshared.sizes() << ", scalar_type: " << L_unshared.scalar_type();
+// LOG(INFO) << "o_unshared.sizes(): " << o_unshared.sizes() << ", scalar_type: " << o_unshared.scalar_type();
+// LOG(INFO) << "M_unshared.sizes(): " << M_unshared.sizes() << ", scalar_type: " << M_unshared.scalar_type();
+// LOG(INFO) << "L_unshared.sizes(): " << L_unshared.sizes() << ", scalar_type: " << L_unshared.scalar_type();
 
 
   // 重塑shared输出
@@ -1165,13 +1176,13 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
   auto L_shared = 
     torch::ones_like(M_shared).reshape({num_heads, total_beams});
 
-  LOG(INFO) << "o_unshared.sizes(): " << o_unshared.sizes() << ", scalar_type: " << o_unshared.scalar_type();
-  LOG(INFO) << "M_unshared.sizes(): " << M_unshared.sizes() << ", scalar_type: " << M_unshared.scalar_type();
-  LOG(INFO) << "L_unshared.sizes(): " << L_unshared.sizes() << ", scalar_type: " << L_unshared.scalar_type();
-  LOG(INFO) << "shared_out_2d.sizes(): " << shared_out_2d.sizes() << ", scalar_type: " << shared_out_2d.scalar_type();
-  LOG(INFO) << "unshared_out_2d.sizes(): " << unshared_out_2d.sizes() << ", scalar_type: " << unshared_out_2d.scalar_type();
-  LOG(INFO) << "final_out_2d.sizes(): " << final_out_2d.sizes() << ", scalar_type: " << final_out_2d.scalar_type();
-  LOG(INFO) << "L_shared.sizes(): " << L_shared.sizes() << ", scalar_type: " << L_shared.scalar_type();
+// LOG(INFO) << "o_unshared.sizes(): " << o_unshared.sizes() << ", scalar_type: " << o_unshared.scalar_type();
+// LOG(INFO) << "M_unshared.sizes(): " << M_unshared.sizes() << ", scalar_type: " << M_unshared.scalar_type();
+// LOG(INFO) << "L_unshared.sizes(): " << L_unshared.sizes() << ", scalar_type: " << L_unshared.scalar_type();
+// LOG(INFO) << "shared_out_2d.sizes(): " << shared_out_2d.sizes() << ", scalar_type: " << shared_out_2d.scalar_type();
+// LOG(INFO) << "unshared_out_2d.sizes(): " << unshared_out_2d.sizes() << ", scalar_type: " << unshared_out_2d.scalar_type();
+// LOG(INFO) << "final_out_2d.sizes(): " << final_out_2d.sizes() << ", scalar_type: " << final_out_2d.scalar_type();
+// LOG(INFO) << "L_shared.sizes(): " << L_shared.sizes() << ", scalar_type: " << L_shared.scalar_type();
 
   // // 调用combine kernel
   combine_attention_kernel(shared_out_2d, 
@@ -1187,7 +1198,7 @@ torch::Tensor RecTritonKernel::xattention(torch::Tensor q,
                            batch, 
                            prompt_len);
   
-  LOG(INFO) << "final_out_2d.shape: " << final_out_2d.sizes();
+// LOG(INFO) << "final_out_2d.shape: " << final_out_2d.sizes();
   return final_out_2d;
 }
 

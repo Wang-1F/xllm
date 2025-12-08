@@ -84,115 +84,115 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
 namespace {
 
 void printModelInputParams(const ModelInputParams& params) {
-  LOG(INFO) << "=== ModelInputParams Debug Info ===";
+LOG(INFO) << "=== ModelInputParams Debug Info ===";
   
   // Basic boolean and integer fields
-  LOG(INFO) << "empty_kv_cache: " << params.empty_kv_cache;
-  LOG(INFO) << "is_prefill: " << params.is_prefill;
-  LOG(INFO) << "global_empty_kv_cache: " << params.global_empty_kv_cache;
-  LOG(INFO) << "num_sequences: " << params.num_sequences;
-  LOG(INFO) << "kv_max_seq_len: " << params.kv_max_seq_len;
-  LOG(INFO) << "q_max_seq_len: " << params.q_max_seq_len;
-  LOG(INFO) << "prefill_seq_len: " << params.prefill_seq_len;
-  LOG(INFO) << "beam_width: " << params.beam_width;
-  LOG(INFO) << "current_round: " << params.current_round;
-  LOG(INFO) << "total_round: " << params.total_round;
+// LOG(INFO) << "empty_kv_cache: " << params.empty_kv_cache;
+// LOG(INFO) << "is_prefill: " << params.is_prefill;
+// LOG(INFO) << "global_empty_kv_cache: " << params.global_empty_kv_cache;
+// LOG(INFO) << "num_sequences: " << params.num_sequences;
+// LOG(INFO) << "kv_max_seq_len: " << params.kv_max_seq_len;
+// LOG(INFO) << "q_max_seq_len: " << params.q_max_seq_len;
+// LOG(INFO) << "prefill_seq_len: " << params.prefill_seq_len;
+// LOG(INFO) << "beam_width: " << params.beam_width;
+// LOG(INFO) << "current_round: " << params.current_round;
+// LOG(INFO) << "total_round: " << params.total_round;
   
   // Vector fields
-  LOG(INFO) << "kv_seq_lens_vec size: " << params.kv_seq_lens_vec.size();
+// LOG(INFO) << "kv_seq_lens_vec size: " << params.kv_seq_lens_vec.size();
   if (!params.kv_seq_lens_vec.empty()) {
       std::ostringstream oss;
       for (size_t i = 0; i < params.kv_seq_lens_vec.size() && i < 10; ++i) {
           oss << params.kv_seq_lens_vec[i] << " ";
       }
       if (params.kv_seq_lens_vec.size() > 10) oss << "...";
-      LOG(INFO) << "kv_seq_lens_vec: [" << oss.str() << "]";
+// LOG(INFO) << "kv_seq_lens_vec: [" << oss.str() << "]";
   }
   
-  LOG(INFO) << "q_seq_lens_vec size: " << params.q_seq_lens_vec.size();
+// LOG(INFO) << "q_seq_lens_vec size: " << params.q_seq_lens_vec.size();
   if (!params.q_seq_lens_vec.empty()) {
       std::ostringstream oss;
       for (size_t i = 0; i < params.q_seq_lens_vec.size() && i < 10; ++i) {
           oss << params.q_seq_lens_vec[i] << " ";
       }
       if (params.q_seq_lens_vec.size() > 10) oss << "...";
-      LOG(INFO) << "q_seq_lens_vec: [" << oss.str() << "]";
+// LOG(INFO) << "q_seq_lens_vec: [" << oss.str() << "]";
   }
   
-  LOG(INFO) << "decode_kv_seq_lens_vec size: " << params.decode_kv_seq_lens_vec.size();
-  LOG(INFO) << "decode_q_seq_lens_vec size: " << params.decode_q_seq_lens_vec.size();
+// LOG(INFO) << "decode_kv_seq_lens_vec size: " << params.decode_kv_seq_lens_vec.size();
+// LOG(INFO) << "decode_q_seq_lens_vec size: " << params.decode_q_seq_lens_vec.size();
   
-  LOG(INFO) << "dp_global_token_nums size: " << params.dp_global_token_nums.size();
+// LOG(INFO) << "dp_global_token_nums size: " << params.dp_global_token_nums.size();
   if (!params.dp_global_token_nums.empty()) {
       std::ostringstream oss;
       for (size_t i = 0; i < params.dp_global_token_nums.size() && i < 10; ++i) {
           oss << params.dp_global_token_nums[i] << " ";
       }
       if (params.dp_global_token_nums.size() > 10) oss << "...";
-      LOG(INFO) << "dp_global_token_nums: [" << oss.str() << "]";
+// LOG(INFO) << "dp_global_token_nums: [" << oss.str() << "]";
   }
   
-  LOG(INFO) << "embedding_ids size: " << params.embedding_ids.size();
-  LOG(INFO) << "extra_token_ids size: " << params.extra_token_ids.size();
+// LOG(INFO) << "embedding_ids size: " << params.embedding_ids.size();
+// LOG(INFO) << "extra_token_ids size: " << params.extra_token_ids.size();
   
   // Decode sequence range
-  LOG(INFO) << "decode_seq_range: [" << params.decode_seq_range.first 
-            << ", " << params.decode_seq_range.second << "]";
+// LOG(INFO) << "decode_seq_range: [" << params.decode_seq_range.first 
+            // << ", " << params.decode_seq_range.second << "]";
   
   // Tensor fields - check if defined and print basic info
   auto printTensorInfo = [](const torch::Tensor& tensor, const std::string& name) {
       if (tensor.defined()) {
-          LOG(INFO) << name << " - shape: " << tensor.sizes() 
+LOG(INFO) << name << " - shape: " << tensor.sizes() 
                     << ", dtype: " << tensor.dtype() 
                     << ", device: " << tensor.device();
       } else {
-          LOG(INFO) << name << " - undefined";
+LOG(INFO) << name << " - undefined";
       }
   };
   
   printTensorInfo(params.q_seq_lens, "q_seq_lens");
   printTensorInfo(params.kv_seq_lens, "kv_seq_lens");
-  printTensorInfo(params.decode_q_seq_lens, "decode_q_seq_lens");
-  printTensorInfo(params.decode_kv_seq_lens, "decode_kv_seq_lens");
-  printTensorInfo(params.new_cache_slots, "new_cache_slots");
-  printTensorInfo(params.block_tables, "block_tables");
-  printTensorInfo(params.input_embedding, "input_embedding");
-  printTensorInfo(params.visual_pos_masks, "visual_pos_masks");
-  printTensorInfo(params.src_block_indices, "src_block_indices");
-  printTensorInfo(params.dst_block_indices, "dst_block_indices");
-  printTensorInfo(params.cum_sum, "cum_sum");
-  printTensorInfo(params.expert_load_data, "expert_load_data");
-  printTensorInfo(params.new_cache_slot_offsets, "new_cache_slot_offsets");
-  printTensorInfo(params.kv_cache_start_offsets, "kv_cache_start_offsets");
-  printTensorInfo(params.graph_buffer, "graph_buffer");
-  printTensorInfo(params.paged_kv_indptr, "paged_kv_indptr");
-  printTensorInfo(params.paged_kv_indices, "paged_kv_indices");
-  printTensorInfo(params.paged_kv_last_page_len, "paged_kv_last_page_len");
-  printTensorInfo(params.beam_width_tensor, "beam_width_tensor");
-  printTensorInfo(params.current_round_tensor, "current_round_tensor");
+  // printTensorInfo(params.decode_q_seq_lens, "decode_q_seq_lens");
+  // printTensorInfo(params.decode_kv_seq_lens, "decode_kv_seq_lens");
+  // printTensorInfo(params.new_cache_slots, "new_cache_slots");
+  // printTensorInfo(params.block_tables, "block_tables");
+  // printTensorInfo(params.input_embedding, "input_embedding");
+  // printTensorInfo(params.visual_pos_masks, "visual_pos_masks");
+  // printTensorInfo(params.src_block_indices, "src_block_indices");
+  // printTensorInfo(params.dst_block_indices, "dst_block_indices");
+  // printTensorInfo(params.cum_sum, "cum_sum");
+  // printTensorInfo(params.expert_load_data, "expert_load_data");
+  // printTensorInfo(params.new_cache_slot_offsets, "new_cache_slot_offsets");
+  // printTensorInfo(params.kv_cache_start_offsets, "kv_cache_start_offsets");
+  // printTensorInfo(params.graph_buffer, "graph_buffer");
+  // printTensorInfo(params.paged_kv_indptr, "paged_kv_indptr");
+  // printTensorInfo(params.paged_kv_indices, "paged_kv_indices");
+  // printTensorInfo(params.paged_kv_last_page_len, "paged_kv_last_page_len");
+  // printTensorInfo(params.beam_width_tensor, "beam_width_tensor");
+  // printTensorInfo(params.current_round_tensor, "current_round_tensor");
   
   // Vector of tensors
-  LOG(INFO) << "deep_stacks size: " << params.deep_stacks.size();
+// LOG(INFO) << "deep_stacks size: " << params.deep_stacks.size();
   for (size_t i = 0; i < params.deep_stacks.size(); ++i) {
       printTensorInfo(params.deep_stacks[i], "deep_stacks[" + std::to_string(i) + "]");
   }
   
-  LOG(INFO) << "shared_k_caches size: " << params.shared_k_caches.size();
-  LOG(INFO) << "shared_v_caches size: " << params.shared_v_caches.size();
-  LOG(INFO) << "current_round_tensor_list size: " << params.current_round_tensor_list.size();
-  LOG(INFO) << "decode_positions_tensor_list size: " << params.decode_positions_tensor_list.size();
+// LOG(INFO) << "shared_k_caches size: " << params.shared_k_caches.size();
+// LOG(INFO) << "shared_v_caches size: " << params.shared_v_caches.size();
+// LOG(INFO) << "current_round_tensor_list size: " << params.current_round_tensor_list.size();
+// LOG(INFO) << "decode_positions_tensor_list size: " << params.decode_positions_tensor_list.size();
   
   // Cache block info vectors
-  LOG(INFO) << "async_copy_out_blocks size: " << params.async_copy_out_blocks.size();
-  LOG(INFO) << "copy_out_blocks size: " << params.copy_out_blocks.size();
-  LOG(INFO) << "copy_in_blocks size: " << params.copy_in_blocks.size();
-  LOG(INFO) << "swap_blocks size: " << params.swap_blocks.size();
+// LOG(INFO) << "async_copy_out_blocks size: " << params.async_copy_out_blocks.size();
+// LOG(INFO) << "copy_out_blocks size: " << params.copy_out_blocks.size();
+// LOG(INFO) << "copy_in_blocks size: " << params.copy_in_blocks.size();
+// LOG(INFO) << "swap_blocks size: " << params.swap_blocks.size();
   
 #if defined(USE_NPU)
-  LOG(INFO) << "layer_synchronizer: " << (params.layer_synchronizer ? "defined" : "nullptr");
+// LOG(INFO) << "layer_synchronizer: " << (params.layer_synchronizer ? "defined" : "nullptr");
 #endif
   
-  LOG(INFO) << "=== End ModelInputParams Debug Info ===";
+LOG(INFO) << "=== End ModelInputParams Debug Info ===";
 }
 
 
@@ -200,10 +200,10 @@ void printModelInputParams(const ModelInputParams& params) {
 
 std::optional<ForwardOutput> LLMWorkerImpl::step(
     const BatchedForwardInputs& inputs) {
-  LOG(INFO) << "inner LLMWorkerImpl::step.";
+// LOG(INFO) << "inner LLMWorkerImpl::step.";
   Timer timer;
   // Only enter multi-round decode when explicitly enabled via global flag.
-  LOG(INFO) << "inputs.micro_inputs.empty(): " << inputs.micro_inputs.empty();
+// LOG(INFO) << "inputs.micro_inputs.empty(): " << inputs.micro_inputs.empty();
   LOG(INFO ) << "inputs.micro_inputs[0].total_round: " << inputs.micro_inputs[0].total_round;
   if (FLAGS_max_decode_rounds > 0 && !inputs.micro_inputs.empty() &&
       inputs.micro_inputs[0].total_round > 0) {
@@ -253,23 +253,23 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(
 
   // temporarily use [0], will be adapted in next pr
   // call model executor forward to get hidden states
-  LOG(INFO) << "input_params_micro_batches.size(): " << 
+// LOG(INFO) << "input_params_micro_batches.size(): " << 
     input_params_micro_batches.size();
   for (const auto& input_param : input_params_micro_batches) {
     printModelInputParams(input_param);
   }
-  LOG(INFO) << "flatten_tokens_micro_batches.size: " << flatten_tokens_micro_batches.size();
+// LOG(INFO) << "flatten_tokens_micro_batches.size: " << flatten_tokens_micro_batches.size();
   for (const auto& flatten_token : flatten_tokens_micro_batches) {
-    LOG(INFO) << flatten_token.sizes();
+// LOG(INFO) << flatten_token.sizes();
   }
-  LOG(INFO) << "flatten_positions_micro_batches.size: " << flatten_positions_micro_batches.size();
+// LOG(INFO) << "flatten_positions_micro_batches.size: " << flatten_positions_micro_batches.size();
   for (const auto& flatten_position : flatten_positions_micro_batches) {
-    LOG(INFO) << flatten_position.sizes();
+// LOG(INFO) << flatten_position.sizes();
   }
-  LOG(INFO) << "kv_caches_.size(): " << kv_caches_.size();
+// LOG(INFO) << "kv_caches_.size(): " << kv_caches_.size();
   for (const auto& kv_cache : kv_caches_) {
-    LOG(INFO) << kv_cache.get_k_cache().sizes();
-    LOG(INFO) << kv_cache.get_v_cache().sizes();
+// LOG(INFO) << kv_cache.get_k_cache().sizes();
+// LOG(INFO) << kv_cache.get_v_cache().sizes();
   }
   auto hidden_states = model_executor_->forward(flatten_tokens_micro_batches,
                                                 flatten_positions_micro_batches,
@@ -341,7 +341,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(
     // set beam search output to output
     output.beam_search_output = beam_search_output;
 
-    LOG(INFO) << "out_tokens.sizes(): " << output.beam_search_output.out_tokens.sizes();
+// LOG(INFO) << "out_tokens.sizes(): " << output.beam_search_output.out_tokens.sizes();
   }
 
   // if running in multi_stream_parallel step, all micro batches
@@ -400,7 +400,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(
 // unshared是从Kv_cache拿的
 std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
     const BatchedForwardInputs& inputs) {
-  LOG(INFO) << "inner LLMWorkerImpl::step_multi_round.";
+// LOG(INFO) << "inner LLMWorkerImpl::step_multi_round.";
   device_.set_device();
   Timer timer;
   std::vector<torch::Tensor> flatten_tokens_micro_batches;
@@ -448,7 +448,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       torch::empty({num_seq, 1}, int_options);
   auto out_seqgroup = sequence_group.clone();
   for (int32_t round = 0; round < total_rounds; ++round) {
-    LOG(INFO) << "round: " << round;
+// LOG(INFO) << "round: " << round;
     const auto& concated_sampling_params =
         round > 0 ? inputs.concated_decoder_sampling_params
                   : inputs.concated_sampling_params;
@@ -458,35 +458,36 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       if (!mip.current_round_tensor_list.empty() && round >= 0 &&
           round < static_cast<int32_t>(mip.current_round_tensor_list.size())) {
         mip.current_round_tensor = mip.current_round_tensor_list[round];
-        mip.current_round = round;
       }
+      mip.current_round = round;
       mip.beam_width = inputs.micro_inputs[0].beam_width;
+// LOG(INFO) << "mip.beam_width: " << mip.beam_width;
     }
-    LOG(INFO) << "before model_executor_->forward.";
-    LOG(INFO) << "input_params_micro_batches.size(): " << 
+// LOG(INFO) << "before model_executor_->forward.";
+// LOG(INFO) << "input_params_micro_batches.size(): " << 
     input_params_micro_batches.size();
-    for (const auto& input_param : input_params_micro_batches) {
-      printModelInputParams(input_param);
-    }
-    LOG(INFO) << "flatten_tokens_micro_batches.size: " << flatten_tokens_micro_batches.size();
-    for (const auto& flatten_token : flatten_tokens_micro_batches) {
-      LOG(INFO) << flatten_token.sizes();
-    }
-    LOG(INFO) << "flatten_positions_micro_batches.size: " << flatten_positions_micro_batches.size();
-    for (const auto& flatten_position : flatten_positions_micro_batches) {
-      LOG(INFO) << flatten_position.sizes();
-    }
-    LOG(INFO) << "kv_caches_.size(): " << kv_caches_.size();
-    for (const auto& kv_cache : kv_caches_) {
-      LOG(INFO) << kv_cache.get_k_cache().sizes();
-      LOG(INFO) << kv_cache.get_v_cache().sizes();
-    }
+    // for (const auto& input_param : input_params_micro_batches) {
+    //   printModelInputParams(input_param);
+    // }
+// LOG(INFO) << "flatten_tokens_micro_batches.size: " << flatten_tokens_micro_batches.size();
+    // for (const auto& flatten_token : flatten_tokens_micro_batches) {
+// LOG(INFO) << flatten_token.sizes();
+    // }
+// LOG(INFO) << "flatten_positions_micro_batches.size: " << flatten_positions_micro_batches.size();
+    // for (const auto& flatten_position : flatten_positions_micro_batches) {
+// LOG(INFO) << flatten_position.sizes();
+    // }
+// LOG(INFO) << "kv_caches_.size(): " << kv_caches_.size();
+    // for (const auto& kv_cache : kv_caches_) {
+// LOG(INFO) << kv_cache.get_k_cache().sizes();
+// LOG(INFO) << kv_cache.get_v_cache().sizes();
+    // }
     auto hidden_states =
         model_executor_->forward(flatten_tokens_micro_batches,
                                  flatten_positions_micro_batches,
                                  kv_caches_,
                                  input_params_micro_batches);
-    LOG(INFO) << "after model_executor_->forward.";
+// LOG(INFO) << "after model_executor_->forward.";
     if (!hidden_states.defined()) {
       return std::nullopt;
     }
@@ -495,78 +496,80 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
     // 验证triton kernel调用逻辑
     // -----------------------
     // 初始化tensor
-    {
-      auto device_options = 
-        torch::TensorOptions().device(device_);
-      auto bf16_options =
-        torch::TensorOptions().dtype(torch::kBFloat16).device(device_);
-      auto int32_options =
-        torch::TensorOptions().dtype(torch::kInt32).device(device_);
+    // {
+    //   auto device_options = 
+    //     torch::TensorOptions().device(device_);
+    //   auto bf16_options =
+    //     torch::TensorOptions().dtype(torch::kBFloat16).device(device_);
+    //   auto int32_options =
+    //     torch::TensorOptions().dtype(torch::kInt32).device(device_);
+    //   auto int64_options =
+    //     torch::TensorOptions().dtype(torch::kInt64).device(device_);
       
-      uint32_t batch_size = 4;
-      uint32_t beam_width = 256;
-      uint32_t prompt_len = 512;
-      uint32_t num_heads = 8;
-      uint32_t head_dim = 128;
+    //   uint32_t batch_size = 4;
+    //   uint32_t beam_width = 256;
+    //   uint32_t prompt_len = 512;
+    //   uint32_t num_heads = 8;
+    //   uint32_t head_dim = 128;
 
-      uint32_t total_beams = batch_size * beam_width;
-      auto q = torch::randn({total_beams, num_heads, head_dim}, bf16_options);
+    //   uint32_t total_beams = batch_size * beam_width;
+    //   auto q = torch::randn({total_beams, num_heads, head_dim}, bf16_options);
 
-      auto shared_k_cache = torch::randn({batch_size, num_heads, prompt_len, head_dim}, bf16_options);  
-      auto shared_v_cache = torch::randn({batch_size, num_heads, prompt_len, head_dim}, bf16_options); 
+    //   auto shared_k_cache = torch::randn({batch_size, num_heads, prompt_len, head_dim}, bf16_options);  
+    //   auto shared_v_cache = torch::randn({batch_size, num_heads, prompt_len, head_dim}, bf16_options); 
       
-      uint32_t max_decode_step = 2;
-      auto unshared_k_cache = torch::randn({total_beams, num_heads, max_decode_step, head_dim}, bf16_options); 
-      auto unshared_v_cache = torch::randn({total_beams, num_heads, max_decode_step, head_dim}, bf16_options);  
+    //   uint32_t max_decode_step = 2;
+    //   auto unshared_k_cache = torch::randn({total_beams, num_heads, max_decode_step, head_dim}, bf16_options); 
+    //   auto unshared_v_cache = torch::randn({total_beams, num_heads, max_decode_step, head_dim}, bf16_options);  
       
-      int decode_step = 1;  // current decode step
-      // int beam_size = 16;   // beam size
+    //   int decode_step = 1;  // current decode step
+    //   // int beam_size = 16;   // beam size
 
-      float sm_scale = 0.08838834764831843;  // 通常是 1/sqrt(head_dim)
-      bool warp_specialize = false;
-      // for (std::size_t i = 0 ; i < 10 ; ++i) {
-      auto ret = rec_triton_kernel_.xattention(q, 
-                                  shared_k_cache,
-                                  shared_v_cache, 
-                                  unshared_k_cache, 
-                                  unshared_v_cache, 
-                                  decode_step, 
-                                  beam_width, 
-                                  sm_scale, 
-                                  prompt_len);
-      // }
-      torch::Tensor tensor = torch::arange(beam_width, torch::dtype(torch::kInt32));
-      auto _unshared_k_cache = torch::randn({batch_size + 1, beam_width, num_heads, max_decode_step, head_dim}, bf16_options); 
-      auto _unshared_v_cache = torch::randn({batch_size + 1, beam_width, num_heads, max_decode_step, head_dim}, bf16_options); 
+    //   float sm_scale = 0.08838834764831843;  // 通常是 1/sqrt(head_dim)
+    //   bool warp_specialize = false;
+    //   // for (std::size_t i = 0 ; i < 10 ; ++i) {
+    //   auto ret = rec_triton_kernel_.xattention(q, 
+    //                               shared_k_cache,
+    //                               shared_v_cache, 
+    //                               unshared_k_cache, 
+    //                               unshared_v_cache, 
+    //                               decode_step, 
+    //                               beam_width, 
+    //                               sm_scale, 
+    //                               prompt_len);
+    //   // }
+    //   torch::Tensor _out_token_index = torch::arange(beam_width, int32_options);
+    //   auto _unshared_k_cache = torch::randn({batch_size + 1, beam_width, num_heads, max_decode_step, head_dim}, bf16_options); 
+    //   auto _unshared_v_cache = torch::randn({batch_size + 1, beam_width, num_heads, max_decode_step, head_dim}, bf16_options); 
 
-      std::vector<torch::Tensor> _k{_unshared_k_cache};
-      std::vector<torch::Tensor> _v{_unshared_v_cache};
+    //   std::vector<torch::Tensor> _k{_unshared_k_cache};
+    //   std::vector<torch::Tensor> _v{_unshared_v_cache};
 
-      auto block_table = torch::arange(batch_size, torch::dtype(torch::kInt64));
+    //   auto block_table = torch::arange(batch_size, int64_options);
 
-      rec_triton_kernel_.grouped_cache_select(out_token_index,
-                                              _k,
-                                              _v,
-                                              block_table,
-                                              decode_step);
-      LOG(INFO) << "after grouped_cache_select.";
-    }
+    //   rec_triton_kernel_.grouped_cache_select(_out_token_index,
+    //                                           _k,
+    //                                           _v,
+    //                                           block_table,
+    //                                           decode_step);
+    //   LOG(INFO) << "after grouped_cache_select.";
+    // }
     
 
     // -----------------------
 
 
     torch::Tensor logits;
-    LOG(INFO) << "before model_->logits.";
+// LOG(INFO) << "before model_->logits.";
     if (concated_sampling_params.selected_token_idxes.defined()) {
       logits = model_->logits(hidden_states,
                               concated_sampling_params.selected_token_idxes);
     }
-    LOG(INFO) << "after model_->logits.";
-    LOG(INFO) << "before sampler_->forward.";
+// LOG(INFO) << "after model_->logits.";
+// LOG(INFO) << "before sampler_->forward.";
     if (concated_sampling_params.selected_token_idxes.defined()) {
       auto sample_output = sampler_->forward(logits, concated_sampling_params);
-      LOG(INFO) << "after sampler_->forward.";
+// LOG(INFO) << "after sampler_->forward.";
       torch::Tensor top_tokens;
       torch::Tensor top_logprobs;
       int32_t beam_width = inputs.micro_inputs[0].beam_width;
@@ -592,22 +595,41 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       //                       out_beam_count_prefix_sums,
       //                       out_seqgroup);
       #if defined(USE_CUDA)
-      LOG(INFO) << "before rec_triton_kernel_.beam_search.";
-      acc_logprob = acc_logprob.to(torch::kBFloat16);
-      rec_triton_kernel_.beam_search(acc_logprob, 
-                                     sequence_group, 
-                                     top_tokens, 
-                                     top_logprobs, 
-                                     out_log_probs, 
-                                     out_token_ids, 
-                                     out_token_index, 
-                                     out_beam_count_prefix_sums, 
-                                     out_seqgroup, 
-                                     total_rounds, 
-                                     round);
-      #endif
+      if (round == 0) {
+        out_token_ids = top_tokens;
+        out_log_probs = top_logprobs;
+        
+        auto copy_dst = sequence_group.slice(/*dim=*/2, /*start=*/round, /*end=*/round + 1).squeeze(-1);
+        auto copy_src = top_tokens.reshape({batch, beam_width});
+LOG(INFO) << "copy_src.size(): " << copy_src.sizes();
+LOG(INFO) << "copy_dst.size(): " << copy_dst.sizes();
+
+        copy_dst.copy_(copy_src, /*non_blocking=*/true);
+
+      } else {
+// LOG(INFO) << "before rec_triton_kernel_.beam_search.";
+        acc_logprob = acc_logprob.to(torch::kBFloat16);
+        rec_triton_kernel_.beam_search(acc_logprob, 
+                                      sequence_group, 
+                                      top_tokens, 
+                                      top_logprobs, 
+                                      out_log_probs, 
+                                      out_token_ids, 
+                                      out_token_index, 
+                                      out_beam_count_prefix_sums, 
+                                      out_seqgroup, 
+                                      total_rounds, 
+                                      round);
+        
+      }
       sequence_group.copy_(out_seqgroup);
       acc_logprob.copy_(out_log_probs);
+      #endif
+LOG(INFO) << "out_seqgroup.sizes(): " << out_seqgroup.sizes();
+LOG(INFO) << "sequence_group.sizes(): " << sequence_group.sizes();
+LOG(INFO) << "out_log_probs.sizes(): " << out_log_probs.sizes();
+LOG(INFO) << "acc_logprob.sizes(): " << acc_logprob.sizes();
+      
       // keep group offset contiguous across rounds (already in out_* tensors)
       // update next round tokens.
       if (round == 0) {
@@ -644,13 +666,13 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       }
 
 #if defined(USE_CUDA)
-      // if (beam_width > 1 && round > 0) {
-      //   rec_triton_kernel_.grouped_cache_select(out_token_index,
-      //                                           unshared_k_cache,
-      //                                           unshared_v_cache,
-      //                                           inputs.concated_block_tables,
-      //                                           round);
-      // }
+      if (beam_width > 1 && round > 0) {
+        rec_triton_kernel_.grouped_cache_select(out_token_index,
+                                                unshared_k_cache,
+                                                unshared_v_cache,
+                                                inputs.concated_block_tables,
+                                                round);
+      }
 #endif
 
 #if defined(USE_NPU)

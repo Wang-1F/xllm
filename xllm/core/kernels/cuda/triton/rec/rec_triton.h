@@ -60,10 +60,10 @@ class RecTritonKernel {
       memcpy(block_shape, block_shape_ptr, sizeof(uint32_t) * input_tensor_rank);
       memcpy(element_strides, element_strides_ptr, sizeof(uint32_t) * input_tensor_rank);
 
-      LOG(INFO) << "shape: " << shape[0] << ", " << shape[1] << ", " << shape[2] << ", " << shape[3];
-      LOG(INFO) << "strides: " << strides[0] << ", " << strides[1] << ", " << strides[2];
-      LOG(INFO) << "block_shape: " << block_shape[0] << ", " << block_shape[1] << ", " << block_shape[2] << ", " << block_shape[3];
-      LOG(INFO) << "element_strides: " << element_strides[0] << ", " << element_strides[1] << ", " << element_strides[2] << ", " << element_strides[3];
+// LOG(INFO) << "shape: " << shape[0] << ", " << shape[1] << ", " << shape[2] << ", " << shape[3];
+// LOG(INFO) << "strides: " << strides[0] << ", " << strides[1] << ", " << strides[2];
+// LOG(INFO) << "block_shape: " << block_shape[0] << ", " << block_shape[1] << ", " << block_shape[2] << ", " << block_shape[3];
+// LOG(INFO) << "element_strides: " << element_strides[0] << ", " << element_strides[1] << ", " << element_strides[2] << ", " << element_strides[3];
     }
 
     ~TensorDescriptorMetaData() {

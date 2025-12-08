@@ -104,7 +104,7 @@ torch::Tensor Qwen3MoeDecoderImpl::forward(
   x = input_norm_(x);
 
   // Attention
-  x = attention_->forward(positions, x, attn_metadata, kv_cache);
+  x = attention_->forward(positions, x, attn_metadata, kv_cache, input_params);
   x = x + residual;
 
   // Post-attention norm

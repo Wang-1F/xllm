@@ -25,7 +25,8 @@ namespace layer {
 Qwen3AttentionImpl::Qwen3AttentionImpl(const ModelArgs& args,
                                        const QuantArgs& quant_args,
                                        const ParallelArgs& parallel_args,
-                                       const torch::TensorOptions& options) {
+                                       const torch::TensorOptions& options)
+                                       : model_args_(args) {
   const int64_t tp_size = parallel_args.tp_group_->world_size();
   const int64_t total_num_heads = args.n_heads();
   const int64_t total_num_kv_heads = args.n_kv_heads().value_or(args.n_heads());
@@ -99,7 +100,8 @@ torch::Tensor Qwen3AttentionImpl::forward(
     const torch::Tensor& positions,
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata,
-    KVCache& kv_cache) {
+    KVCache& kv_cache, 
+    const ModelInputParams& input_params) {
   // 1. qkv projection
   auto qkv = qkv_proj_->forward(hidden_states);
 
@@ -126,9 +128,32 @@ torch::Tensor Qwen3AttentionImpl::forward(
   k = k.view({T, kv_size_});
 
   // q: [batch_size, beam_width, dim] reshape [batch_size, beam_width, num_head, head_dim]
-
+  bool is_prefill = input_params.current_round == 0;
+  // Attention
+  torch::Tensor out;
+  if (FLAGS_max_decode_rounds > 0 && !is_prefill) {
+// LOG(INFO) << "inner xattention branch.";
+    int32_t layer_id = input_params.layer_id;
+   
+LOG(INFO) << "input_params.kv_seq_lens_vec: " << input_params.kv_seq_lens_vec;
+LOG(INFO) << "input_params.decode_kv_seq_lens_vec: " << input_params.decode_kv_seq_lens_vec;
+    q = q.reshape({-1, model_args_.n_heads(), model_args_.head_dim()});
+    out = rec_triton_kernel_.xattention(q,
+                                          input_params.shared_k_caches[layer_id],
+                                          input_params.shared_v_caches[layer_id],
+                                          kv_cache.get_k_cache(),
+                                          kv_cache.get_v_cache(),
+                                          input_params.current_round,
+                                          input_params.beam_width,
+                                          scaling_,
+                                          input_params.kv_seq_lens_vec[1]);
+  } else {
+// LOG(INFO) << "inner flashinfer branch.";
+    out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
+// LOG(INFO) << "out.shape: " << out.sizes();
+  }
   // 5. store k/v cache and do attention
-  auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
+  // auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
 
   // 6. output projection
   return o_proj_->forward(out);

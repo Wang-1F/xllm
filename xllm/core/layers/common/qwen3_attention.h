@@ -27,6 +27,10 @@ limitations under the License.
 #include "linear.h"
 #include "rotary_embedding.h"
 
+#if defined(USE_CUDA)
+#include "xllm/core/kernels/cuda/triton/rec/rec_triton.h"
+#endif
+
 namespace xllm {
 namespace layer {
 
@@ -41,9 +45,12 @@ class Qwen3AttentionImpl : public torch::nn::Module {
   torch::Tensor forward(const torch::Tensor& positions,
                         const torch::Tensor& hidden_states,
                         const AttentionMetadata& attn_metadata,
-                        KVCache& kv_cache);
+                        KVCache& kv_cache, 
+                        const ModelInputParams& input_params);
 
   void load_state_dict(const StateDict& state_dict);
+
+  float get_scaling() const { return scaling_; }
 
  private:
   int64_t num_heads_;
@@ -60,6 +67,11 @@ class Qwen3AttentionImpl : public torch::nn::Module {
   RmsNorm k_norm_{nullptr};
   Attention attn_{nullptr};
   RotaryEmbedding rotary_emb_{nullptr};
+
+  ModelArgs model_args_;
+  #if defined(USE_CUDA)
+    kernel::cuda::triton::RecTritonKernel rec_triton_kernel_;
+  #endif
 };
 TORCH_MODULE(Qwen3Attention);
 

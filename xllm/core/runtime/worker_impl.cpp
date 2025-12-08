@@ -461,7 +461,7 @@ void WorkerImpl::prepare_work_before_execute(
     }
 #endif
 
-#if defined(USE_NPU)
+#if defined(USE_NPU) || defined(USE_CUDA)
     // step-level decode shared cache: allocate/attach by step_uid metadata
     if (FLAGS_max_decode_rounds > 0) {
       bool is_prefill = fwd_inputs_on_device.input_params.global_empty_kv_cache

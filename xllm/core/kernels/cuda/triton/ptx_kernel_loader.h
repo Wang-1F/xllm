@@ -78,7 +78,7 @@ static int cuda_check_impl(T result) {
       return 0;
     }
     cudaError_t err = cudaGetLastError();
-    LOG(INFO) << "Kernel launch failed: " << cudaGetErrorString(err);
+// LOG(INFO) << "Kernel launch failed: " << cudaGetErrorString(err);
     const char* errorStr = nullptr;
     if (cuGetErrorName(result, &errorStr) == CUDA_SUCCESS) {
       LOG(FATAL) << "CUDA error (CUresult): " << errorStr << " (code " << result
@@ -89,8 +89,8 @@ static int cuda_check_impl(T result) {
     }
   } else if constexpr (std::is_same_v<T, cudaError_t>) {
     // handle cudaError_t type
-    LOG(INFO) << "cudaSuccess: " << cudaSuccess;
-    LOG(INFO) << "result: " << result;
+// LOG(INFO) << "cudaSuccess: " << cudaSuccess;
+// LOG(INFO) << "result: " << result;
     // if (result != cudaSuccess) {
     //   LOG(FATAL) << "CUDA error (cudaError_t): " << result << " (code "
     //              << result << ")";
@@ -131,22 +131,22 @@ class PtxKernelLoader {
     temp_file << ptx_content;
     temp_file.close();
     close(fd);
-    LOG(INFO) << "before cuInit(0).";
+// LOG(INFO) << "before cuInit(0).";
     CUDA_CHECK(cuInit(0));
-    LOG(INFO) << "before cuModuleLoad(0).";
+// LOG(INFO) << "before cuModuleLoad(0).";
     CUDA_CHECK(cuModuleLoad(&module, temp_filename));
 
     // delete temp file
     std::remove(temp_filename);
-    LOG(INFO) << "kernel_name_: " << kernel_name_;
+// LOG(INFO) << "kernel_name_: " << kernel_name_;
     kernel_name_ = kernel_name;
   }
 
   CUfunction get_kernel() {
     CUfunction kernel;
-    LOG(INFO) << "before cuModuleGetFunction.";
+// LOG(INFO) << "before cuModuleGetFunction.";
     CUDA_CHECK(cuModuleGetFunction(&kernel, module, kernel_name_));
-    LOG(INFO) << "after cuModuleGetFunction.";
+// LOG(INFO) << "after cuModuleGetFunction.";
     return kernel;
   }
 
@@ -194,7 +194,7 @@ struct GenericKernelConfigs {
         closest_index = i;
       }
     }
-    LOG(INFO) << "closest_index: " << closest_index;
+// LOG(INFO) << "closest_index: " << closest_index;
     return kernel_configs(closest_index);
   }
 
@@ -212,7 +212,7 @@ struct GenericKernelConfigs {
         closest_index = i;
       }
     }
-    LOG(INFO) << "closest_index: " << closest_index;
+// LOG(INFO) << "closest_index: " << closest_index;
     return kernel_configs(closest_index);
   }
 
