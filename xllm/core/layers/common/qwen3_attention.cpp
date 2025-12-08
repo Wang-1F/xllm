@@ -125,6 +125,8 @@ torch::Tensor Qwen3AttentionImpl::forward(
   q = q.view({T, q_size_});
   k = k.view({T, kv_size_});
 
+  // q: [batch_size, beam_width, dim] reshape [batch_size, beam_width, num_head, head_dim]
+
   // 5. store k/v cache and do attention
   auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
 

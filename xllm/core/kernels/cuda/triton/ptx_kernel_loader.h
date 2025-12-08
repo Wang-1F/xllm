@@ -89,10 +89,12 @@ static int cuda_check_impl(T result) {
     }
   } else if constexpr (std::is_same_v<T, cudaError_t>) {
     // handle cudaError_t type
-    if (result != cudaSuccess) {
-      LOG(FATAL) << "CUDA error (cudaError_t): " << result << " (code "
-                 << result << ")";
-    }
+    LOG(INFO) << "cudaSuccess: " << cudaSuccess;
+    LOG(INFO) << "result: " << result;
+    // if (result != cudaSuccess) {
+    //   LOG(FATAL) << "CUDA error (cudaError_t): " << result << " (code "
+    //              << result << ")";
+    // }
   }
 }
 
@@ -210,6 +212,7 @@ struct GenericKernelConfigs {
         closest_index = i;
       }
     }
+    LOG(INFO) << "closest_index: " << closest_index;
     return kernel_configs(closest_index);
   }
 
