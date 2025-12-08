@@ -78,7 +78,24 @@ torch::Tensor Qwen3DecoderImpl::forward(torch::Tensor& x,
   x = input_norm_->forward(x);
 
   // Attention
-  x = attention_->forward(positions, x, attn_metadata, kv_cache);
+  if (FLAGS_max_decode_rounds > 0 && !attn_metadata.is_prefill) {
+    int32_t layer_id = input_params.layer_id;
+    float sm_scale = attention_->get_scaling();
+    rec_triton_kernel_.xattention(x,
+                                  input_params.shared_k_caches[layer_id],
+                                  input_params.shared_v_caches[layer_id],
+                                  kv_cache.get_k_cache(),
+                                  kv_cache.get_v_cache(),
+                                  input_params.kv_seq_lens_vec[0],
+                                  input_params.current_round,
+                                  input_params.beam_width,
+                                  sm_scale,
+                                  /*warp_specialize*/ false,
+                                  input_params.kv_seq_lens_vec[0]);
+  } else {
+    x = attention_->forward(positions, x, attn_metadata, kv_cache);
+  }
+
   x = x + residual;
 
   // Post-attention norm
