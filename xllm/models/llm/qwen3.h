@@ -226,15 +226,16 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
     auto cancated_h = torch::cat(hs, 0);
     return norm_(cancated_h, 0);
 #else
-    bool is_prefill = input_params[0].q_max_seq_len > 1;
+    auto input_param = input_params[0];
+    bool is_prefill = input_param.q_max_seq_len > 1;
     auto attn_metadata =
-        layer::AttentionMetadata::build(input_params[0], is_prefill);
+        layer::AttentionMetadata::build(input_param, is_prefill);
 
     torch::Tensor h;
     for (size_t i = 0; i < layers_.size(); i++) {
       auto& layer = layers_[i];
-      h = layer(
-          hs[0], positions[0], attn_metadata, kv_caches[i], input_params[0]);
+      input_param.layer_id = i;
+      h = layer(hs[0], positions[0], attn_metadata, kv_caches[i], input_param);
     }
     return norm_(h);
 #endif

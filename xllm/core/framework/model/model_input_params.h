@@ -244,7 +244,6 @@ struct ModelInputParams {
   // Used by ACL Graph Executor to avoid repeated memory allocation
   torch::Tensor graph_buffer;
 
-
   // the indptr of the paged kv-cache
   // used in flashinfer
   // IntTensor: [n_seq + 1]
@@ -272,7 +271,7 @@ struct ModelInputParams {
   // current round for step-level decode
   int32_t current_round = 0;
   int32_t total_round = 0;
-
+  int32_t layer_id = -1;
 };
 
 }  // namespace xllm

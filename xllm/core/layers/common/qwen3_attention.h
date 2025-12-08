@@ -45,6 +45,8 @@ class Qwen3AttentionImpl : public torch::nn::Module {
 
   void load_state_dict(const StateDict& state_dict);
 
+  float get_scaling() const { return scaling_; }
+
  private:
   int64_t num_heads_;
   int64_t num_kv_heads_;

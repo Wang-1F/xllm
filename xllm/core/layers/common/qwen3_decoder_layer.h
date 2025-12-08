@@ -31,6 +31,10 @@ limitations under the License.
 #include "layers/rms_norm.h"
 #include "qwen3_attention.h"
 
+#if defined(USE_CUDA)
+#include "xllm/core/kernels/cuda/triton/rec/rec_triton.h"
+#endif
+
 namespace xllm {
 namespace layer {
 
@@ -55,6 +59,10 @@ class Qwen3DecoderImpl : public torch::nn::Module {
   RmsNorm post_norm_{nullptr};
 
   ParallelArgs parallel_args_;
+
+#if defined(USE_CUDA)
+  kernel::cuda::triton::RecTritonKernel rec_triton_kernel_;
+#endif
 };
 
 }  // namespace layer
