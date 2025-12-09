@@ -636,7 +636,8 @@ LOG(INFO) << "acc_logprob.sizes(): " << acc_logprob.sizes();
         flatten_tokens_micro_batches[0] =
             sample_output.top_tokens.to(torch::kInt32).reshape({-1});
       } else {
-        flatten_tokens_micro_batches[0] = out_token_ids.clone().reshape({-1});
+        flatten_tokens_micro_batches[0] = torch::clamp(out_token_ids, 0, 150000).clone().reshape({-1});
+        // flatten_tokens_micro_batches[0] = out_token_ids.clone().reshape({-1});
       }
 
       // update next round positions.

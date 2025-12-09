@@ -112,7 +112,6 @@ class RecTritonKernel {
                        const TensorDescriptor& desc_v, 
                        const TensorDescriptor& desc_o, 
                        uint32_t N_CTX, 
-                       uint32_t N_KTX, 
                        uint32_t HEAD_DIM, 
                        uint32_t batch_size, 
                        uint32_t beam_width, 

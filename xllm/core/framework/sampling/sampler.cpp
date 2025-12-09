@@ -48,6 +48,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
 
   torch::Tensor sample_logits = logits;
   if (params.selected_token_idxes.numel() != params.sample_idxes.numel()) {
+    LOG(INFO) << "inner selected_token_idxes.numel() != params.sample_idxes.numel().";
     sample_logits = logits.index_select(/*dim=*/0, params.sample_idxes);
   }
 

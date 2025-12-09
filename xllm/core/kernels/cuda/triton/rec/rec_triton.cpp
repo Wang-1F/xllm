@@ -134,7 +134,8 @@ RecTritonKernel::create_tensor_map(const TensorDescriptor& tensor_descriptor,
   CUtensorMapDataType dtype = 
     get_target_tensor_map_dtype(tensor.scalar_type());
 // LOG(INFO) << "dtype: " << dtype;
-  cuuint32_t tensor_rank = tensor.dim();
+  
+  cuuint32_t tensor_rank = 2;
 // LOG(INFO) << "tensor_rank: " << tensor_rank;
   void* tensor_addr = tensor.data_ptr();
   const cuuint64_t* dims = metadata.shape;
@@ -386,6 +387,7 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
                                                        uint32_t batch_size, 
                                                        uint32_t beam_width, 
                                                        uint32_t prompt_len) {
+  prompt_len = 1024;                                                        
   // 获取各个维度的head dimension
   int64_t HEAD_DIM_Q = q.size(-1);
   int64_t HEAD_DIM_K = shared_k_cache.size(-1);
@@ -402,20 +404,16 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
 // LOG(INFO) << "q_shape: " << q_shape;
   int64_t Z = q_shape[0];
   int64_t H = q_shape[1]; 
-  int64_t N_CTX = q_shape[2];
   int64_t HEAD_DIM = q_shape[3];
 
   // 获取k张量的形状
   auto k_shape = shared_k_cache.sizes();
-  // int64_t N_KTX = k_shape[2];
-  int64_t N_KTX = prompt_len;
 
-  // 设置块大小并计算填充后的N_CTX
   int64_t BLOCK_M = 64;
-  int64_t padded_N_CTX = ((N_CTX + BLOCK_M - 1) / BLOCK_M) * BLOCK_M;
+  int64_t padded_q_seq_len = ((beam_width + BLOCK_M - 1) / BLOCK_M) * BLOCK_M;
 
-  if (padded_N_CTX > N_CTX) {
-    int64_t pad_length = padded_N_CTX - N_CTX;
+  if (padded_q_seq_len > beam_width) {
+    int64_t pad_length = padded_q_seq_len - beam_width;
     // 使用torch::nn::functional::pad进行填充
     // 参数: (left, right, top, bottom) 对应最后两个维度
     q = torch::nn::functional::pad(q, 
@@ -426,10 +424,9 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
 
   // 获取q张量的形状
   q_shape = q.sizes();
-// LOG(INFO) << "q_new_shape: " << q_shape;
+LOG(INFO) << "q_new_shape: " << q_shape;
   Z = q_shape[0];
   H = q_shape[1]; 
-  // N_CTX = q_shape[2];
   HEAD_DIM = q_shape[3];
 
   // 创建输出张量
@@ -455,37 +452,45 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
 // LOG(INFO) << "HEAD_DIM: " << HEAD_DIM;
 
 // LOG(INFO) << "desc_q: ";
-  uint64_t q_shapes[2] = {y_dim, HEAD_DIM};
-  uint64_t q_strides[2] = {HEAD_DIM * 2, 1};
+  // uint64_t q_shapes[2] = {y_dim, HEAD_DIM};
+  // uint64_t q_strides[2] = {HEAD_DIM * 2, 1};
+  uint64_t q_shapes[2] = {HEAD_DIM, y_dim};
+  uint64_t q_strides[2] = {HEAD_DIM * 2, HEAD_DIM * y_dim * 2};
   uint32_t q_block_shape[2] = {64, 64};
   uint32_t q_elem_strides[2] = {1, 1};
-  q = q.view({y_dim, HEAD_DIM});
+  q = q.reshape({y_dim, HEAD_DIM});
 // LOG(INFO) << "q.scalar_type(): " << q.scalar_type();
 // LOG(INFO) << "q.shape: " << q.sizes();
   TensorDescriptor desc_q{q, q_shapes, q_strides, q_block_shape, q_elem_strides, 2};
 
 // LOG(INFO) << "desc_k: ";
-  uint64_t k_shapes[2] = {k_dim, HEAD_DIM};
-  uint64_t k_strides[2] = {HEAD_DIM * 2, 1};
+  // uint64_t k_shapes[2] = {k_dim, HEAD_DIM};
+  // uint64_t k_strides[2] = {HEAD_DIM * 2, 1};
+  uint64_t k_shapes[2] = {HEAD_DIM, k_dim};
+  uint64_t k_strides[2] = {HEAD_DIM * 2, k_dim * HEAD_DIM * 2};
   uint32_t k_block_shape[2] = {64, 64};
   uint32_t k_elem_strides[2] = {1, 1};
-  shared_k_cache = shared_k_cache.view({k_dim, HEAD_DIM});
+  // shared_k_cache = shared_k_cache.reshape({k_dim, HEAD_DIM});
   TensorDescriptor desc_k{shared_k_cache, k_shapes, k_strides, k_block_shape, k_elem_strides, 2};
 
 // LOG(INFO) << "desc_v: ";
-  uint64_t v_shapes[2] = {k_dim, HEAD_DIM};
-  uint64_t v_strides[2] = {HEAD_DIM * 2, 1};
+  // uint64_t v_shapes[2] = {k_dim, HEAD_DIM};
+  // uint64_t v_strides[2] = {HEAD_DIM * 2, 1};
+  uint64_t v_shapes[2] = {HEAD_DIM, k_dim};
+  uint64_t v_strides[2] = {HEAD_DIM * 2, k_dim * HEAD_DIM * 2};
   uint32_t v_block_shape[2] = {64, 64};
   uint32_t v_elem_strides[2] = {1, 1};
-  shared_v_cache = shared_v_cache.view({k_dim, HEAD_DIM});
+  // shared_v_cache = shared_v_cache.reshape({k_dim, HEAD_DIM});
   TensorDescriptor desc_v{shared_v_cache, v_shapes, v_strides, v_block_shape, v_elem_strides, 2};
 
 // LOG(INFO) << "desc_o: ";
-  uint64_t o_shapes[2] = {y_dim, HEAD_DIM};
-  uint64_t o_strides[2] = {HEAD_DIM * 2, 1};
+  // uint64_t o_shapes[2] = {y_dim, HEAD_DIM};
+  // uint64_t o_strides[2] = {HEAD_DIM * 2, 1};
+  uint64_t o_shapes[2] = {HEAD_DIM, y_dim};
+  uint64_t o_strides[2] = {HEAD_DIM * 2, HEAD_DIM * y_dim * 2};
   uint32_t o_block_shape[2] = {64, 64};
   uint32_t o_elem_strides[2] = {1, 1};
-  o = o.view({y_dim, HEAD_DIM});
+  // o = o.reshape({y_dim, HEAD_DIM});
   TensorDescriptor desc_o{o, o_shapes, o_strides, o_block_shape, o_elem_strides, 2};
 
 // LOG(INFO) << "sm_scale: " << sm_scale;
@@ -504,7 +509,6 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
                                               desc_v, 
                                               desc_o, 
                                               q_shape[2], 
-                                              N_KTX, 
                                               HEAD_DIM, 
                                               batch_size, 
                                               beam_width, 
@@ -522,7 +526,6 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attn_fwd_shared(float 
                                       const TensorDescriptor& desc_v, 
                                       const TensorDescriptor& desc_o, 
                                       uint32_t N_CTX,  // q_shape[2]
-                                      uint32_t N_KTX, 
                                       uint32_t HEAD_DIM, // q_shape[3]
                                       uint32_t batch_size, 
                                       uint32_t beam_width, 
@@ -530,7 +533,6 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attn_fwd_shared(float 
 // LOG(INFO) << "sm_scale: " << sm_scale;
 // LOG(INFO) << "Z: " << Z;
 // LOG(INFO) << "H: " << H;
-// LOG(INFO) << "N_CTX: " << N_CTX;
 // LOG(INFO) << "N_KTX: " << N_KTX;
 // LOG(INFO) << "HEAD_DIM: " <<HEAD_DIM;
 // LOG(INFO) << "batch_size: " <<batch_size;
@@ -559,16 +561,16 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attn_fwd_shared(float 
 // LOG(INFO) << "before create_tensor_map.";
   // unified_metadata_
 
-// LOG(INFO) << "tensor_map_q: ";
+LOG(INFO) << "tensor_map_q: ";
   alignas(64) CUtensorMap tensor_map_q;
   CUDA_CHECK(create_tensor_map(desc_q, &tensor_map_q, 3));
-// LOG(INFO) << "tensor_map_k: ";
+LOG(INFO) << "tensor_map_k: ";
   alignas(64) CUtensorMap tensor_map_k;
   CUDA_CHECK(create_tensor_map(desc_k, &tensor_map_k, 3));
-// LOG(INFO) << "tensor_map_v: ";
+LOG(INFO) << "tensor_map_v: ";
   alignas(64) CUtensorMap tensor_map_v;
   CUDA_CHECK(create_tensor_map(desc_v, &tensor_map_v, 3));
-// LOG(INFO) << "tensor_map_o: ";
+LOG(INFO) << "tensor_map_o: ";
   alignas(64) CUtensorMap tensor_map_o;
   CUDA_CHECK(create_tensor_map(desc_o, &tensor_map_o, 3));
 
@@ -625,10 +627,10 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attn_fwd_shared(float 
     (void*)&o_stride_1,
 
     (void*)&N_CTX,
-    (void*)&N_KTX,
+    (void*)&prompt_len,
 
-    (void*)&N_KTX, // fake
-    (void*)&N_KTX  // fake
+    (void*)&prompt_len, // fake
+    (void*)&prompt_len  // fake
   };
 
 
@@ -691,7 +693,7 @@ void RecTritonKernel::attention_unshared_wrapper_forward(torch::Tensor q_unshare
   uint64_t q_strides[2] = {num_heads * head_dim * 2, num_heads * head_dim * total_beams * 2};
   uint32_t q_block_shape[2] = {128, 1};
   uint32_t q_elem_strides[2] = {1, 1};
-  q_unshared = q_unshared.view({total_beams, num_heads * head_dim});
+  // q_unshared = q_unshared.view({total_beams, num_heads * head_dim});
 
   TensorDescriptor desc_q{q_unshared, q_shapes, q_strides, q_block_shape, q_elem_strides, 2};
 
@@ -702,7 +704,7 @@ void RecTritonKernel::attention_unshared_wrapper_forward(torch::Tensor q_unshare
   uint32_t k_block_shape[2] = {64, 64};
   
   uint32_t k_elem_strides[2] = {1, 1};
-  unshared_k_cache = unshared_k_cache.view({kv_total_size, kv_heads * head_dim});
+  // unshared_k_cache = unshared_k_cache.view({kv_total_size, kv_heads * head_dim});
   TensorDescriptor desc_k{unshared_k_cache, k_shapes, k_strides, k_block_shape, k_elem_strides, 2};
 
 // LOG(INFO) << "desc_v: ";
@@ -711,7 +713,7 @@ void RecTritonKernel::attention_unshared_wrapper_forward(torch::Tensor q_unshare
   uint64_t v_strides[2] = {v_shapes[0] * 2, v_shapes[0] * v_shapes[1] * 2};
   uint32_t v_block_shape[2] = {64, 64};
   uint32_t v_elem_strides[2] = {1, 1};
-  unshared_v_cache = unshared_v_cache.view({kv_total_size, kv_heads * head_dim});
+  // unshared_v_cache = unshared_v_cache.view({kv_total_size, kv_heads * head_dim});
   TensorDescriptor desc_v{unshared_v_cache, v_shapes, v_strides, v_block_shape, v_elem_strides, 2};
 
 // LOG(INFO) << "desc_o: ";
@@ -1026,14 +1028,14 @@ LOG(INFO) << "prompt_len: " << prompt_len;
     // unshared_v_cache = unshared_v_cache.reshape({
     //   batch * beam_size, kv_heads, max_decode_step_cache, head_dim_cache
     // });
-    unshared_k_cache = unshared_k_cache.slice(0, 0, batch);
-    unshared_v_cache = unshared_v_cache.slice(0, 0, batch);
-    unshared_k_cache = unshared_k_cache.reshape({
-      batch * beam_size, kv_heads, max_decode_step_cache, head_dim_cache
-    });
-    unshared_v_cache = unshared_v_cache.reshape({
-      batch * beam_size, kv_heads, max_decode_step_cache, head_dim_cache
-    });
+    // unshared_k_cache = unshared_k_cache.slice(0, 0, batch);
+    // unshared_v_cache = unshared_v_cache.slice(0, 0, batch);
+    // unshared_k_cache = unshared_k_cache.reshape({
+    //   batch * beam_size, kv_heads, max_decode_step_cache, head_dim_cache
+    // });
+    // unshared_v_cache = unshared_v_cache.reshape({
+    //   batch * beam_size, kv_heads, max_decode_step_cache, head_dim_cache
+    // });
       
   } else if (unshared_k_shape.size() == 4) {
       int64_t beam_total_cache = unshared_k_shape[0];
@@ -1080,13 +1082,13 @@ LOG(INFO) << "prompt_len: " << prompt_len;
 // LOG(INFO) << "prompt_len: " << prompt_len;
     // LOG(INFO)
     shared_k_cache = shared_k_cache.view({batch, num_heads, -1, head_dim});
-    shared_k_cache = shared_k_cache.slice(2, 0, prompt_len);
+    // shared_k_cache = shared_k_cache.slice(2, 0, prompt_len);
     
     
     shared_v_cache = shared_v_cache.unsqueeze(2).repeat({1, 1, repeat_factor, 1, 1});
     // shared_v_cache = shared_v_cache.view({batch, num_heads, prompt_len, head_dim});
     shared_v_cache = shared_v_cache.view({batch, num_heads, -1, head_dim});
-    shared_v_cache = shared_v_cache.slice(2, 0, prompt_len);
+    // shared_v_cache = shared_v_cache.slice(2, 0, prompt_len);
   }
 
   
