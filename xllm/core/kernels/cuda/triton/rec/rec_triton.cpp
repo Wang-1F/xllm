@@ -144,7 +144,9 @@ RecTritonKernel::create_tensor_map(const TensorDescriptor& tensor_descriptor,
 // LOG(INFO) << "strides: " << metadata.strides[0];
   const cuuint32_t* block_shape = metadata.block_shape;
 // LOG(INFO) << "block_shape: " << metadata.block_shape[0];
-  const cuuint32_t* element_strides = metadata.element_strides;
+  uint32_t elem_strides[5] = {1, 1, 1, 1, 1};
+  const cuuint32_t* element_strides = elem_strides;
+  // const cuuint32_t* element_strides = metadata.element_strides;
   CUresult result = cuTensorMapEncodeTiled(
         tensorMap,                    // 输出：填充这个结构体
         dtype,
@@ -424,7 +426,7 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attention_shared_wrapp
 
   // 获取q张量的形状
   q_shape = q.sizes();
-LOG(INFO) << "q_new_shape: " << q_shape;
+//LOG(INFO) << "q_new_shape: " << q_shape;
   Z = q_shape[0];
   H = q_shape[1]; 
   HEAD_DIM = q_shape[3];
@@ -561,16 +563,16 @@ std::tuple<torch::Tensor, torch::Tensor> RecTritonKernel::attn_fwd_shared(float 
 // LOG(INFO) << "before create_tensor_map.";
   // unified_metadata_
 
-LOG(INFO) << "tensor_map_q: ";
+//LOG(INFO) << "tensor_map_q: ";
   alignas(64) CUtensorMap tensor_map_q;
   CUDA_CHECK(create_tensor_map(desc_q, &tensor_map_q, 3));
-LOG(INFO) << "tensor_map_k: ";
+//LOG(INFO) << "tensor_map_k: ";
   alignas(64) CUtensorMap tensor_map_k;
   CUDA_CHECK(create_tensor_map(desc_k, &tensor_map_k, 3));
-LOG(INFO) << "tensor_map_v: ";
+//LOG(INFO) << "tensor_map_v: ";
   alignas(64) CUtensorMap tensor_map_v;
   CUDA_CHECK(create_tensor_map(desc_v, &tensor_map_v, 3));
-LOG(INFO) << "tensor_map_o: ";
+//LOG(INFO) << "tensor_map_o: ";
   alignas(64) CUtensorMap tensor_map_o;
   CUDA_CHECK(create_tensor_map(desc_o, &tensor_map_o, 3));
 
@@ -945,20 +947,41 @@ void RecTritonKernel::combine_attention_kernel(torch::Tensor shared_out_2d,
 }
 
 torch::Tensor RecTritonKernel::xattention(torch::Tensor q, 
-                                 torch::Tensor shared_k_cache, 
-                                 torch::Tensor shared_v_cache, 
-                                 torch::Tensor unshared_k_cache, 
-                                 torch::Tensor unshared_v_cache, 
-                                 uint32_t decode_step, 
-                                 uint32_t beam_size, 
-                                 float sm_scale, 
-                                 uint32_t prompt_len) {
+                                          torch::Tensor shared_k_cache, 
+                                          torch::Tensor shared_v_cache, 
+                                          torch::Tensor unshared_k_cache, 
+                                          torch::Tensor unshared_v_cache, 
+                                          uint32_t decode_step, 
+                                          uint32_t beam_size, 
+                                          float sm_scale, 
+                                          uint32_t prompt_len) {
+  if (!is_cached_) {
+    is_cached_ = true;
+    q_ = q;
+    shared_k_cache_ = shared_k_cache;
+    shared_v_cache_ = shared_v_cache;
+    unshared_k_cache_ = unshared_k_cache;
+    unshared_v_cache_ = unshared_v_cache;
+    decode_step_ = decode_step;
+    beam_size_ = beam_size;
+    sm_scale_ = sm_scale;
+    prompt_len_ = prompt_len;
+  }
+  q = q_;
+  shared_k_cache = shared_k_cache_;
+  shared_v_cache = shared_v_cache_;
+  unshared_k_cache = unshared_k_cache_;
+  unshared_v_cache = unshared_v_cache_;
+  decode_step = decode_step_;
+  beam_size = beam_size_;
+  sm_scale = sm_scale_;
+  prompt_len = prompt_len_;
 // LOG(INFO) << "q.shape: " << q.sizes();
 // LOG(INFO) << "shared_k_cache.shape: " << shared_k_cache.sizes();
 // LOG(INFO) << "shared_v_cache.shape: " << shared_v_cache.sizes();
 // LOG(INFO) << "unshared_k_cache.shape: " << unshared_k_cache.sizes();
 // LOG(INFO) << "unshared_v_cache.shape: " << unshared_v_cache.sizes();
-LOG(INFO) << "prompt_len: " << prompt_len;
+//LOG(INFO) << "prompt_len: " << prompt_len;
 // LOG(INFO) << "decode_step: " << decode_step;
 // LOG(INFO) << "beam_size: " << beam_size;
   
@@ -1094,8 +1117,8 @@ LOG(INFO) << "prompt_len: " << prompt_len;
   
   
 // LOG(INFO) << "q_shared.sizes(): " << q_shared.sizes();
-LOG(INFO) << "shared_k_cache.sizes(): " << shared_k_cache.sizes();
-LOG(INFO) << "shared_v_cache.sizes(): " << shared_v_cache.sizes();
+//LOG(INFO) << "shared_k_cache.sizes(): " << shared_k_cache.sizes();
+//LOG(INFO) << "shared_v_cache.sizes(): " << shared_v_cache.sizes();
 // LOG(INFO) << "sm_scale: " << sm_scale;
 // LOG(INFO) << "warp_specialize: " << warp_specialize;
   // Forward pass for shared attention

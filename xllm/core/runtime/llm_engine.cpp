@@ -148,7 +148,7 @@ bool LLMEngine::init() {
 bool LLMEngine::init_model() {
   const std::string& model_path = options_.model_path();
   auto model_loader = ModelLoader::create(model_path);
-  LOG(INFO) << "Initializing model from: " << model_path;
+//LOG(INFO) << "Initializing model from: " << model_path;
 
   tokenizer_ = model_loader->tokenizer();
   CHECK(tokenizer_ != nullptr);
@@ -168,10 +168,10 @@ bool LLMEngine::init_model() {
   dtype_ = util::parse_dtype(args_.dtype(), options_.devices()[0]);
 
   // key + value for all layers
-  LOG(INFO) << "Block info, block_size: " << options_.block_size()
-            << ", n_local_kv_heads: " << n_local_kv_heads_
-            << ", head_dim: " << head_dim_ << ", n_layers: " << args_.n_layers()
-            << ", dtype: " << dtype_;
+//LOG(INFO) << "Block info, block_size: " << options_.block_size()
+            // << ", n_local_kv_heads: " << n_local_kv_heads_
+            // << ", head_dim: " << head_dim_ << ", n_layers: " << args_.n_layers()
+            // << ", dtype: " << dtype_;
 
   if (tokenizer_->vocab_size() != args_.vocab_size()) {
     // use tokenizer vocab size if model vocab size is not set
@@ -187,9 +187,9 @@ bool LLMEngine::init_model() {
     }
   }
 
-  LOG(INFO) << "Initializing model with " << args_;
-  LOG(INFO) << "Initializing model with quant args: " << quant_args_;
-  LOG(INFO) << "Initializing model with tokenizer args: " << tokenizer_args_;
+//LOG(INFO) << "Initializing model with " << args_;
+//LOG(INFO) << "Initializing model with quant args: " << quant_args_;
+//LOG(INFO) << "Initializing model with tokenizer args: " << tokenizer_args_;
 
   // init model for each worker in parallel
   // multiple workers, call async init
@@ -738,7 +738,7 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
     // empty worker, return
     return {};
   }
-  LOG(INFO) << "inner LLMEngine::step.";
+  // LOG(INFO) << "inner LLMEngine::step.";
   if (FLAGS_max_decode_rounds > 0) {
     return step_multi_round(batch);
   }

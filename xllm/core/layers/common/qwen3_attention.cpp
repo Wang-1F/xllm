@@ -135,18 +135,18 @@ torch::Tensor Qwen3AttentionImpl::forward(
 // LOG(INFO) << "inner xattention branch.";
     int32_t layer_id = input_params.layer_id;
    
-LOG(INFO) << "input_params.kv_seq_lens_vec: " << input_params.kv_seq_lens_vec;
-LOG(INFO) << "input_params.decode_kv_seq_lens_vec: " << input_params.decode_kv_seq_lens_vec;
+//LOG(INFO) << "input_params.kv_seq_lens_vec: " << input_params.kv_seq_lens_vec;
+//LOG(INFO) << "input_params.decode_kv_seq_lens_vec: " << input_params.decode_kv_seq_lens_vec;
     q = q.reshape({-1, model_args_.n_heads(), model_args_.head_dim()});
     out = rec_triton_kernel_.xattention(q,
-                                          input_params.shared_k_caches[layer_id],
-                                          input_params.shared_v_caches[layer_id],
-                                          kv_cache.get_k_cache(),
-                                          kv_cache.get_v_cache(),
-                                          input_params.current_round,
-                                          input_params.beam_width,
-                                          scaling_,
-                                          input_params.kv_seq_lens_vec[1]);
+                                        input_params.shared_k_caches[layer_id],
+                                        input_params.shared_v_caches[layer_id],
+                                        kv_cache.get_k_cache(),
+                                        kv_cache.get_v_cache(),
+                                        input_params.current_round,
+                                        input_params.beam_width,
+                                        scaling_,
+                                        input_params.kv_seq_lens_vec[1]);
   } else {
 // LOG(INFO) << "inner flashinfer branch.";
     out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));

@@ -176,14 +176,14 @@ bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
   if (sequence->host_kv_state().num_kv_blocks() == 0) {
     allocate_host_shared(sequence);
   }
-  LOG(INFO) << "sequence.token_ids.size(): " << sequence->tokens().size();
-  LOG(INFO) << "sequence.token_ids: " << std::vector<int32_t>{sequence->tokens()};
+//LOG(INFO) << "sequence.token_ids.size(): " << sequence->tokens().size();
+//LOG(INFO) << "sequence.token_ids: " << std::vector<int32_t>{sequence->tokens()};
   const size_t num_blocks = sequence->kv_state().num_kv_blocks();
   // round up to the nearest block number
   const size_t block_size = options_.block_size();
   // num_tokens = FLAGS_max_decode_rounds == 0 ? num_tokens : 1;
   const size_t num_blocks_needed = (num_tokens + block_size - 1) / block_size;
-  LOG(INFO) << "num_blocks_needed: " << num_blocks_needed;
+//LOG(INFO) << "num_blocks_needed: " << num_blocks_needed;
   if (num_blocks_needed <= num_blocks) {
     process_beam_search(sequence, /*need_swap*/ true);
     return true;

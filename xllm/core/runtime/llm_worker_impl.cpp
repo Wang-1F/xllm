@@ -84,7 +84,7 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
 namespace {
 
 void printModelInputParams(const ModelInputParams& params) {
-LOG(INFO) << "=== ModelInputParams Debug Info ===";
+//LOG(INFO) << "=== ModelInputParams Debug Info ===";
   
   // Basic boolean and integer fields
 // LOG(INFO) << "empty_kv_cache: " << params.empty_kv_cache;
@@ -142,9 +142,9 @@ LOG(INFO) << "=== ModelInputParams Debug Info ===";
   // Tensor fields - check if defined and print basic info
   auto printTensorInfo = [](const torch::Tensor& tensor, const std::string& name) {
       if (tensor.defined()) {
-LOG(INFO) << name << " - shape: " << tensor.sizes() 
-                    << ", dtype: " << tensor.dtype() 
-                    << ", device: " << tensor.device();
+//LOG(INFO) << name << " - shape: " << tensor.sizes() 
+                    // << ", dtype: " << tensor.dtype() 
+                    // << ", device: " << tensor.device();
       } else {
 LOG(INFO) << name << " - undefined";
       }
@@ -192,7 +192,7 @@ LOG(INFO) << name << " - undefined";
 // LOG(INFO) << "layer_synchronizer: " << (params.layer_synchronizer ? "defined" : "nullptr");
 #endif
   
-LOG(INFO) << "=== End ModelInputParams Debug Info ===";
+//LOG(INFO) << "=== End ModelInputParams Debug Info ===";
 }
 
 
@@ -601,8 +601,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
         
         auto copy_dst = sequence_group.slice(/*dim=*/2, /*start=*/round, /*end=*/round + 1).squeeze(-1);
         auto copy_src = top_tokens.reshape({batch, beam_width});
-LOG(INFO) << "copy_src.size(): " << copy_src.sizes();
-LOG(INFO) << "copy_dst.size(): " << copy_dst.sizes();
+//LOG(INFO) << "copy_src.size(): " << copy_src.sizes();
+//LOG(INFO) << "copy_dst.size(): " << copy_dst.sizes();
 
         copy_dst.copy_(copy_src, /*non_blocking=*/true);
 
@@ -625,10 +625,10 @@ LOG(INFO) << "copy_dst.size(): " << copy_dst.sizes();
       sequence_group.copy_(out_seqgroup);
       acc_logprob.copy_(out_log_probs);
       #endif
-LOG(INFO) << "out_seqgroup.sizes(): " << out_seqgroup.sizes();
-LOG(INFO) << "sequence_group.sizes(): " << sequence_group.sizes();
-LOG(INFO) << "out_log_probs.sizes(): " << out_log_probs.sizes();
-LOG(INFO) << "acc_logprob.sizes(): " << acc_logprob.sizes();
+//LOG(INFO) << "out_seqgroup.sizes(): " << out_seqgroup.sizes();
+//LOG(INFO) << "sequence_group.sizes(): " << sequence_group.sizes();
+//LOG(INFO) << "out_log_probs.sizes(): " << out_log_probs.sizes();
+//LOG(INFO) << "acc_logprob.sizes(): " << acc_logprob.sizes();
       
       // keep group offset contiguous across rounds (already in out_* tensors)
       // update next round tokens.
@@ -636,7 +636,7 @@ LOG(INFO) << "acc_logprob.sizes(): " << acc_logprob.sizes();
         flatten_tokens_micro_batches[0] =
             sample_output.top_tokens.to(torch::kInt32).reshape({-1});
       } else {
-        flatten_tokens_micro_batches[0] = torch::clamp(out_token_ids, 0, 150000).clone().reshape({-1});
+        flatten_tokens_micro_batches[0] = torch::clamp(out_token_ids, 0, 150000).reshape({-1});
         // flatten_tokens_micro_batches[0] = out_token_ids.clone().reshape({-1});
       }
 

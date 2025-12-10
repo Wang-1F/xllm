@@ -193,6 +193,19 @@ class RecTritonKernel {
   using TestTMAKernelConfig = GenericKernelConfig<ThreeDimBlockSize>;
   GenericKernelConfigs<TestTMAKernelConfig> bf16_test_tma_configs_;
   std::vector<std::vector<int>> bf16_test_tma_input_dim_array_;
+
+
+  torch::Tensor q_;
+  torch::Tensor shared_k_cache_;
+  torch::Tensor shared_v_cache_;
+  torch::Tensor unshared_k_cache_;
+  torch::Tensor unshared_v_cache_;
+  uint32_t decode_step_;
+  uint32_t beam_size_;
+  float sm_scale_;
+  uint32_t prompt_len_;
+  bool is_cached_{false};
+
 };
 
 } // namespace xllm::kernel::cuda::triton
