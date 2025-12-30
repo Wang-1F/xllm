@@ -55,10 +55,19 @@ struct AttentionMetadata {
   torch::Tensor shared_k_cache;
   torch::Tensor shared_v_cache;
   uint32_t step;
-  
+
+  torch::Tensor paged_kv_indptr_unshared;
+  torch::Tensor paged_kv_indices_unshared;
+  torch::Tensor paged_kv_last_page_len_unshared;
+
+  torch::Tensor paged_kv_indptr_shared;
+  torch::Tensor paged_kv_indices_shared;
+  torch::Tensor paged_kv_last_page_len_shared;
   // 不需要每一层都申请显存，而是维护起来，生命周期为整步的decode
   torch::Tensor unshared_o;
   torch::Tensor unshared_lse;
+  torch::Tensor shared_o;
+  torch::Tensor shared_lse;
 };
 
 }  // namespace layer

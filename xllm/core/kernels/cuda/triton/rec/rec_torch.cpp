@@ -56,33 +56,63 @@ torch::Tensor RecTorchKernel::xattention(torch::Tensor q,                    // 
 
 void RecTorchKernel::prefill_reshape_and_cache(torch::Tensor proj_k,          // [shared_len, kv_heads, head_dim]
                                                torch::Tensor proj_v,          // [shared_len, kv_heads, head_dim]
-                                               torch::Tensor shared_k_cache,  // [num_shared_kv_seq_len, kv_heads, head_dim]
-                                               torch::Tensor shared_v_cache   // [num_shared_kv_seq_len, kv_heads, head_dim]
+                                               torch::Tensor kv_cu_seq_lens,    // [batch_size + 1]
+                                               torch::Tensor shared_k_cache,  // [batch_size, num_shared_kv_seq_len, kv_heads, head_dim]
+                                               torch::Tensor shared_v_cache   // [batch_size, num_shared_kv_seq_len, kv_heads, head_dim]
                                                ) {
-  // LOG(INFO) << "inner RecTorchKernel::prefill_reshape_and_cache";
   // 获取维度信息
   int64_t shared_len = proj_k.size(0);
   int64_t kv_heads = proj_k.size(1);
   int64_t head_dim = proj_k.size(2);
-  int64_t num_shared_kv_seq_len = shared_k_cache.size(0);
+  int64_t batch_size = shared_k_cache.size(0);
+  int64_t num_shared_kv_seq_len = shared_k_cache.size(1);
   
   // 检查维度兼容性
-  CHECK_LE(shared_len, num_shared_kv_seq_len) << 
-              "shared_len () must be <= num_shared_kv_seq_len ";
-  CHECK_EQ(proj_k.size(1), shared_k_cache.size(1)) <<
-              "kv_heads dimension mismatch";
-  CHECK_EQ(proj_k.size(2), shared_k_cache.size(2)) << 
-              "head_dim dimension mismatch";
+  CHECK_EQ(kv_cu_seq_lens.size(0), batch_size + 1) << 
+              "kv_cu_seq_lens size must be batch_size + 1";
+  CHECK_EQ(proj_k.size(1), kv_heads) << "proj_k kv_heads dimension mismatch";
+  CHECK_EQ(proj_k.size(2), head_dim) << "proj_k head_dim dimension mismatch";
+  CHECK_EQ(shared_k_cache.size(2), kv_heads) <<
+              "shared_k_cache kv_heads dimension mismatch";
+  CHECK_EQ(shared_k_cache.size(3), head_dim) << 
+              "shared_k_cache head_dim dimension mismatch";
   CHECK_EQ(proj_v.sizes(), proj_k.sizes()) << 
               "proj_v and proj_k must have same shape";
   CHECK_EQ(shared_v_cache.sizes(), shared_k_cache.sizes()) << 
               "shared_v_cache and shared_k_cache must have same shape";
-  // LOG(INFO) << "before copy_.";
-  // 将 proj_k 和 proj_v 复制到 cache 的前 shared_len 位置
-  // 方法1: 使用 slice 和 copy_
-  shared_k_cache.slice(0, 0, shared_len).copy_(proj_k);
-  shared_v_cache.slice(0, 0, shared_len).copy_(proj_v);
-  // LOG(INFO) << "after copy_.";
+  
+  // 将 kv_cu_seq_lens 转换为 CPU 以便访问
+  auto kv_cu_seq_lens_cpu = kv_cu_seq_lens.to(torch::kCPU);
+  auto kv_cu_seq_lens_ptr = kv_cu_seq_lens_cpu.data_ptr<int32_t>();
+  
+  // 根据 kv_cu_seq_lens 将 proj_k 和 proj_v 按照每个 batch 的共享长度分配到对应的 cache 中
+  int64_t proj_offset = 0;
+  for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+    int32_t batch_start = kv_cu_seq_lens_ptr[batch_idx];
+    int32_t batch_end = kv_cu_seq_lens_ptr[batch_idx + 1];
+    int64_t batch_shared_len = batch_end - batch_start;
+    
+    CHECK_LE(batch_shared_len, num_shared_kv_seq_len) << 
+                "batch " << batch_idx << " shared_len (" << batch_shared_len 
+                << ") must be <= num_shared_kv_seq_len (" << num_shared_kv_seq_len << ")";
+    CHECK_LE(proj_offset + batch_shared_len, shared_len) <<
+                "proj_k/proj_v offset overflow";
+    
+    // 从 proj_k 和 proj_v 中提取当前 batch 的数据
+    // proj_k[batch_start:batch_end, :, :] -> shared_k_cache[batch_idx, 0:batch_shared_len, :, :]
+    auto proj_k_batch = proj_k.slice(0, batch_start, batch_end);
+    auto proj_v_batch = proj_v.slice(0, batch_start, batch_end);
+    
+    // 复制到对应的 cache 位置
+    shared_k_cache[batch_idx].slice(0, 0, batch_shared_len).copy_(proj_k_batch);
+    shared_v_cache[batch_idx].slice(0, 0, batch_shared_len).copy_(proj_v_batch);
+    
+    proj_offset += batch_shared_len;
+  }
+  
+  CHECK_EQ(proj_offset, shared_len) << 
+              "Total shared_len mismatch: expected " << shared_len 
+              << ", got " << proj_offset;
 }
 
 void RecTorchKernel::decoder_reshape_and_cache(torch::Tensor proj_k,          // [batch_size, beam_size, kv_heads, head_dim]

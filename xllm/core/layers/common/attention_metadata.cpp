@@ -50,18 +50,28 @@ AttentionMetadata AttentionMetadata::build(const ModelInputParams& params,
   attn_metadata.is_dummy = (params.q_max_seq_len == 0);
 
   // for xattention
-  if (params.current_round >= 0) {
+  if (FLAGS_max_decode_rounds > 0 && params.current_round >= 0) {
+    attn_metadata.paged_kv_indptr_unshared = params.paged_kv_indptr_unshared;
+    attn_metadata.paged_kv_indices_unshared = params.paged_kv_indices_unshared;
+    attn_metadata.paged_kv_last_page_len_unshared = params.paged_kv_last_page_len_unshared;
+
+    attn_metadata.paged_kv_indptr_shared = params.paged_kv_indptr_shared;
+    attn_metadata.paged_kv_indices_shared = params.paged_kv_indices_shared;
+    attn_metadata.paged_kv_last_page_len_shared = params.paged_kv_last_page_len_shared;
+
     auto fp32_options = 
       torch::TensorOptions().dtype(torch::kFloat32).device(attn_metadata.paged_kv_indices.device());
     auto bf16_options = 
       torch::TensorOptions().dtype(torch::kBFloat16).device(attn_metadata.paged_kv_indices.device());
     int32_t num_heads = params.num_heads;
     int32_t head_dim = params.head_dim;
-    int32_t total_beam = attn_metadata.paged_kv_indices.size(0);
+    int32_t total_beam = attn_metadata.paged_kv_indices_unshared.size(0);
     
     // hard code
     attn_metadata.unshared_o = torch::zeros({total_beam, num_heads, head_dim}, bf16_options);
     attn_metadata.unshared_lse = torch::zeros({total_beam, num_heads, 1}, fp32_options);
+    attn_metadata.shared_o = torch::zeros({total_beam, num_heads, head_dim}, bf16_options);
+    attn_metadata.shared_lse = torch::zeros({total_beam, num_heads, 1}, fp32_options);
   }
 
   return attn_metadata;

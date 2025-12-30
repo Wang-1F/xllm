@@ -337,6 +337,15 @@ struct ModelInputParams {
   int32_t total_round = 0;
   int32_t num_heads = 0;
   int32_t head_dim = 0;
+
+  // for xattention
+  torch::Tensor paged_kv_indptr_unshared;
+  torch::Tensor paged_kv_indices_unshared;
+  torch::Tensor paged_kv_last_page_len_unshared;
+  
+  torch::Tensor paged_kv_indptr_shared;
+  torch::Tensor paged_kv_indices_shared;
+  torch::Tensor paged_kv_last_page_len_shared;
 };
 
 }  // namespace xllm

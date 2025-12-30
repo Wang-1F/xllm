@@ -245,6 +245,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
 
   int32_t num_heads = context_.get_model_args().n_heads();
   int32_t head_dim = context_.get_model_args().head_dim();
+  int32_t num_kv_heads = context_.get_model_args().n_kv_heads().value_or(num_heads);
   input.input_params.num_heads = num_heads;
   input.input_params.head_dim = head_dim;
   int32_t batch = input.input_params.num_sequences;
@@ -275,6 +276,20 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       torch::zeros({num_seq, 1}, int_options);
   // 维护beam_serch后的sequence token ids
   auto out_seqgroup = sequence_group.clone();
+
+  LOG(INFO) << "input.input_params.shared_k_caches.shape: " << input.input_params.shared_k_caches[0].sizes();
+  LOG(INFO) << "input.input_params.shared_v_caches.shape: " << input.input_params.shared_v_caches[0].sizes();
+
+  // 对 vector 中的所有 tensor 都进行 view 操作
+  for (auto& shared_v_cache : input.input_params.shared_v_caches) {
+    shared_v_cache = shared_v_cache.view({batch, -1, num_kv_heads, head_dim});
+  }
+  for (auto& shared_k_cache : input.input_params.shared_k_caches) {
+    shared_k_cache = shared_k_cache.view({batch, -1, num_kv_heads, head_dim});
+  }
+
+  LOG(INFO) << "input.input_params.shared_k_caches.shape: " << input.input_params.shared_k_caches[0].sizes();
+  LOG(INFO) << "input.input_params.shared_v_caches.shape: " << input.input_params.shared_v_caches[0].sizes();
 
   ForwardOutput output;
 
@@ -339,30 +354,23 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
         //     sample_output.top_tokens.to(torch::kInt32).reshape({-1, 1}); 
         // LOG(INFO) << "top_tokens.shape: " << top_tokens.sizes();
         // // 代表得分
-        // top_logprobs = sample_output.top_logprobs.reshape({-1, 1});
+        // top_logprobs = sample_output.top_logprobs.reshape({-1, 1}); 
 
-        // 下面这些应该不是step=0才做的，应该是所有都要做
-        
-
-        // 更新q_seq_len，原来保留的是prefill的seq_len，需要改成decode的
-        // 其次，因为shared对beam_size和num_heads做了合轴，因此seq_len实际变成了beam_size
-        // LOG(INFO) << "num_seq: " << num_seq;
-        // input.input_params.q_seq_lens = torch::arange(batch + 1, int_options) * beam_width;
-        input.input_params.q_seq_lens = torch::arange(batch + 1, int_options);  
-        // input.input_params.q_seq_lens = torch::arange(batch + 1, int_options) * beam_width;  
         // 当batch和beam都确认下来的时候，就可以决定paged的indptr和indices了，且值是固定的，也不会随着step变化
         auto batch_offsets = input.input_params.paged_kv_indices;
         batch_offsets = batch_offsets.unsqueeze(1).expand({-1, beam_width_init});
         auto beam_offsets = torch::arange(beam_width_init, input.input_params.paged_kv_indices.options());
+        beam_offsets = beam_offsets.unsqueeze(0).expand({batch, -1});
         auto batch_beam_offsets = batch_offsets * beam_width_init + beam_offsets;
 
-        input.input_params.paged_kv_indices = 
+        input.input_params.paged_kv_indices_unshared = 
           batch_beam_offsets.flatten();
-        input.input_params.paged_kv_indptr = 
+        input.input_params.paged_kv_indptr_unshared = 
           torch::arange(batch * beam_width_init + 1, input.input_params.paged_kv_indptr.options());
         // 至于last_page_len，应该就是beam_width个step + 1，所以这三个参数都可以放在layer外面设置，非layer内
       } 
-      input.input_params.paged_kv_last_page_len = 
+      LOG(INFO) << "input.input_params.paged_kv_last_page_len: " << input.input_params.paged_kv_last_page_len;
+      input.input_params.paged_kv_last_page_len_unshared = 
         torch::full({batch * beam_width_init}, round + 1, input.input_params.paged_kv_last_page_len.options());
       // else {
         
