@@ -31,7 +31,7 @@ enum class RecPipelineType : uint8_t {
   kLlmRecDefault = 0,          // LlmRec without mm_data (pure qwen)
   kLlmRecWithMmData = 1,       // LlmRec with mm_data (qwen + embedding)
   kOneRecDefault = 2,          // OneRec
-  kLlmPureDevicePipeLine = 3,  // LlmRec pure device pipeline for multi-round
+  kLlmRecPureDevicePipeline = 3,  // LlmRec pure device pipeline for multi-round
 };
 
 // Pipeline strategy selector: choose strategy based on RecModelKind
