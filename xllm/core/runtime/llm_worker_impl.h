@@ -74,7 +74,7 @@ class LLMWorkerImpl : public WorkerImpl {
 
 #endif
 
- private:
+ protected:
   std::unique_ptr<BeamSearcher> beam_searcher_;
 };
 

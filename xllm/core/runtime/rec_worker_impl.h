@@ -46,7 +46,6 @@ class RecWorkerImpl : public LLMWorkerImpl {
  protected:
   std::shared_ptr<ThreadPool> input_builder_thread_pool_;
 
- private:
   class RecWorkPipeline {
    public:
     virtual ~RecWorkPipeline() = default;
@@ -62,7 +61,7 @@ class RecWorkerImpl : public LLMWorkerImpl {
     virtual std::optional<ForwardOutput> step(const ForwardInput& input) = 0;
   };
 
-  class LlmRecWorkPipeline final : public RecWorkPipeline {
+  class LlmRecWorkPipeline : public RecWorkPipeline {
    public:
     explicit LlmRecWorkPipeline(RecWorkerImpl& worker);
 
@@ -75,11 +74,11 @@ class RecWorkerImpl : public LLMWorkerImpl {
 
     std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
-   private:
+   protected:
     RecWorkerImpl& worker_;
   };
 
-  class OneRecWorkPipeline final : public RecWorkPipeline {
+  class OneRecWorkPipeline : public RecWorkPipeline {
    public:
     explicit OneRecWorkPipeline(RecWorkerImpl& worker);
 
@@ -92,11 +91,11 @@ class RecWorkerImpl : public LLMWorkerImpl {
 
     std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
-   private:
+   protected:
     RecWorkerImpl& worker_;
   };
 
-  class LlmRecWithMmDataWorkPipeline final : public RecWorkPipeline {
+  class LlmRecWithMmDataWorkPipeline : public RecWorkPipeline {
    public:
     explicit LlmRecWithMmDataWorkPipeline(RecWorkerImpl& worker);
 
@@ -109,11 +108,11 @@ class RecWorkerImpl : public LLMWorkerImpl {
 
     std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
-   private:
+   protected:
     RecWorkerImpl& worker_;
   };
 
-  class LlmRecPureDevicePipeline final : public RecWorkPipeline {
+  class LlmRecPureDevicePipeline : public RecWorkPipeline {
    public:
     explicit LlmRecPureDevicePipeline(RecWorkerImpl& worker);
 
@@ -126,8 +125,8 @@ class RecWorkerImpl : public LLMWorkerImpl {
 
     std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
-   private:
-    std::optional<ForwardOutput> step_multi_round(ForwardInput& input);
+   protected:
+    virtual std::optional<ForwardOutput> step_multi_round(ForwardInput& input);
 
     // Update input for next round in multi-round decoding
     void update_input_for_next_round(ForwardInput& input,

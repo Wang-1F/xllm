@@ -298,6 +298,7 @@ ForwardInput RecWorkerImpl::LlmRecPureDevicePipeline::prepare_inputs(
                                 ? worker_.input_builder_thread_pool_.get()
                                 : nullptr;
 
+  // 确认是否可以多线程
   return batch.prepare_rec_forward_input(worker_.options_.num_decoding_tokens(),
                                          /*min_decoding_batch_size=*/0,
                                          worker_.context_.get_model_args(),

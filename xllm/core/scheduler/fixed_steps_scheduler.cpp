@@ -27,6 +27,7 @@ limitations under the License.
 #include <memory>
 
 #include "common/metrics.h"
+#include "common/types.h"
 #include "core/common/global_flags.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch.h"
@@ -35,8 +36,17 @@ limitations under the License.
 #include "framework/request/sequence.h"
 
 namespace xllm {
+
+namespace {
+constexpr size_t kRequestQueueSize = 100000;
+}  // namespace
+
 FixedStepsScheduler::FixedStepsScheduler(Engine* engine, const Options& options)
-    : ContinuousScheduler(engine, options) {}
+    : ContinuousScheduler(engine, options),
+      step_threadpool_(std::make_unique<ThreadPool>(
+          static_cast<size_t>(FLAGS_rec_worker_max_concurrency))),
+      step_semaphore_(
+          static_cast<std::ptrdiff_t>(FLAGS_rec_worker_max_concurrency)) {}
 
 bool FixedStepsScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
@@ -206,8 +216,9 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
     std::shared_ptr<Request> request = *it;
     request->update_connection_status();
     if (request->finished() || request->cancelled()) {
-      // kv_cache_manager_->deallocate(request.get());
-      // release the ownership of the request
+      if (request->state().rec_type == RecType::kLlmRec) {
+        kv_cache_manager_->deallocate(request.get());
+      }
       finished_requests.emplace_back(request);
       // finished request is set to nullptr
       *it = nullptr;
@@ -258,7 +269,11 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
   }
 
   // update metrics before returning
-  if (!batches[0].empty()) {
+  bool is_batches_empty =
+      (std::all_of(batches.begin(), batches.end(), [](const Batch& one_batch) {
+        return one_batch.empty();
+      }));
+  if (!is_batches_empty) {
     // only update the scheduling latency when there are requests to process
     COUNTER_ADD(scheduling_latency_seconds, timer.elapsed_seconds());
   }
@@ -285,17 +300,21 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
   return batches;
 }
 
-std::vector<Batch> FixedStepsScheduler::schedule_request(
+ScheduleResult FixedStepsScheduler::schedule_request(
     const absl::Duration& timeout) {
   const auto deadline = absl::Now() + timeout;
-  std::vector<Batch> batches;
+  ScheduleResult result;
   while (true) {
-    batches = prepare_batch();
-    bool all_empty = std::all_of(batches.begin(),
-                                 batches.end(),
-                                 [](const Batch& b) { return b.empty(); });
+    result.batches = prepare_batch();
+    bool all_empty =
+        std::all_of(result.batches.begin(),
+                    result.batches.end(),
+                    [](const Batch& one_batch) { return one_batch.empty(); });
     if (!all_empty) {
-      return batches;
+      // Move running_requests_ and running_sequences_ into result
+      result.requests = std::move(running_requests_);
+      result.sequences = std::move(running_sequences_);
+      return result;
     }
     const auto now = absl::Now();
     if (now > deadline) {
@@ -307,8 +326,8 @@ std::vector<Batch> FixedStepsScheduler::schedule_request(
         std::min(absl::Milliseconds(kStepSleepTimeMs), deadline - now);
     absl::SleepFor(time_to_sleep);
   }
-  // return an empty result
-  return batches;
+  // return empty result
+  return result;
 }
 
 // step the scheduler forward by one step
@@ -316,16 +335,54 @@ std::vector<Batch> FixedStepsScheduler::schedule_request(
 void FixedStepsScheduler::step(const absl::Duration& timeout) {
   if (!options_.enable_schedule_overlap()) {
     // get a new batch of requests
-    std::vector<Batch> batches = schedule_request(timeout);
-    bool all_empty = std::all_of(batches.begin(),
-                                 batches.end(),
-                                 [](const Batch& b) { return b.empty(); });
+    ScheduleResult result = schedule_request(timeout);
+    bool all_empty =
+        std::all_of(result.batches.begin(),
+                    result.batches.end(),
+                    [](const Batch& one_batch) { return one_batch.empty(); });
     if (all_empty) {
       return;
     }
 
-    engine_->step(batches);
-    kv_cache_manager_->reset_transfer_infos();
+    // Submit task to thread pool for asynchronous execution
+    // After engine_->step() completes, process finished/cancelled requests
+    auto function = [this,
+                     batches = std::move(result.batches),
+                     requests = std::move(result.requests),
+                     sequences = std::move(result.sequences)]() mutable {
+      engine_->step(batches);
+      kv_cache_manager_->reset_transfer_infos();
+
+      // After step completes, check and process finished/cancelled requests
+      std::vector<std::shared_ptr<Request>> finished_requests;
+      for (auto& request : requests) {
+        if (request) {
+          request->update_connection_status();
+          if (request->finished() || request->cancelled()) {
+            kv_cache_manager_->deallocate(request.get());
+            finished_requests.emplace_back(request);
+          }
+        }
+      }
+
+      // Process finished requests
+      if (!finished_requests.empty()) {
+        response_processor_->process_completed_requests(finished_requests);
+      }
+
+      if (FLAGS_rec_worker_max_concurrency > 1) {
+        step_semaphore_.release();
+      }
+    };
+
+    if (FLAGS_rec_worker_max_concurrency > 1) {
+      step_semaphore_.acquire();
+      step_threadpool_->schedule(function);
+    } else {
+      function();
+    }
+
+    // Return immediately to allow the next step() call to execute in parallel
   } else {
     LOG(ERROR) << "FixedStepsScheduler::step() not supported with "
                   "enable_schedule_overlap";
