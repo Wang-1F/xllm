@@ -31,7 +31,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
     torch::Tensor& key,
     torch::Tensor& value,
     KVCache& kv_cache) {
-  auto output = torch::empty_like(query);
+  auto output = attn_metadata.preallocated_output;
   auto output_lse = std::nullopt;
   if (attn_metadata.max_seq_len == 0) {
     output = output.view({-1, num_heads_ * head_size_});

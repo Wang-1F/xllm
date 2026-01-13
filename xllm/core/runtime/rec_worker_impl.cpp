@@ -442,6 +442,8 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
       torch::TensorOptions().dtype(torch::kFloat32).device(device);
   auto paged_options =
       torch::TensorOptions().dtype(torch::kInt32).device(device);
+  CHECK_GT(worker_.kv_caches_.size(), 0) << "KV caches are not initialized.";
+  auto kv_cache_options = worker_.kv_caches_[0].get_k_cache().options();
 
   BeamSearchTensors beam_tensors =
       prepare_beam_search_tensors(batch_size, beam_width, total_rounds, device);
@@ -460,6 +462,12 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
   SampleOutput sample_output;
   torch::Tensor top_tokens;
 
+  int32_t max_q_seq_len =
+      mutable_input.input_params.q_seq_lens.max().item().toInt();
+  int32_t num_qo_heads = mutable_input.input_params.num_heads;
+  int32_t head_dim = mutable_input.input_params.head_dim;
+  mutable_input.input_params.preallocated_output =
+      torch::zeros({max_q_seq_len, num_qo_heads * head_dim}, kv_cache_options);
   for (int32_t round = 0; round < total_rounds; ++round) {
     const auto& sampling_params = round > 0
                                       ? mutable_input.decoder_sampling_params
@@ -483,6 +491,11 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
                                          mutable_input.input_params);
     if (!hidden_states.defined()) {
       return std::nullopt;
+    }
+
+    if (round == 0) {
+      mutable_input.input_params.preallocated_output = torch::zeros(
+          {batch_size * beam_width, num_qo_heads * head_dim}, kv_cache_options);
     }
 
     if (sampling_params.selected_token_idxes.defined()) {
