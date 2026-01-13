@@ -54,9 +54,6 @@ class MultiStepBatchInputBuilder {
 
   ~MultiStepBatchInputBuilder() = default;
 
-  // Build multi-step raw forward input for the whole batch.
-  RawForwardInput build_raw_forward_input();
-
   // Build multi-step forward input for the whole batch.
   ForwardInput build_forward_input();
 
@@ -142,13 +139,6 @@ class MultiStepBatchInputBuilder {
     std::vector<std::vector<int32_t>> decode_unique_token_counts_vec;
     std::vector<int32_t> decode_unique_token_lens_vec;
     std::vector<int32_t> decode_sample_idxes;
-#if defined(USE_NPU) || defined(USE_CUDA)
-    std::vector<int32_t> decode_seq_lens;
-    std::vector<int32_t> decode_q_seq_lens;
-#elif defined(USE_MLU)
-    std::vector<int32_t> decode_seq_lens = {0};
-    std::vector<int32_t> decode_q_seq_lens = {0};
-#endif
     std::vector<int32_t> decode_positions_vec;
 
     // Multi-step specific metadata
@@ -167,7 +157,6 @@ class MultiStepBatchInputBuilder {
 
   // Multi-step specific forward input conversion functions
   ForwardInput state_to_forward_input();
-  RawForwardInput state_to_raw_forward_input(BuilderState* state_ptr = nullptr);
 
   void setup_kv_cache_info(Sequence* sequence,
                            uint32_t n_kv_cache_tokens,

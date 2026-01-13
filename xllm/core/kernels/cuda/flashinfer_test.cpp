@@ -126,9 +126,6 @@ inline void log_tensor_stats(const char* name,
   // std() default is unbiased; for debug, biased is fine and faster.
   const double tstd = tf.std(/*unbiased=*/false).item<double>();
   const double tabsmax = tf.abs().max().item<double>();
-  LOG(INFO) << name << " dtype=" << t.scalar_type() << " shape=" << t.sizes()
-            << " min=" << tmin << " max=" << tmax << " mean=" << tmean
-            << " std=" << tstd << " absmax=" << tabsmax;
 }
 
 // Shape a tensor's value range to mimic real-model ranges:
@@ -384,8 +381,7 @@ TEST_F(FlashInferLseCombineTest, TwoDecodePlusLseCombineMatchesSingleDecode) {
                                         total_pages_shared,
                                         0,
                                         beam_size);
-  LOG(INFO) << "shared:";
-  prinf_paged_kv(shared);
+
   PagedKV unshared = make_block1_paged_kv(device_,
                                           kv_dtype,
                                           num_kv_heads,
@@ -394,8 +390,6 @@ TEST_F(FlashInferLseCombineTest, TwoDecodePlusLseCombineMatchesSingleDecode) {
                                           total_pages_unshared,
                                           max_decode_step,
                                           beam_size);
-  LOG(INFO) << "unshared:";
-  prinf_paged_kv(unshared);
   // Full cache is concatenation along the page dimension.
   torch::Tensor k_full = torch::cat({shared.k_cache, unshared.k_cache}, 0);
   torch::Tensor v_full = torch::cat({shared.v_cache, unshared.v_cache}, 0);
@@ -431,12 +425,6 @@ TEST_F(FlashInferLseCombineTest, TwoDecodePlusLseCombineMatchesSingleDecode) {
           .to(device_);
   torch::Tensor full_last_page_len =
       torch::full({B * beam_size}, 1, idx_options);  // block_size=1 => always 1
-  LOG(INFO) << "full_indptr:";
-  LOG(INFO) << full_indptr;
-  LOG(INFO) << "full_indices:";
-  LOG(INFO) << full_indices;
-  LOG(INFO) << "full_last_page_len:";
-  LOG(INFO) << full_last_page_len;
   // Random query for a single-step decode: [B, H, D].
   torch::manual_seed(0);
   auto q_options = torch::TensorOptions().device(device_).dtype(q_dtype);
@@ -487,7 +475,6 @@ TEST_F(FlashInferLseCombineTest, TwoDecodePlusLseCombineMatchesSingleDecode) {
   k_full = torch::cat({shared.k_cache, unshared.k_cache}, 0);
   v_full = torch::cat({shared.v_cache, unshared.v_cache}, 0);
 
-  LOG(INFO) << "sm_scale=" << sm_scale << " head_dim=" << head_dim;
   // log_tensor_stats("query(init)", query, float_options);
   // log_tensor_stats("shared.k_cache", shared.k_cache, float_options);
   // log_tensor_stats("shared.v_cache", shared.v_cache, float_options);
@@ -587,19 +574,8 @@ TEST_F(FlashInferLseCombineTest, TwoDecodePlusLseCombineMatchesSingleDecode) {
   if (torch::any(torch::isnan(lse_unshared)).item<bool>()) {
     LOG(ERROR) << "lse_unshared contains NaN!";
   }
-  LOG(INFO) << "o_full range: " << o_full.min().item<double>() << " to "
-            << o_full.max().item<double>();
-  LOG(INFO) << "o_combined range: " << o_combined.min().item<double>() << " to "
-            << o_combined.max().item<double>();
-  LOG(INFO) << "lse_shared range: " << lse_shared.min().item<double>() << " to "
-            << lse_shared.max().item<double>();
-  LOG(INFO) << "lse_unshared range: " << lse_unshared.min().item<double>()
-            << " to " << lse_unshared.max().item<double>();
-  LOG(INFO) << "lse_full range: " << lse_full.min().item<double>() << " to "
-            << lse_full.max().item<double>();
 
   auto diff = (o_full.to(float_options) - o_combined.to(float_options)).abs();
-  LOG(INFO) << "max_diff: " << diff.max().item<double>();
 
   const double max_abs = diff.max().item<double>();
   // Compare in FP32 to avoid BF16 rounding inside the checker itself.

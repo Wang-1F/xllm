@@ -114,17 +114,9 @@ void MultiStepBatchInputBuilder::process_single_sequence(
 #if defined(USE_NPU)
   base_state.seq_lens.push_back(seq_len);
   base_state.q_seq_lens.push_back(q_seq_len);
-  if (is_pure_device_mode()) {
-    state.decode_seq_lens.push_back(decode_seq_len);
-    state.decode_q_seq_lens.push_back(decode_q_seq_len);
-  }
 #elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU)
   base_state.seq_lens.push_back(base_state.seq_lens.back() + seq_len);
   base_state.q_seq_lens.push_back(base_state.q_seq_lens.back() + q_seq_len);
-  if (is_pure_device_mode()) {
-    state.decode_seq_lens.push_back(decode_seq_len);
-    state.decode_q_seq_lens.push_back(decode_q_seq_len);
-  }
 #endif
 
   // Call our enhanced method to process tokens and positions
@@ -161,22 +153,6 @@ void MultiStepBatchInputBuilder::process_single_sequence(
   // }
 
   // Multi-step specific processing
-}
-
-RawForwardInput MultiStepBatchInputBuilder::build_raw_forward_input() {
-  // Reset multi-step state for this build
-  // multi_step_state_ = MultiStepBuilderState{};
-  multi_step_state_.total_steps = get_pure_device_decode_rounds();
-
-  is_mtp_decode_ = false;
-  // LOG(INFO) << "sequences_.size(): " << sequences_.size();
-  // Single-threaded processing for now; can be extended to use thread_pool_
-  for (int32_t i = 0; i < static_cast<int32_t>(sequences_.size()); ++i) {
-    process_single_sequence(i, &multi_step_state_.base_state, nullptr);
-  }
-  // LOG(INFO) << "multi_step_state_.base_state.batch_forward_type: " <<
-  // multi_step_state_.base_state.batch_forward_type.to_string();
-  return state_to_raw_forward_input(&multi_step_state_.base_state);
 }
 
 ForwardInput MultiStepBatchInputBuilder::build_forward_input() {
@@ -508,7 +484,7 @@ ForwardInput MultiStepBatchInputBuilder::state_to_forward_input() {
   }
 
   // Set full_kv_shape if we have multi-step decode data
-  if (!multi_step_state.decode_seq_lens.empty() && !sequences_.empty()) {
+  if (is_pure_device_mode() && !sequences_.empty()) {
     int64_t batch_size = static_cast<int64_t>(sequences_.size());
     int64_t n_kv_heads =
         args_ ? args_->n_kv_heads().value_or(args_->n_heads()) : 0;
@@ -520,20 +496,6 @@ ForwardInput MultiStepBatchInputBuilder::state_to_forward_input() {
             batch_size * FLAGS_beam_width * std::max(0, decode_rounds - 1),
         n_kv_heads,
         head_dim};
-  }
-
-  // Decode sequence lengths
-  if (!multi_step_state.decode_seq_lens.empty()) {
-    auto tensor_options = torch::TensorOptions()
-                              .dtype(torch::kInt)
-                              .device(torch::kCPU)
-                              .pinned_memory(true);
-    input_params.decode_kv_seq_lens =
-        torch::tensor(multi_step_state.decode_seq_lens, tensor_options);
-    input_params.decode_q_seq_lens =
-        torch::tensor(multi_step_state.decode_q_seq_lens, tensor_options);
-    input_params.decode_kv_seq_lens_vec = multi_step_state.decode_seq_lens;
-    input_params.decode_q_seq_lens_vec = multi_step_state.decode_q_seq_lens;
   }
 
   // Decode positions
@@ -548,184 +510,6 @@ ForwardInput MultiStepBatchInputBuilder::state_to_forward_input() {
   input_params.batch_id = batch_id_;
 
   return forward_input;
-}
-
-RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
-    BuilderState* state_ptr) {
-  BuilderState& src = state_ptr ? *state_ptr : multi_step_state_.base_state;
-  if (src.flatten_tokens_vec.empty()) {
-    return {};
-  }
-  // LOG(INFO) << "multi_step_state_.base_state.batch_forward_type: " <<
-  // multi_step_state_.base_state.batch_forward_type.to_string();
-  RawForwardInput raw_forward_input;
-  VLOG(1) << "[SEL/RAW] selected_token_idxes.size(before move)="
-          << src.selected_token_idxes.size();
-  raw_forward_input.flatten_tokens_vec = std::move(src.flatten_tokens_vec);
-  raw_forward_input.flatten_positions_vec =
-      std::move(src.flatten_positions_vec);
-  raw_forward_input.sampling_params = std::move(src.sampling_params);
-  raw_forward_input.selected_token_idxes = std::move(src.selected_token_idxes);
-  raw_forward_input.sample_idxes = std::move(src.sample_idxes);
-  raw_forward_input.unique_token_ids_vec = std::move(src.unique_token_ids_vec);
-  raw_forward_input.unique_token_counts_vec =
-      std::move(src.unique_token_counts_vec);
-  raw_forward_input.unique_token_lens_vec =
-      std::move(src.unique_token_lens_vec);
-  raw_forward_input.empty_kv_cache = src.empty_kv_cache;
-  // LOG(INFO) << "src.batch_forward_type: " <<
-  // src.batch_forward_type.to_string();
-  raw_forward_input.batch_forward_type = src.batch_forward_type;
-  raw_forward_input.max_seq_len = src.max_seq_len;
-  raw_forward_input.q_max_seq_len = src.q_max_seq_len;
-  raw_forward_input.seq_lens = std::move(src.seq_lens);
-  raw_forward_input.q_seq_lens = std::move(src.q_seq_lens);
-  raw_forward_input.new_token_slot_ids = std::move(src.new_token_slot_ids);
-  // LOG(INFO) << "src.block_tables_vec.size(): " <<
-  // src.block_tables_vec.size();
-  raw_forward_input.block_tables_vec = std::move(src.block_tables_vec);
-  raw_forward_input.num_sequences = num_sequences_;
-  raw_forward_input.transfer_kv_infos = std::move(src.transfer_kv_infos);
-
-  // for flashinfer
-  raw_forward_input.paged_kv_indptr = std::move(src.paged_kv_indptr);
-  raw_forward_input.paged_kv_indices = std::move(src.paged_kv_indices);
-  raw_forward_input.paged_kv_last_page_len =
-      std::move(src.paged_kv_last_page_len);
-
-  raw_forward_input.embedding_ids = std::move(src.embedding_ids);
-  raw_forward_input.extra_token_ids = std::move(src.extra_token_ids);
-  // beam search kernel input
-  if (!src.acc_logprob_vec.empty()) {
-    raw_forward_input.acc_logprob_vec = std::move(src.acc_logprob_vec);
-  }
-
-  if (FLAGS_enable_continuous_kvcache) {
-    raw_forward_input.new_cache_slot_offsets =
-        std::move(src.new_cache_slot_offsets);
-    raw_forward_input.kv_cache_start_offsets =
-        std::move(src.kv_cache_start_offsets);
-  }
-
-  // Swap blocks (optional). Align with BatchInputBuilder's packing behavior:
-  // - If block-copy kernel enabled: pack to src/dst indices + cum_sum
-  // - Else: keep swap_blocks as a flat list of (src,dst)
-  if (swap_block_transfer_infos_ != nullptr &&
-      !swap_block_transfer_infos_->empty()) {
-    auto& swap_blocks = *swap_block_transfer_infos_;
-    if (FLAGS_enable_block_copy_kernel) {
-      std::sort(swap_blocks.begin(),
-                swap_blocks.end(),
-                [](const BlockTransferInfo& a, const BlockTransferInfo& b) {
-                  return a.src_block_id < b.src_block_id;
-                });
-      if (!swap_blocks.empty()) {
-        std::vector<int32_t> src_indices, dst_indices, cum_sum;
-        int32_t current_src = swap_blocks[0].src_block_id;
-        src_indices.reserve(swap_blocks.size());
-        dst_indices.reserve(swap_blocks.size());
-
-        src_indices.push_back(swap_blocks[0].src_block_id);
-        dst_indices.push_back(swap_blocks[0].dst_block_id);
-        for (size_t i = 1; i < swap_blocks.size(); i++) {
-          dst_indices.push_back(swap_blocks[i].dst_block_id);
-          if (swap_blocks[i].src_block_id != current_src) {
-            src_indices.push_back(swap_blocks[i].src_block_id);
-            cum_sum.push_back(i);
-            current_src = swap_blocks[i].src_block_id;
-          }
-        }
-        cum_sum.push_back(swap_blocks.size());
-
-        raw_forward_input.swap_blocks.clear();
-        raw_forward_input.src_block_indices = std::move(src_indices);
-        raw_forward_input.dst_block_indices = std::move(dst_indices);
-        raw_forward_input.cum_sum = std::move(cum_sum);
-      }
-    } else {
-      raw_forward_input.swap_blocks.insert(raw_forward_input.swap_blocks.end(),
-                                           swap_blocks.begin(),
-                                           swap_blocks.end());
-    }
-  }
-
-  // Add multi-step specific data using existing RawForwardInput fields
-  auto& multi_step_state = multi_step_state_;
-  multi_step_state.total_steps = get_pure_device_decode_rounds();
-
-  // Set step-level decode metadata for multi-step processing
-  raw_forward_input.beam_width = FLAGS_beam_width;
-  raw_forward_input.total_round = multi_step_state.total_steps;
-
-  // Set full_kv_shape if we have multi-step decode data
-  if (!multi_step_state.decode_seq_lens.empty() && !sequences_.empty()) {
-    // Set decode kv cache shape for step-level decode
-    // Format: [batch_size * beam_width, n_kv_heads, step_rounds, head_dim]
-    int64_t batch_size = static_cast<int64_t>(sequences_.size());
-    int64_t step_rounds = static_cast<int64_t>(multi_step_state.total_steps);
-
-    int64_t n_kv_heads =
-        args_ ? args_->n_kv_heads().value_or(args_->n_heads()) : 0;
-    int64_t head_dim = args_ ? args_->head_dim() : 0;
-    // LOG(INFO) << "batch_size:" << batch_size;
-    // LOG(INFO) << "FLAGS_max_token_per_req:" << FLAGS_max_token_per_req;
-    // LOG(INFO) << "FLAGS_beam_width:" << FLAGS_beam_width;
-    // LOG(INFO) << "FLAGS_max_decode_rounds:" << FLAGS_max_decode_rounds;
-    int32_t decode_rounds = get_pure_device_decode_rounds();
-    raw_forward_input.full_kv_shape = {
-        batch_size * FLAGS_max_token_per_req +
-            batch_size * FLAGS_beam_width * std::max(0, decode_rounds - 1),
-        n_kv_heads,
-        head_dim};
-  }
-
-  if (!multi_step_state.decode_seq_lens.empty()) {
-    raw_forward_input.decode_seq_lens.insert(
-        raw_forward_input.decode_seq_lens.end(),
-        multi_step_state.decode_seq_lens.begin(),
-        multi_step_state.decode_seq_lens.end());
-    raw_forward_input.decode_q_seq_lens.insert(
-        raw_forward_input.decode_q_seq_lens.end(),
-        multi_step_state.decode_q_seq_lens.begin(),
-        multi_step_state.decode_q_seq_lens.end());
-  }
-
-  if (!multi_step_state.decode_positions_vec.empty()) {
-    raw_forward_input.decode_positions_vec.insert(
-        raw_forward_input.decode_positions_vec.end(),
-        multi_step_state.decode_positions_vec.begin(),
-        multi_step_state.decode_positions_vec.end());
-  }
-
-  // append multi-step decode state into raw_forward_input
-  if (!multi_step_state.decode_selected_token_idxes.empty()) {
-    raw_forward_input.decode_selected_token_idxes.insert(
-        raw_forward_input.decode_selected_token_idxes.end(),
-        multi_step_state.decode_selected_token_idxes.begin(),
-        multi_step_state.decode_selected_token_idxes.end());
-    raw_forward_input.decode_sample_idxes.insert(
-        raw_forward_input.decode_sample_idxes.end(),
-        multi_step_state.decode_sample_idxes.begin(),
-        multi_step_state.decode_sample_idxes.end());
-    raw_forward_input.decode_unique_token_ids_vec.insert(
-        raw_forward_input.decode_unique_token_ids_vec.end(),
-        multi_step_state.decode_unique_token_ids_vec.begin(),
-        multi_step_state.decode_unique_token_ids_vec.end());
-    raw_forward_input.decode_unique_token_counts_vec.insert(
-        raw_forward_input.decode_unique_token_counts_vec.end(),
-        multi_step_state.decode_unique_token_counts_vec.begin(),
-        multi_step_state.decode_unique_token_counts_vec.end());
-    raw_forward_input.decode_unique_token_lens_vec.insert(
-        raw_forward_input.decode_unique_token_lens_vec.end(),
-        multi_step_state.decode_unique_token_lens_vec.begin(),
-        multi_step_state.decode_unique_token_lens_vec.end());
-    raw_forward_input.decode_sampling_params.insert(
-        raw_forward_input.decode_sampling_params.end(),
-        multi_step_state.decode_sampling_params.begin(),
-        multi_step_state.decode_sampling_params.end());
-  }
-  raw_forward_input.batch_id = batch_id_;
-  return raw_forward_input;
 }
 
 }  // namespace xllm

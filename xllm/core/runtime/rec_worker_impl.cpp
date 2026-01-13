@@ -604,16 +604,7 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::execute_beam_search(
     int32_t round,
     int32_t batch_size) {
 #if defined(USE_NPU)
-  xllm_ops::beam_search(beam_tensors.acc_logprob,
-                        top_tokens,
-                        top_logprobs,
-                        beam_tensors.sequence_group,
-                        round,
-                        beam_tensors.out_token_ids,
-                        beam_tensors.out_token_index,
-                        beam_tensors.out_log_probs,
-                        beam_tensors.out_beam_count_prefix_sums,
-                        beam_tensors.out_seqgroup);
+// TODO: implement beam search for NPU
 #elif defined(USE_CUDA)
   xllm::kernel::cuda::beam_search(beam_tensors.acc_logprob,
                                   beam_tensors.sequence_group,
@@ -636,14 +627,7 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::execute_cache_select(
     int32_t beam_width,
     int32_t layer_num) {
 #if defined(USE_NPU)
-  xllm_ops::cache_select(beam_tensors.out_token_index,
-                         input.input_params.unshared_k_caches,
-                         input.input_params.unshared_v_caches,
-                         input.input_params.block_tables,
-                         beam_tensors.out_beam_count_prefix_sums,
-                         round,
-                         beam_width,
-                         layer_num);
+// TODO: implement cache select for NPU
 #elif defined(USE_CUDA)
   xllm::kernel::cuda::cache_select(beam_tensors.out_token_index,
                                    input.input_params.unshared_k_caches,
