@@ -423,31 +423,19 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::prepare_work_before_execute(
 
 std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
     const ForwardInput& input) {
-  return step_multi_round(const_cast<ForwardInput&>(input));
-}
-
-std::optional<ForwardOutput>
-RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
-  auto dtype = worker_.dtype();
+  Timer timer;
   auto device = worker_.device_;
   device.set_device();
 
-  Timer timer;
+  ForwardInput& mutable_input = const_cast<ForwardInput&>(input);
 
-  int32_t total_rounds = input.total_round;
+  int32_t total_rounds = mutable_input.total_round;
   int32_t max_decode_step = total_rounds - 1;
-
-  int32_t batch_size = input.input_params.paged_kv_last_page_len.numel();
-  int32_t beam_width = input.beam_width;
-
-  auto args = worker_.context_.get_model_args();
-  int32_t layer_num = static_cast<int32_t>(args.n_layers());
-  int64_t num_qo_heads = worker_.context_.get_model_args().n_heads();
-  int64_t head_dim = worker_.context_.get_model_args().head_dim();
-
-  input.input_params.num_heads = num_qo_heads;
-  input.input_params.head_dim = head_dim;
-  input.input_params.beam_width = beam_width;
+  int32_t batch_size =
+      mutable_input.input_params.paged_kv_last_page_len.numel();
+  int32_t beam_width = mutable_input.beam_width;
+  int32_t layer_num =
+      static_cast<int32_t>(worker_.context_.get_model_args().n_layers());
 
   auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
   auto fp32_options =
@@ -455,159 +443,306 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
   auto paged_options =
       torch::TensorOptions().dtype(torch::kInt32).device(device);
 
-  torch::Tensor sequence_group =
-      torch::zeros({batch_size, beam_width, total_rounds}, int_options);
+  BeamSearchTensors beam_tensors =
+      prepare_beam_search_tensors(batch_size, beam_width, total_rounds, device);
 
-  int64_t num_seq = batch_size * beam_width;
-  torch::Tensor acc_logprob = torch::zeros({num_seq, 1}, fp32_options);
-  torch::Tensor out_log_probs = torch::zeros({num_seq, 1}, fp32_options);
-  torch::Tensor out_token_ids = torch::zeros({num_seq, 1}, int_options);
-  torch::Tensor out_token_index = torch::zeros({num_seq, 1}, int_options);
-  torch::Tensor out_beam_count_prefix_sums =
-      torch::zeros({num_seq, 1}, int_options);
-  torch::Tensor out_seqgroup = torch::zeros_like(sequence_group);
+  FixedTensors fixed_tensors = prepare_fixed_tensors(
+      batch_size, beam_width, max_decode_step, paged_options);
 
-  // Pre-create fixed tensors outside loop for reuse
-  torch::Tensor batch_ids = torch::arange(0, batch_size, paged_options)
-                                .unsqueeze(1)
-                                .unsqueeze(2)
-                                .expand({-1, beam_width, max_decode_step}) *
-                            (beam_width * max_decode_step);
-
-  torch::Tensor beams_ids = torch::arange(0, beam_width, paged_options)
-                                .unsqueeze(0)
-                                .unsqueeze(2)
-                                .expand({batch_size, -1, max_decode_step}) *
-                            max_decode_step;
-
-  torch::Tensor max_decode_step_ids =
-      torch::arange(0, max_decode_step, paged_options)
-          .unsqueeze(0)
-          .unsqueeze(1)
-          .expand({batch_size, beam_width, -1});
+  mutable_input.input_params.num_heads =
+      worker_.context_.get_model_args().n_heads();
+  mutable_input.input_params.head_dim =
+      worker_.context_.get_model_args().head_dim();
+  mutable_input.input_params.beam_width = beam_width;
 
   ForwardOutput output;
+  torch::Tensor logits;
+  SampleOutput sample_output;
+  torch::Tensor top_tokens;
 
   for (int32_t round = 0; round < total_rounds; ++round) {
-    const auto& sampling_params =
-        round > 0 ? input.decoder_sampling_params : input.sampling_params;
-    input.input_params.is_prefill = round == 0;
+    const auto& sampling_params = round > 0
+                                      ? mutable_input.decoder_sampling_params
+                                      : mutable_input.sampling_params;
+    mutable_input.input_params.is_prefill = round == 0;
 
-    if (!input.input_params.current_round_tensor_list.empty() && round >= 0 &&
-        round < static_cast<int32_t>(
-                    input.input_params.current_round_tensor_list.size())) {
-      input.input_params.current_round_tensor =
-          input.input_params.current_round_tensor_list[round];
-
-      input.input_params.current_round = round - 1;
+    if (!mutable_input.input_params.current_round_tensor_list.empty() &&
+        round >= 0 &&
+        round <
+            static_cast<int32_t>(
+                mutable_input.input_params.current_round_tensor_list.size())) {
+      mutable_input.input_params.current_round_tensor =
+          mutable_input.input_params.current_round_tensor_list[round];
+      mutable_input.input_params.current_round = round - 1;
     }
 
-    auto hidden_states = worker_.model_executor_->forward(input.token_ids,
-                                                          input.positions,
-                                                          worker_.kv_caches_,
-                                                          input.input_params);
+    auto hidden_states =
+        worker_.model_executor_->forward(mutable_input.token_ids,
+                                         mutable_input.positions,
+                                         worker_.kv_caches_,
+                                         mutable_input.input_params);
     if (!hidden_states.defined()) {
       return std::nullopt;
     }
 
-    torch::Tensor logits;
     if (sampling_params.selected_token_idxes.defined()) {
       logits = worker_.model_->logits(hidden_states,
                                       sampling_params.selected_token_idxes);
+      sample_output = worker_.sampler_->forward(logits, sampling_params);
+      top_tokens = sample_output.top_tokens.to(torch::kInt32)
+                       .reshape({-1, mutable_input.beam_width});
     }
 
-    if (sampling_params.selected_token_idxes.defined()) {
-      auto sample_output = worker_.sampler_->forward(logits, sampling_params);
-      // Convert once, reused in update_input_for_next_round
-      torch::Tensor top_tokens =
-          sample_output.top_tokens.to(torch::kInt32).reshape({-1, beam_width});
+    if (sample_output.top_tokens.defined()) {
       torch::Tensor top_logprobs =
           sample_output.top_logprobs.reshape({-1, beam_width});
+      execute_beam_search(
+          top_tokens, top_logprobs, beam_tensors, round, batch_size);
 
-#if defined(USE_NPU)
-      xllm_ops::beam_search(acc_logprob,
-                            top_tokens,
-                            top_logprobs,
-                            sequence_group,
-                            round,
-                            out_token_ids,
-                            out_token_index,
-                            out_log_probs,
-                            out_beam_count_prefix_sums,
-                            out_seqgroup);
-#elif defined(USE_CUDA)
-      xllm::kernel::cuda::beam_search(acc_logprob,
-                                      sequence_group,
-                                      top_tokens,
-                                      top_logprobs,
-                                      out_log_probs,
-                                      out_token_ids,
-                                      out_token_index,
-                                      out_beam_count_prefix_sums,
-                                      out_seqgroup,
-                                      batch_size,
-                                      round);
-
-#endif
-      sequence_group.copy_(out_seqgroup, /*non_blocking=*/false);
-      acc_logprob.copy_(out_log_probs, /*non_blocking=*/false);
+      beam_tensors.sequence_group.copy_(beam_tensors.out_seqgroup,
+                                        /*non_blocking=*/true);
+      beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
+                                     /*non_blocking=*/true);
 
       if (round < total_rounds - 1) {
-        update_input_for_next_round(input,
+        update_input_for_next_round(mutable_input,
                                     round,
                                     sample_output,
                                     top_tokens,
-                                    out_token_ids,
+                                    beam_tensors,
                                     batch_size,
                                     beam_width,
                                     max_decode_step,
                                     paged_options,
-                                    batch_ids,
-                                    beams_ids,
-                                    max_decode_step_ids);
+                                    fixed_tensors);
         if (round > 0) {
-#if defined(USE_NPU)
-          xllm_ops::cache_select(out_token_index,
-                                 input.input_params.unshared_k_caches,
-                                 input.input_params.unshared_v_caches,
-                                 input.input_params.block_tables,
-                                 out_beam_count_prefix_sums,
-                                 round,
-                                 beam_width,
-                                 layer_num);
-#elif defined(USE_CUDA)
-          xllm::kernel::cuda::cache_select(
-              out_token_index,
-              input.input_params.unshared_k_caches,
-              input.input_params.unshared_v_caches,
-              input.input_params.naive_block_table,
-              out_beam_count_prefix_sums,
-              round - 1,  // Corresponds to step 0 decode
-              beam_width,
-              layer_num);
-#endif
+          execute_cache_select(
+              beam_tensors, mutable_input, round, beam_width, layer_num);
         }
       }
 
-      // update output at the last round.
       if (round == total_rounds - 1) {
-        output.logits = logits;
-        output.sample_output = sample_output;
-        output.do_sample = sampling_params.do_sample;
-        output.logprobs = sampling_params.logprobs;
-        output.max_top_logprobs = sampling_params.max_top_logprobs;
-        output.beam_search_output.src_seq_idxes = out_token_index.reshape({-1});
-        output.beam_search_output.out_tokens = out_token_ids.reshape({-1});
-        output.beam_search_output.out_logprobs = out_log_probs.reshape({-1});
-        output.beam_sequence_group = sequence_group;
+        build_final_output(
+            logits, sample_output, sampling_params, beam_tensors, output);
       }
     }
   }
 
-  auto ret = device.synchronize_default_stream();
+  device.synchronize_default_stream();
+
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(device.index());
   return output;
+}
+
+RecWorkerImpl::LlmRecPureDevicePipeline::BeamSearchTensors
+RecWorkerImpl::LlmRecPureDevicePipeline::prepare_beam_search_tensors(
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t total_rounds,
+    const torch::Device& device) {
+  auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto fp32_options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+
+  BeamSearchTensors tensors;
+  tensors.sequence_group =
+      torch::zeros({batch_size, beam_width, total_rounds}, int_options);
+  int64_t num_seq = batch_size * beam_width;
+  tensors.acc_logprob = torch::zeros({num_seq, 1}, fp32_options);
+  tensors.out_log_probs = torch::zeros({num_seq, 1}, fp32_options);
+  tensors.out_token_ids = torch::zeros({num_seq, 1}, int_options);
+  tensors.out_token_index = torch::zeros({num_seq, 1}, int_options);
+  tensors.out_beam_count_prefix_sums = torch::zeros({num_seq, 1}, int_options);
+  tensors.out_seqgroup = torch::zeros_like(tensors.sequence_group);
+  return tensors;
+}
+
+RecWorkerImpl::LlmRecPureDevicePipeline::FixedTensors
+RecWorkerImpl::LlmRecPureDevicePipeline::prepare_fixed_tensors(
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t max_decode_step,
+    const torch::TensorOptions& paged_options) {
+  FixedTensors tensors;
+  tensors.batch_ids = torch::arange(0, batch_size, paged_options)
+                          .unsqueeze(1)
+                          .unsqueeze(2)
+                          .expand({-1, beam_width, max_decode_step}) *
+                      (beam_width * max_decode_step);
+
+  tensors.beams_ids = torch::arange(0, beam_width, paged_options)
+                          .unsqueeze(0)
+                          .unsqueeze(2)
+                          .expand({batch_size, -1, max_decode_step}) *
+                      max_decode_step;
+
+  tensors.max_decode_step_ids = torch::arange(0, max_decode_step, paged_options)
+                                    .unsqueeze(0)
+                                    .unsqueeze(1)
+                                    .expand({batch_size, beam_width, -1});
+  return tensors;
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::execute_beam_search(
+    const torch::Tensor& top_tokens,
+    const torch::Tensor& top_logprobs,
+    BeamSearchTensors& beam_tensors,
+    int32_t round,
+    int32_t batch_size) {
+#if defined(USE_NPU)
+  xllm_ops::beam_search(beam_tensors.acc_logprob,
+                        top_tokens,
+                        top_logprobs,
+                        beam_tensors.sequence_group,
+                        round,
+                        beam_tensors.out_token_ids,
+                        beam_tensors.out_token_index,
+                        beam_tensors.out_log_probs,
+                        beam_tensors.out_beam_count_prefix_sums,
+                        beam_tensors.out_seqgroup);
+#elif defined(USE_CUDA)
+  xllm::kernel::cuda::beam_search(beam_tensors.acc_logprob,
+                                  beam_tensors.sequence_group,
+                                  top_tokens,
+                                  top_logprobs,
+                                  beam_tensors.out_log_probs,
+                                  beam_tensors.out_token_ids,
+                                  beam_tensors.out_token_index,
+                                  beam_tensors.out_beam_count_prefix_sums,
+                                  beam_tensors.out_seqgroup,
+                                  batch_size,
+                                  round);
+#endif
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::execute_cache_select(
+    const BeamSearchTensors& beam_tensors,
+    ForwardInput& input,
+    int32_t round,
+    int32_t beam_width,
+    int32_t layer_num) {
+#if defined(USE_NPU)
+  xllm_ops::cache_select(beam_tensors.out_token_index,
+                         input.input_params.unshared_k_caches,
+                         input.input_params.unshared_v_caches,
+                         input.input_params.block_tables,
+                         beam_tensors.out_beam_count_prefix_sums,
+                         round,
+                         beam_width,
+                         layer_num);
+#elif defined(USE_CUDA)
+  xllm::kernel::cuda::cache_select(beam_tensors.out_token_index,
+                                   input.input_params.unshared_k_caches,
+                                   input.input_params.unshared_v_caches,
+                                   input.input_params.naive_block_table,
+                                   beam_tensors.out_beam_count_prefix_sums,
+                                   round - 1,
+                                   beam_width,
+                                   layer_num);
+#endif
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::build_final_output(
+    const torch::Tensor& logits,
+    const SampleOutput& sample_output,
+    const SamplingParameters& sampling_params,
+    const BeamSearchTensors& beam_tensors,
+    ForwardOutput& output) {
+  output.logits = logits;
+  output.sample_output = sample_output;
+  output.do_sample = sampling_params.do_sample;
+  output.logprobs = sampling_params.logprobs;
+  output.max_top_logprobs = sampling_params.max_top_logprobs;
+  output.beam_search_output.src_seq_idxes =
+      beam_tensors.out_token_index.reshape({-1});
+  output.beam_search_output.out_tokens =
+      beam_tensors.out_token_ids.reshape({-1});
+  output.beam_search_output.out_logprobs =
+      beam_tensors.out_log_probs.reshape({-1});
+  output.beam_sequence_group = beam_tensors.sequence_group;
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::compute_shared_kv_tensors(
+    const ModelInputParams& input_params,
+    int32_t batch_size,
+    int32_t beam_size,
+    const torch::TensorOptions& paged_options,
+    torch::Tensor& shared_kv_len_offsets,
+    torch::Tensor& shared_mask,
+    torch::Tensor& shared_kv_indices,
+    int32_t& shared_kv_len) {
+  auto kv_cu_seq_lens = input_params.kv_seq_lens;
+  auto max_val = kv_cu_seq_lens.max();
+  shared_kv_len = max_val.item().toInt();
+  auto batch_shared_kv_lens = torch::diff(kv_cu_seq_lens);
+
+  shared_kv_len_offsets = torch::arange(0, shared_kv_len, paged_options)
+                              .unsqueeze(0)
+                              .expand({batch_size, shared_kv_len});
+
+  auto beam_shared_kv_expanded =
+      batch_shared_kv_lens.unsqueeze(1).expand({-1, shared_kv_len});
+
+  shared_mask = (shared_kv_len_offsets < beam_shared_kv_expanded)
+                    .unsqueeze(1)
+                    .expand({-1, beam_size, -1});
+
+  auto kv_cu_seq_lens_prefix = kv_cu_seq_lens.slice(0, 0, -1);
+  auto shared_batch_offsets =
+      kv_cu_seq_lens_prefix.unsqueeze(1).expand({-1, shared_kv_len});
+
+  shared_kv_indices = (shared_batch_offsets + shared_kv_len_offsets)
+                          .unsqueeze(1)
+                          .expand({-1, beam_size, -1});
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::compute_unshared_kv_tensors(
+    int32_t current_step,
+    int32_t batch_size,
+    int32_t shared_kv_len,
+    const FixedTensors& fixed_tensors,
+    torch::Tensor& unshared_kv_indices,
+    torch::Tensor& unshared_mask) {
+  uint32_t unshared_begin_index = shared_kv_len * batch_size;
+  auto unshared_kv_offsets = fixed_tensors.batch_ids + fixed_tensors.beams_ids +
+                             fixed_tensors.max_decode_step_ids;
+  unshared_kv_indices = unshared_kv_offsets + unshared_begin_index;
+  unshared_mask = fixed_tensors.max_decode_step_ids <= current_step;
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::build_paged_kv_indices(
+    const torch::Tensor& shared_kv_indices,
+    const torch::Tensor& unshared_kv_indices,
+    const torch::Tensor& shared_mask,
+    const torch::Tensor& unshared_mask,
+    int32_t batch_size,
+    int32_t beam_size,
+    int32_t current_step,
+    int32_t shared_kv_len,
+    const torch::TensorOptions& paged_options,
+    const ModelInputParams& input_params,
+    torch::Tensor& paged_kv_indices,
+    torch::Tensor& paged_kv_indptr,
+    torch::Tensor& paged_kv_last_page_len) {
+  auto full_mask = torch::cat({shared_mask, unshared_mask}, 2);
+  auto full_kv_indices =
+      torch::cat({shared_kv_indices, unshared_kv_indices}, 2);
+
+  auto kv_cu_seq_lens = input_params.kv_seq_lens;
+  auto batch_shared_kv_lens = torch::diff(kv_cu_seq_lens);
+  uint32_t unshared_kv_len = current_step + 1;
+  auto batch_beam_shared_kv_lens =
+      (batch_shared_kv_lens.unsqueeze(1).expand({-1, beam_size}) +
+       unshared_kv_len)
+          .flatten();
+
+  auto cumsum_result = torch::cumsum(batch_beam_shared_kv_lens, 0);
+  paged_kv_indptr = torch::cat(
+      {torch::zeros({1}, paged_options), cumsum_result.to(paged_options)}, 0);
+
+  paged_kv_indices = full_kv_indices.masked_select(full_mask);
+  paged_kv_last_page_len = torch::ones({batch_size * beam_size}, paged_options);
 }
 
 void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
@@ -615,21 +750,18 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
     int32_t current_step,
     const SampleOutput& sample_output,
     const torch::Tensor& top_tokens,
-    const torch::Tensor& out_token_ids,
+    const BeamSearchTensors& beam_tensors,
     int32_t batch_size,
     int32_t beam_size,
     int32_t max_decode_step,
     const torch::TensorOptions& paged_options,
-    const torch::Tensor& batch_ids,
-    const torch::Tensor& beams_ids,
-    const torch::Tensor& max_decode_step_ids) {
+    const FixedTensors& fixed_tensors) {
   if (current_step == 0) {
     input.token_ids = top_tokens.reshape({-1});
   } else {
-    input.token_ids = out_token_ids.reshape({-1});
+    input.token_ids = beam_tensors.out_token_ids.reshape({-1});
   }
 
-  // update next current_step positions.
   if (!input.input_params.decode_positions_tensor_list.empty() &&
       current_step >= 0 &&
       current_step <
@@ -641,54 +773,43 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
 
   input.input_params.batch_forward_type = BatchForwardType(2);
 
-  auto kv_cu_seq_lens = input.input_params.kv_seq_lens;
-  auto max_val = kv_cu_seq_lens.max();
-  int32_t shared_kv_len = max_val.item().toInt();
-  auto batch_shared_kv_lens = torch::diff(kv_cu_seq_lens);
+  torch::Tensor shared_kv_len_offsets, shared_mask, shared_kv_indices;
+  int32_t shared_kv_len;
+  compute_shared_kv_tensors(input.input_params,
+                            batch_size,
+                            beam_size,
+                            paged_options,
+                            shared_kv_len_offsets,
+                            shared_mask,
+                            shared_kv_indices,
+                            shared_kv_len);
 
-  auto shared_kv_len_offsets = torch::arange(0, shared_kv_len, paged_options)
-                                   .unsqueeze(0)
-                                   .expand({batch_size, shared_kv_len});
+  torch::Tensor unshared_kv_indices, unshared_mask;
+  compute_unshared_kv_tensors(current_step,
+                              batch_size,
+                              shared_kv_len,
+                              fixed_tensors,
+                              unshared_kv_indices,
+                              unshared_mask);
 
-  auto beam_shared_kv_expanded =
-      batch_shared_kv_lens.unsqueeze(1).expand({-1, shared_kv_len});
+  torch::Tensor paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len;
+  build_paged_kv_indices(shared_kv_indices,
+                         unshared_kv_indices,
+                         shared_mask,
+                         unshared_mask,
+                         batch_size,
+                         beam_size,
+                         current_step,
+                         shared_kv_len,
+                         paged_options,
+                         input.input_params,
+                         paged_kv_indices,
+                         paged_kv_indptr,
+                         paged_kv_last_page_len);
 
-  auto shared_mask = (shared_kv_len_offsets < beam_shared_kv_expanded)
-                         .unsqueeze(1)
-                         .expand({-1, beam_size, -1});
-
-  auto kv_cu_seq_lens_prefix = kv_cu_seq_lens.slice(0, 0, -1);
-  auto shared_batch_offsets =
-      kv_cu_seq_lens_prefix.unsqueeze(1).expand({-1, shared_kv_len});
-
-  auto shared_kv_indices = (shared_batch_offsets + shared_kv_len_offsets)
-                               .unsqueeze(1)
-                               .expand({-1, beam_size, -1});
-
-  uint32_t unshared_begin_index = shared_kv_len * batch_size;
-  auto unshared_kv_offsets = batch_ids + beams_ids + max_decode_step_ids;
-  auto unshared_kv_indices = unshared_kv_offsets + unshared_begin_index;
-  auto unshared_mask = max_decode_step_ids <= current_step;
-
-  auto full_mask = torch::cat({shared_mask, unshared_mask}, 2);
-  auto full_kv_indices =
-      torch::cat({shared_kv_indices, unshared_kv_indices}, 2);
-
-  uint32_t unshared_kv_len = current_step + 1;
-  auto batch_beam_shared_kv_lens =
-      (batch_shared_kv_lens.unsqueeze(1).expand({-1, beam_size}) +
-       unshared_kv_len)
-          .flatten();
-
-  auto cumsum_result = torch::cumsum(batch_beam_shared_kv_lens, 0);
-  auto paged_kv_indptr = torch::cat(
-      {torch::zeros({1}, paged_options), cumsum_result.to(paged_options)}, 0);
-
-  input.input_params.paged_kv_indices =
-      full_kv_indices.masked_select(full_mask);
+  input.input_params.paged_kv_indices = paged_kv_indices;
   input.input_params.paged_kv_indptr = paged_kv_indptr;
-  input.input_params.paged_kv_last_page_len =
-      torch::ones({batch_size * beam_size}, paged_options);
+  input.input_params.paged_kv_last_page_len = paged_kv_last_page_len;
 }
 
 RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
