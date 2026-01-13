@@ -28,39 +28,30 @@ void beam_search(torch::Tensor acc_logprob,
   CHECK_EQ(beam_size, top_k) << "beam_size must be equal with top_k.";
 
   if (current_step == 0) {
-    // [batch_size, beam_size]
-    auto tokens =
-        top_tokens.view({batch_size * 1, top_k}).slice(1, 0, beam_size);
-    // [batch_size * beam_size]
+    auto tokens_view =
+        top_tokens.view({batch_size, top_k}).slice(1, 0, beam_size);
+    auto init_probs_view =
+        top_logprobs.view({batch_size, top_k}).slice(1, 0, beam_size);
 
-    tokens = tokens.reshape({batch_size * beam_size, 1});
-    // [batch_size, beam_size]
-
-    auto init_probs =
-        top_logprobs.view({batch_size * 1, top_k}).slice(1, 0, beam_size);
-    // [batch_size * beam_size]
-
-    init_probs = init_probs.reshape({batch_size * beam_size, 1});
-
-    out_acc_logprob.copy_(init_probs);
-    out_token_ids.copy_(tokens);
+    out_token_ids.view({batch_size, beam_size}).copy_(tokens_view);
+    out_acc_logprob.view({batch_size, beam_size}).copy_(init_probs_view);
 
     auto indices =
-        torch::arange(beam_size, torch::kInt32).to(device);  // [beam_size]
-    indices = indices.unsqueeze(0)
-                  .expand({batch_size, -1})
-                  .reshape({-1, 1});  // [batch * beam, 1]
+        torch::arange(
+            beam_size,
+            torch::TensorOptions().dtype(torch::kInt32).device(device))
+            .unsqueeze(0)
+            .expand({batch_size, -1})
+            .reshape({-1, 1});
     out_token_index.copy_(indices);
 
     auto sequence_view =
-        out_sequence_group.view({batch_size * beam_size, total_rounds});
-
-    sequence_view.select(1, 0).copy_(tokens.squeeze(1));
+        out_sequence_group.view({batch_size, beam_size, total_rounds});
+    sequence_view.slice(2, 0, 1).squeeze(2).copy_(tokens_view);
 
   } else {
-    auto combined_probs = acc_logprob + top_logprobs;
-
-    combined_probs = combined_probs.view({batch_size, beam_size * top_k});
+    auto combined_probs =
+        (acc_logprob + top_logprobs).view({batch_size, beam_size * top_k});
 
     auto topk_result = torch::topk(combined_probs, beam_size, -1);
     auto new_probs = std::get<0>(topk_result);    // [batch_size, beam_size]
@@ -73,35 +64,47 @@ void beam_search(torch::Tensor acc_logprob,
       new_probs = new_probs.gather(1, ordered_indices);
       new_indices = new_indices.gather(1, ordered_indices);
     }
-    auto parent_beam =
-        (new_indices / top_k).to(torch::kLong);  // [batch_size, beam_size]
-    auto token_in_beam =
-        (new_indices % top_k).to(torch::kLong);  // [batch_size, beam_size]
 
-    // [batch_size, 1]
-    auto batch_idx =
-        torch::arange(batch_size, torch::kLong).to(device).unsqueeze(1);
-    // [batch_size, beam_size, top_k]
+    auto parent_beam = (new_indices / top_k).to(torch::kLong);
+    auto token_in_beam = (new_indices % top_k).to(torch::kLong);
+
     auto top_tokens_reshaped = top_tokens.view({batch_size, beam_size, top_k});
 
-    auto new_tokens =
-        top_tokens_reshaped.index({batch_idx, parent_beam, token_in_beam});
+    auto batch_idx =
+        torch::arange(batch_size,
+                      torch::TensorOptions().dtype(torch::kLong).device(device))
+            .unsqueeze(1)
+            .expand_as(parent_beam);
 
-    out_acc_logprob.copy_(new_probs.reshape({-1, 1}));
-    out_token_index.copy_(new_indices.reshape({-1, 1}));
-    out_token_ids.copy_(new_tokens.reshape({-1, 1}));
+    using torch::indexing::TensorIndex;
+    auto new_tokens = top_tokens_reshaped.index({TensorIndex(batch_idx),
+                                                 TensorIndex(parent_beam),
+                                                 TensorIndex(token_in_beam)});
 
-    auto batch_range = torch::arange(batch_size, torch::kInt32)
-                           .to(device)
-                           .unsqueeze(1)
-                           .expand({-1, beam_size});
-    auto beam_range = torch::arange(beam_size, torch::kInt32)
-                          .to(device)
-                          .unsqueeze(0)
-                          .expand({batch_size, -1});
+    out_acc_logprob.view({batch_size, beam_size}).copy_(new_probs);
+    out_token_index.view({batch_size, beam_size})
+        .copy_(new_indices.to(torch::kInt32));
+    out_token_ids.view({batch_size, beam_size}).copy_(new_tokens);
 
-    out_sequence_group.slice(2, 0, current_step) = in_sequence_group.index(
-        {batch_range, parent_beam, torch::indexing::Slice(0, current_step)});
+    auto batch_range =
+        torch::arange(
+            batch_size,
+            torch::TensorOptions().dtype(torch::kInt32).device(device))
+            .unsqueeze(1)
+            .expand({-1, beam_size});
+    auto beam_range =
+        torch::arange(
+            beam_size,
+            torch::TensorOptions().dtype(torch::kInt32).device(device))
+            .unsqueeze(0)
+            .expand({batch_size, -1});
+
+    using torch::indexing::Slice;
+    using torch::indexing::TensorIndex;
+    out_sequence_group.slice(2, 0, current_step) =
+        in_sequence_group.index({TensorIndex(batch_range),
+                                 TensorIndex(parent_beam.to(torch::kInt32)),
+                                 Slice(0, current_step)});
 
     out_sequence_group.slice(2, current_step, current_step + 1) =
         new_tokens.unsqueeze(2);
