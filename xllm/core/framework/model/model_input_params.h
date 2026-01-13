@@ -235,11 +235,6 @@ struct ModelInputParams {
     params.kv_seq_lens_vec = kv_seq_lens_vec;
     params.q_seq_lens_vec = q_seq_lens_vec;
 
-    params.decode_kv_seq_lens = safe_to(decode_kv_seq_lens, device, true);
-    params.decode_q_seq_lens = safe_to(decode_q_seq_lens, device, true);
-    params.decode_kv_seq_lens_vec = decode_kv_seq_lens_vec;
-    params.decode_q_seq_lens_vec = decode_q_seq_lens_vec;
-
     params.input_embedding = safe_to(input_embedding, device);
 
     params.deep_stacks = deep_stacks;
@@ -336,8 +331,6 @@ struct ModelInputParams {
     print_tensor(q_cu_seq_lens, "ModelInputParams: q_cu_seq_lens", 4);
     print_tensor(new_cache_slots, "ModelInputParams: new_cache_slots", 4);
     print_tensor(block_tables, "ModelInputParams: block_tables", 4);
-    print_tensor(decode_kv_seq_lens, "ModelInputParams: decode_kv_seq_lens", 4);
-    print_tensor(decode_q_seq_lens, "ModelInputParams: decode_q_seq_lens", 4);
     LOG(INFO) << "ModelInputParams: dp_global_token_nums is "
               << dp_global_token_nums << ", dp_is_decode: " << dp_is_decode;
 
@@ -394,11 +387,6 @@ struct ModelInputParams {
   torch::Tensor q_cu_seq_lens;
   std::vector<int> kv_seq_lens_vec;
   std::vector<int> q_seq_lens_vec;
-
-  torch::Tensor decode_q_seq_lens;
-  torch::Tensor decode_kv_seq_lens;
-  std::vector<int> decode_kv_seq_lens_vec;
-  std::vector<int> decode_q_seq_lens_vec;
 
   // IntTensor: [n_tokens]
   torch::Tensor new_cache_slots;

@@ -72,13 +72,6 @@ void torch_reference(
   int64_t head_dim = proj_k.size(3);
   int64_t max_num_request = unshared_k_cache.size(0);
   int64_t max_decode_step = unshared_k_cache.size(2);
-  LOG(INFO) << "proj_k.shape: " << proj_k.sizes();
-  LOG(INFO) << "proj_v.shape: " << proj_v.sizes();
-  LOG(INFO) << "unshared_k_cache.shape: " << unshared_k_cache.sizes();
-  LOG(INFO) << "unshared_v_cache.shape: " << unshared_v_cache.sizes();
-  LOG(INFO) << "block_table.shape: " << block_table.sizes();
-  LOG(INFO) << "step: " << step;
-
   // Basic shape checks.
   CHECK_EQ(proj_v.sizes(), proj_k.sizes())
       << "proj_v and proj_k must have same shape";
