@@ -528,11 +528,36 @@ void RecMaster::handle_request(std::vector<Message> messages,
   }
 
   Timer timer;
+
+  // Debug: print messages content
+  LOG(INFO) << "[DEBUG] handle_request messages count: " << messages.size();
+  for (size_t i = 0; i < messages.size(); ++i) {
+    const auto& msg = messages[i];
+    std::string content_str;
+    if (std::holds_alternative<std::string>(msg.content)) {
+      content_str = std::get<std::string>(msg.content);
+    } else {
+      content_str = "[MMContentVec with " +
+                    std::to_string(std::get<MMContentVec>(msg.content).size()) +
+                    " items]";
+    }
+    LOG(INFO) << "[DEBUG] messages[" << i << "] role=" << msg.role
+              << ", content=" << content_str;
+  }
+
   std::optional<std::string> prompt;
   if (sp.has_tools()) {
     prompt = chat_template_->apply(messages, sp.tools, sp.chat_template_kwargs);
   } else {
     prompt = chat_template_->apply(messages, sp.chat_template_kwargs);
+  }
+
+  // Debug: print prompt result
+  if (prompt.has_value()) {
+    LOG(INFO) << "[DEBUG] prompt after chat_template_->apply: "
+              << prompt.value();
+  } else {
+    LOG(INFO) << "[DEBUG] prompt is empty after chat_template_->apply";
   }
 
   if (!prompt.has_value()) {
