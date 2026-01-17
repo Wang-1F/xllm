@@ -104,7 +104,6 @@ const XLLM_InitOptions XLLM_INIT_REC_OPTIONS_DEFAULT = {
     .server_idx = 0,
     .beam_width = 128,
     .max_decode_rounds = 3,
-    .max_token_per_req = 1024,
     .max_memory_utilization = 0.9,
 
     .task = "generate",

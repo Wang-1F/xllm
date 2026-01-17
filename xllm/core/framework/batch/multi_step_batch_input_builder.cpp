@@ -492,7 +492,7 @@ ForwardInput MultiStepBatchInputBuilder::state_to_forward_input() {
 
     int32_t decode_rounds = get_pure_device_decode_rounds();
     forward_input.full_kv_shape = {
-        FLAGS_max_seqs_per_batch * FLAGS_max_token_per_req +
+        FLAGS_max_seqs_per_batch * FLAGS_max_tokens_per_batch +
             FLAGS_max_seqs_per_batch * FLAGS_beam_width *
                 std::max(0, decode_rounds - 1),
         n_kv_heads,

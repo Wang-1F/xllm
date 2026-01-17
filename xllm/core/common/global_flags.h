@@ -247,8 +247,6 @@ DECLARE_int32(max_decode_rounds);
 
 DECLARE_int32(beam_width);
 
-DECLARE_int64(max_token_per_req);
-
 #if defined(USE_NPU)
 DECLARE_string(npu_kernel_backend);
 #endif

@@ -117,7 +117,6 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
 
     FLAGS_beam_width = xllm_init_options.beam_width;
     FLAGS_max_decode_rounds = xllm_init_options.max_decode_rounds;
-    FLAGS_max_token_per_req = xllm_init_options.max_token_per_req;
 
     handler->master = std::make_unique<xllm::RecMaster>(options);
     handler->master->run();

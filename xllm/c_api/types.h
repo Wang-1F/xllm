@@ -109,9 +109,6 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
   /** Maximum number of decode rounds for each inference request */
   uint32_t max_decode_rounds;
 
-  /** Maximum number of tokens allowed per inference request */
-  uint32_t max_token_per_req;
-
   /** Maximum GPU memory utilization ratio for model inference */
   float max_memory_utilization;
 
