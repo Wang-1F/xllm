@@ -134,13 +134,6 @@ class RecWorkerImpl : public LLMWorkerImpl {
                                                   int32_t total_rounds,
                                                   const torch::Device& device);
 
-    // Prepare fixed tensors for multi-round decoding
-    FixedTensors prepare_fixed_tensors(
-        int32_t batch_size,
-        int32_t beam_width,
-        int32_t max_decode_step,
-        const torch::TensorOptions& paged_options);
-
     // Execute beam search kernel
     void execute_beam_search(const torch::Tensor& top_tokens,
                              const torch::Tensor& top_logprobs,
@@ -221,10 +214,7 @@ class RecWorkerImpl : public LLMWorkerImpl {
       explicit FullKvCacheOffsets(
           LlmRecPureDevicePipeline* pure_device_pipeline);
       torch::Tensor full_kv_offsets;
-      torch::Tensor full_kv_mask;
-      torch::Tensor full_kv_indices;
-      torch::Tensor unshared_offsets;
-      torch::Tensor max_decode_step_ids;
+      torch::Tensor unshared_indices;
     };
     std::unique_ptr<FullKvCacheOffsets> full_kv_cache_offsets_;
 
