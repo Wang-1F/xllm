@@ -393,18 +393,19 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
     mutable_input.input_params.attn_metadata = nullptr;
     // Update current_round_ tensor value
     current_round_.fill_(round - 1);
-
-    // Start async computation for next round input (overlap with GPU
-    // logits/sampling)
-    if (round < total_rounds - 1) {
-      next_round_async_result =
-          compute_next_round_input_async(mutable_input.input_params.kv_seq_lens,
-                                         round,
-                                         batch_size,
-                                         beam_width,
-                                         max_decode_step,
-                                         paged_options);
-    }
+    // Consume previous async result for this round (if any) and schedule
+    // async work for the next round. This keeps the blocking future.get()
+    // right before forward and maximizes overlap with GPU execution.
+    prepare_round_input_and_schedule_next(mutable_input,
+                                          round,
+                                          total_rounds,
+                                          batch_size,
+                                          beam_width,
+                                          max_decode_step,
+                                          paged_options,
+                                          top_tokens,
+                                          beam_tensors,
+                                          next_round_async_result);
 
     torch::Tensor hidden_states;
 
@@ -437,20 +438,9 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
       beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
                                      /*non_blocking=*/true);
 
-      if (round < total_rounds - 1) {
-        // Use async results if available, otherwise fallback to sync
-        // computation
-        update_input_for_next_round(mutable_input,
-                                    round,
-                                    sample_output,
-                                    top_tokens,
-                                    beam_tensors,
-                                    next_round_async_result.value());
-
-        if (round > 0) {
-          execute_cache_select(
-              beam_tensors, mutable_input, round, beam_width, layer_num);
-        }
+      if (round > 0 && round < total_rounds - 1) {
+        execute_cache_select(
+            beam_tensors, mutable_input, round, beam_width, layer_num);
       }
 
       if (round == total_rounds - 1) {
@@ -583,6 +573,69 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::build_final_output(
   output.beam_sequence_group = beam_tensors.sequence_group;
 }
 
+void RecWorkerImpl::LlmRecPureDevicePipeline::
+    prepare_round_input_and_schedule_next(
+        ForwardInput& input,
+        int32_t round,
+        int32_t total_rounds,
+        int32_t batch_size,
+        int32_t beam_width,
+        int32_t max_decode_step,
+        const torch::TensorOptions& paged_options,
+        const torch::Tensor& top_tokens,
+        const BeamSearchTensors& beam_tensors,
+        std::optional<folly::SemiFuture<NextRoundInputResults>>&
+            next_round_async_result) {
+  // Phase A: consume async result for the current round (prepared in last
+  // round).
+
+  if (next_round_async_result.has_value()) {
+    LOG(INFO) << "need data.";
+    // Block only here to wait for CPU-side paged KV computation.
+    auto results = std::move(next_round_async_result.value()).get();
+
+    input.input_params.paged_kv_indices = results.paged_kv_indices;
+    input.input_params.paged_kv_indptr = results.paged_kv_indptr;
+    input.input_params.paged_kv_last_page_len = results.paged_kv_last_page_len;
+
+    // previous_step corresponds to the decode step that produced tokens for
+    // this round.
+    const int32_t previous_step = round - 1;
+    if (previous_step == 0) {
+      // First decode step uses top_tokens from prefill.
+      if (top_tokens.defined()) {
+        input.token_ids = top_tokens.reshape({-1});
+      }
+    } else if (previous_step > 0) {
+      // Later steps use beam search output tokens.
+      input.token_ids = beam_tensors.out_token_ids.reshape({-1});
+    }
+
+    if (!input.input_params.decode_positions_tensor_list.empty() &&
+        previous_step >= 0 &&
+        previous_step <
+            static_cast<int32_t>(
+                input.input_params.decode_positions_tensor_list.size())) {
+      input.positions =
+          input.input_params.decode_positions_tensor_list[previous_step];
+    }
+
+    // Mark as decode batch and clear explicit input embedding (reuse
+    // token_ids).
+    input.input_params.batch_forward_type = BatchForwardType(2);
+    input.input_params.input_embedding = torch::Tensor();
+
+    // Ensure this future is not consumed twice.
+    next_round_async_result.reset();
+  }
+
+  // Phase B: schedule async computation for the next round, if any.
+  if (round < total_rounds - 1) {
+    next_round_async_result = compute_next_round_input_async(
+        input, round, batch_size, beam_width, max_decode_step, paged_options);
+  }
+}
+
 folly::SemiFuture<
     RecWorkerImpl::LlmRecPureDevicePipeline::NextRoundInputResults>
 RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
@@ -669,42 +722,42 @@ RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
   return future;
 }
 
-void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
-    ForwardInput& input,
-    int32_t current_step,
-    const SampleOutput& sample_output,
-    const torch::Tensor& top_tokens,
-    const BeamSearchTensors& beam_tensors,
-    folly::SemiFuture<NextRoundInputResults>& async_results) {
-  // Wait for async computation to complete
-  LOG(INFO) << "before get async results";
-  auto results = std::move(async_results).get();
+// void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
+//     ForwardInput& input,
+//     int32_t current_step,
+//     const SampleOutput& sample_output,
+//     const torch::Tensor& top_tokens,
+//     const BeamSearchTensors& beam_tensors,
+//     folly::SemiFuture<NextRoundInputResults>& async_results) {
+//   // Wait for async computation to complete
+//   LOG(INFO) << "before get async results";
+//   auto results = std::move(async_results).get();
 
-  // Apply results to input (only these lines need to wait)
-  input.input_params.paged_kv_indices = results.paged_kv_indices;
-  input.input_params.paged_kv_indptr = results.paged_kv_indptr;
-  input.input_params.paged_kv_last_page_len = results.paged_kv_last_page_len;
+//   // Apply results to input (only these lines need to wait)
+//   input.input_params.paged_kv_indices = results.paged_kv_indices;
+//   input.input_params.paged_kv_indptr = results.paged_kv_indptr;
+//   input.input_params.paged_kv_last_page_len = results.paged_kv_last_page_len;
 
-  if (current_step == 0) {
-    input.token_ids = top_tokens.reshape({-1});
-  } else {
-    input.token_ids = beam_tensors.out_token_ids.reshape({-1});
-  }
+//   if (current_step == 0) {
+//     input.token_ids = top_tokens.reshape({-1});
+//   } else {
+//     input.token_ids = beam_tensors.out_token_ids.reshape({-1});
+//   }
 
-  if (!input.input_params.decode_positions_tensor_list.empty() &&
-      current_step >= 0 &&
-      current_step <
-          static_cast<int32_t>(
-              input.input_params.decode_positions_tensor_list.size())) {
-    input.positions =
-        input.input_params.decode_positions_tensor_list[current_step];
-  }
+//   if (!input.input_params.decode_positions_tensor_list.empty() &&
+//       current_step >= 0 &&
+//       current_step <
+//           static_cast<int32_t>(
+//               input.input_params.decode_positions_tensor_list.size())) {
+//     input.positions =
+//         input.input_params.decode_positions_tensor_list[current_step];
+//   }
 
-  input.input_params.batch_forward_type = BatchForwardType(2);
+//   input.input_params.batch_forward_type = BatchForwardType(2);
 
-  torch::Tensor input_imbedding;
-  input.input_params.input_embedding = input_imbedding;
-}
+//   torch::Tensor input_imbedding;
+//   input.input_params.input_embedding = input_imbedding;
+// }
 
 // void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
 //     ForwardInput& input,

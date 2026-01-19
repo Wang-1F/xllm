@@ -354,15 +354,19 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
     // Start async computation for next round input (overlap with GPU
     // logits/sampling)
     // TODO: support async computation for next round input
-    if (round < total_rounds - 1 && !FLAGS_enable_graph) {
-      next_round_async_result =
-          compute_next_round_input_async(mutable_input.input_params.kv_seq_lens,
-                                         round,
-                                         batch_size,
-                                         beam_width,
-                                         max_decode_step,
-                                         paged_options);
-    }
+    // Consume previous async result for this round (if any) and schedule
+    // async work for the next round. This keeps the blocking future.get()
+    // right before forward and maximizes overlap with GPU execution.
+    prepare_round_input_and_schedule_next(mutable_input,
+                                          round,
+                                          total_rounds,
+                                          batch_size,
+                                          beam_width,
+                                          max_decode_step,
+                                          paged_options,
+                                          top_tokens,
+                                          beam_tensors,
+                                          next_round_async_result);
 
     torch::Tensor hidden_states;
 
@@ -395,38 +399,31 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
       beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
                                      /*non_blocking=*/true);
 
-      if (round < total_rounds - 1) {
-        // Use async results if available, otherwise fallback to sync
-        // computation
-        if (next_round_async_result.has_value()) {
-          update_input_for_next_round(mutable_input,
-                                      round,
-                                      sample_output,
-                                      top_tokens,
-                                      beam_tensors,
-                                      next_round_async_result.value());
-        } else {
-          // Fallback to synchronous computation
-          // update_input_for_next_round(mutable_input,
-          //                             round,
-          //                             sample_output,
-          //                             top_tokens,
-          //                             beam_tensors,
-          //                             batch_size,
-          //                             beam_width,
-          //                             max_decode_step,
-          //                             paged_options);
-        }
-
-        if (round > 0) {
-          execute_cache_select(
-              beam_tensors, mutable_input, round, beam_width, layer_num);
-        }
+      if (round > 0 && round < total_rounds - 1) {
+        execute_cache_select(
+            beam_tensors, mutable_input, round, beam_width, layer_num);
       }
 
       if (round == total_rounds - 1) {
         build_final_output(
             logits, sample_output, sampling_params, beam_tensors, output);
+        // auto tmp_acc_logprob =
+        //     beam_tensors.acc_logprob.view({batch_size, beam_width});
+        // for (int i = 0; i < batch_size; i++) {
+        //   for (int j = 0; j < beam_width; j++) {
+        //     std::string str{};
+        //     for (int k = 0; k < beam_tensors.sequence_group.size(2); k++) {
+        //       if (k > 0) {
+        //         str += ", ";
+        //       }
+        //       str += std::to_string(
+        //           beam_tensors.sequence_group[i][j][k].item<int32_t>());
+        //     }
+        //     // str += ": ";
+        //     // str += std::to_string(tmp_acc_logprob[i][j].item<float>());
+        //     std::cout << str << std::endl;
+        //   }
+        // }
       }
     }
   }

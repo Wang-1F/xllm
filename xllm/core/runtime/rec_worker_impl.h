@@ -162,30 +162,56 @@ class RecWorkerImpl : public LLMWorkerImpl {
                             const BeamSearchTensors& beam_tensors,
                             ForwardOutput& output);
 
-    // Structure to hold async computation results for next round input
+    // Structure to hold async computation results for next round input.
+    // These tensors describe the paged KV layout for the *next* decode step.
     struct NextRoundInputResults {
+      // Flattened indices into full_kv_caches_ for all (batch, beam) tokens.
       torch::Tensor paged_kv_indices;
+      // Indptr for each (batch, beam) sequence in paged_kv_indices.
       torch::Tensor paged_kv_indptr;
+      // Last page length for each (batch, beam) sequence.
       torch::Tensor paged_kv_last_page_len;
     };
 
-    // Compute next round input asynchronously (can overlap with GPU execution)
+    // Unified entry for preparing current round input and scheduling next
+    // round.
+    //
+    // Semantics:
+    //  - Phase A (consume existing async result):
+    //    If next_round_async_result has value, this method will block on
+    //    future.get(), update `input`'s paged_kv_* tensors, token_ids and
+    //    positions for the *current* round, then reset the optional to nullopt.
+    //  - Phase B (schedule async work for next round):
+    //    If round < total_rounds - 1, this method will launch
+    //    compute_next_round_input_async(...) for the upcoming round and store
+    //    the returned SemiFuture back into next_round_async_result so that
+    //    the next call to this method can consume it.
+    //
+    // By calling this method once at the beginning of each decode round,
+    // right before model_executor_->forward, we can (1) ensure current round
+    // inputs are ready and (2) maximize overlap between CPU preparation of
+    // next-round paged KV and GPU execution of the current round.
+    void prepare_round_input_and_schedule_next(
+        ForwardInput& input,
+        int32_t round,
+        int32_t total_rounds,
+        int32_t batch_size,
+        int32_t beam_width,
+        int32_t max_decode_step,
+        const torch::TensorOptions& paged_options,
+        const torch::Tensor& top_tokens,
+        const BeamSearchTensors& beam_tensors,
+        std::optional<folly::SemiFuture<NextRoundInputResults>>&
+            next_round_async_result);
+
+    // Compute next round input asynchronously (can overlap with GPU execution).
     folly::SemiFuture<NextRoundInputResults> compute_next_round_input_async(
-        const torch::Tensor& kv_seq_lens,
+        ForwardInput& input,
         int32_t current_step,
         int32_t batch_size,
         int32_t beam_size,
         int32_t max_decode_step,
         const torch::TensorOptions& paged_options);
-
-    // Update input for next round using pre-computed async results
-    void update_input_for_next_round(
-        ForwardInput& input,
-        int32_t current_step,
-        const SampleOutput& sample_output,
-        const torch::Tensor& top_tokens,
-        const BeamSearchTensors& beam_tensors,
-        folly::SemiFuture<NextRoundInputResults>& async_results);
 
     void allocate_kv_caches_related();
     void prepare_kv_caches_related_for_input(const ForwardInput& inputs,
