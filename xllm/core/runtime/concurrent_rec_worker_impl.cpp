@@ -407,15 +407,15 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
                                       next_round_async_result.value());
         } else {
           // Fallback to synchronous computation
-          update_input_for_next_round(mutable_input,
-                                      round,
-                                      sample_output,
-                                      top_tokens,
-                                      beam_tensors,
-                                      batch_size,
-                                      beam_width,
-                                      max_decode_step,
-                                      paged_options);
+          // update_input_for_next_round(mutable_input,
+          //                             round,
+          //                             sample_output,
+          //                             top_tokens,
+          //                             beam_tensors,
+          //                             batch_size,
+          //                             beam_width,
+          //                             max_decode_step,
+          //                             paged_options);
         }
 
         if (round > 0) {

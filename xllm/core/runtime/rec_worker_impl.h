@@ -178,17 +178,6 @@ class RecWorkerImpl : public LLMWorkerImpl {
         int32_t max_decode_step,
         const torch::TensorOptions& paged_options);
 
-    // Update input for next round in multi-round decoding
-    void update_input_for_next_round(ForwardInput& input,
-                                     int32_t current_step,
-                                     const SampleOutput& sample_output,
-                                     const torch::Tensor& top_tokens,
-                                     const BeamSearchTensors& beam_tensors,
-                                     int32_t batch_size,
-                                     int32_t beam_size,
-                                     int32_t max_decode_step,
-                                     const torch::TensorOptions& paged_options);
-
     // Update input for next round using pre-computed async results
     void update_input_for_next_round(
         ForwardInput& input,
