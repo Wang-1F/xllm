@@ -173,6 +173,7 @@ ConcurrentRecWorkerImpl::step_async(const ForwardInput& input) {
   if (FLAGS_enable_graph) {
     warmup(input);
   }
+
   // Use schedule() to assign tasks, letting ThreadPool automatically select
   // idle threads The logic for allocating instance_id happens when the task
   // executes (see lambda below)
@@ -343,6 +344,10 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
   std::optional<folly::SemiFuture<NextRoundInputResults>>
       next_round_async_result;
 
+  bool is_warmup = concurrent_worker_.warmup_set_.find(
+                       mutable_input.input_params.num_sequences) ==
+                   concurrent_worker_.warmup_set_.end();
+
   for (int32_t round = 0; round < total_rounds; ++round) {
     const auto& sampling_params = round > 0
                                       ? mutable_input.decoder_sampling_params
@@ -353,8 +358,7 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
 
     // Start async computation for next round input (overlap with GPU
     // logits/sampling)
-    // TODO: support async computation for next round input
-    if (round < total_rounds - 1 && !FLAGS_enable_graph) {
+    if (round < total_rounds - 1 && !is_warmup) {
       next_round_async_result =
           compute_next_round_input_async(mutable_input.input_params.kv_seq_lens,
                                          round,
