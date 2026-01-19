@@ -396,15 +396,15 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
 
     // Start async computation for next round input (overlap with GPU
     // logits/sampling)
-    if (round < total_rounds - 1) {
-      next_round_async_result =
-          compute_next_round_input_async(mutable_input.input_params.kv_seq_lens,
-                                         round,
-                                         batch_size,
-                                         beam_width,
-                                         max_decode_step,
-                                         paged_options);
-    }
+    // if (round < total_rounds - 1) {
+    //   next_round_async_result =
+    //       compute_next_round_input_async(mutable_input.input_params.kv_seq_lens,
+    //                                      round,
+    //                                      batch_size,
+    //                                      beam_width,
+    //                                      max_decode_step,
+    //                                      paged_options);
+    // }
 
     torch::Tensor hidden_states;
 
@@ -735,73 +735,88 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
     int32_t max_decode_step,
     const torch::TensorOptions& paged_options) {
   // [max_seqs_per_batch_, beam_size, max_decode_step]
-  auto full_kv_offsets = full_kv_cache_offsets_->full_kv_offsets;
-  // [max_seqs_per_batch_, beam_size, max_decode_step]
-  auto full_kv_mask = full_kv_cache_offsets_->full_kv_mask;
-  // [max_seqs_per_batch_, beam_size, max_decode_step]
-  auto full_kv_indices = full_kv_cache_offsets_->full_kv_indices;
+  // auto full_kv_offsets = full_kv_cache_offsets_->full_kv_offsets;
+  // // [max_seqs_per_batch_, beam_size, max_decode_step]
+  // auto full_kv_mask = full_kv_cache_offsets_->full_kv_mask;
+  // // [max_seqs_per_batch_, beam_size, max_decode_step]
+  // auto full_kv_indices = full_kv_cache_offsets_->full_kv_indices;
 
-  // [batch_size, beam_size, max_token_per_req_]
-  auto shared_kv_offsets =
-      full_kv_offsets.slice(2, 0, max_token_per_req_).slice(0, 0, batch_size);
+  // // [batch_size, beam_size, max_token_per_req_]
+  // auto shared_kv_offsets =
+  //     full_kv_offsets.slice(2, 0, max_token_per_req_).slice(0, 0,
+  //     batch_size);
 
   auto kv_cu_seq_lens = input.input_params.kv_seq_lens;
+  int32_t prompt_len = kv_cu_seq_lens[-1].item<int32_t>();
 
-  // [batch_size]
-  auto shared_kv_lens_each_batch = torch::diff(kv_cu_seq_lens);
+  // // [batch_size]
+  // auto shared_kv_lens_each_batch = torch::diff(kv_cu_seq_lens);
 
-  // [batch_size, beam_size, max_token_per_req_]
-  auto shared_kv_lens_each_batch_broadcast =
-      shared_kv_lens_each_batch.unsqueeze(1).unsqueeze(1);
+  // // [batch_size, beam_size, max_token_per_req_]
+  // auto shared_kv_lens_each_batch_broadcast =
+  //     shared_kv_lens_each_batch.unsqueeze(1).unsqueeze(1);
 
-  // [batch_size, beam_size, max_token_per_req_]
-  auto shared_mask =
-      full_kv_mask.slice(2, 0, max_token_per_req_).slice(0, 0, batch_size);
+  // // [batch_size, beam_size, max_token_per_req_]
+  // auto shared_mask =
+  //     full_kv_mask.slice(2, 0, max_token_per_req_).slice(0, 0, batch_size);
 
-  shared_mask.copy_(shared_kv_offsets < shared_kv_lens_each_batch_broadcast);
-  // [batch_size]
-  auto kv_lens_batch_offsets = kv_cu_seq_lens.slice(0, 0, -1);
+  // shared_mask.copy_(shared_kv_offsets < shared_kv_lens_each_batch_broadcast);
+  // // [batch_size]
+  // auto kv_lens_batch_offsets = kv_cu_seq_lens.slice(0, 0, -1);
 
-  auto kv_lens_batch_offsets_broadcast =
-      kv_lens_batch_offsets.unsqueeze(1).unsqueeze(1);
+  // auto kv_lens_batch_offsets_broadcast =
+  //     kv_lens_batch_offsets.unsqueeze(1).unsqueeze(1);
 
-  auto shared_kv_indices =
-      full_kv_indices.slice(2, 0, max_token_per_req_).slice(0, 0, batch_size);
+  // auto shared_kv_indices =
+  //     full_kv_indices.slice(2, 0, max_token_per_req_).slice(0, 0,
+  //     batch_size);
 
-  shared_kv_indices.copy_(kv_lens_batch_offsets_broadcast + shared_kv_offsets);
-  uint32_t unshared_kv_begin_offset = max_tokens_per_batch_;
+  // shared_kv_indices.copy_(kv_lens_batch_offsets_broadcast +
+  // shared_kv_offsets); uint32_t unshared_kv_begin_offset =
+  // max_tokens_per_batch_;
 
-  auto unshared_full_kv_offsets = full_kv_cache_offsets_->unshared_offsets;
+  // auto unshared_full_kv_offsets = full_kv_cache_offsets_->unshared_offsets;
 
-  // [batch_size, beam_size, max_decode_step]
-  auto unshared_kv_offsets = unshared_full_kv_offsets.slice(0, 0, batch_size);
-  int32_t unshared_kv_len = beam_size * max_decode_step;
-  auto unshared_kv_indices =
-      full_kv_indices
-          .slice(2, max_token_per_req_, max_token_per_req_ + unshared_kv_len)
-          .slice(0, 0, batch_size);
-  unshared_kv_indices.copy_(unshared_kv_offsets + unshared_kv_begin_offset);
+  // // [batch_size, beam_size, max_decode_step]
+  // auto unshared_kv_offsets = unshared_full_kv_offsets.slice(0, 0,
+  // batch_size); int32_t unshared_kv_len = beam_size * max_decode_step; auto
+  // unshared_kv_indices =
+  //     full_kv_indices
+  //         .slice(2, max_token_per_req_, max_token_per_req_ + unshared_kv_len)
+  //         .slice(0, 0, batch_size);
+  // unshared_kv_indices.copy_(unshared_kv_offsets + unshared_kv_begin_offset);
 
-  auto unshared_mask =
-      full_kv_mask
-          .slice(2, max_token_per_req_, max_token_per_req_ + unshared_kv_len)
-          .slice(0, 0, batch_size);
-  auto real_max_decode_step_ids =
-      full_kv_cache_offsets_->max_decode_step_ids.slice(0, 0, batch_size);
-  unshared_mask.copy_(real_max_decode_step_ids <= current_step);
+  // auto unshared_mask =
+  //     full_kv_mask
+  //         .slice(2, max_token_per_req_, max_token_per_req_ + unshared_kv_len)
+  //         .slice(0, 0, batch_size);
+  // auto real_max_decode_step_ids =
+  //     full_kv_cache_offsets_->max_decode_step_ids.slice(0, 0, batch_size);
+  // unshared_mask.copy_(real_max_decode_step_ids <= current_step);
 
-  torch::Tensor paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len;
-  unshared_kv_len = current_step + 1;
+  // torch::Tensor paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len;
+  // unshared_kv_len = current_step + 1;
 
-  auto batch_beam_shared_kv_lens =
-      (shared_kv_lens_each_batch.unsqueeze(1).expand({-1, beam_size}) +
-       unshared_kv_len)
-          .flatten();
-  auto cumsum_result = torch::cumsum(batch_beam_shared_kv_lens, 0);
-  paged_kv_indptr = torch::cat(
-      {torch::zeros({1}, paged_options), cumsum_result.to(paged_options)}, 0);
-  paged_kv_indices = full_kv_indices.masked_select(full_kv_mask);
-  paged_kv_last_page_len = torch::ones({batch_size * beam_size}, paged_options);
+  // auto batch_beam_shared_kv_lens =
+  //     (shared_kv_lens_each_batch.unsqueeze(1).expand({-1, beam_size}) +
+  //      unshared_kv_len)
+  //         .flatten();
+  // auto cumsum_result = torch::cumsum(batch_beam_shared_kv_lens, 0);
+  // paged_kv_indptr = torch::cat(
+  //     {torch::zeros({1}, paged_options), cumsum_result.to(paged_options)},
+  //     0);
+  // paged_kv_indices = full_kv_indices.masked_select(full_kv_mask);
+  // paged_kv_last_page_len = torch::ones({batch_size * beam_size},
+  // paged_options);
+
+  auto paged_kv_indices =
+      torch::zeros({batch_size * beam_size * (prompt_len + current_step + 1)},
+                   paged_options);
+  auto paged_kv_indptr =
+      torch::zeros({batch_size * beam_size + 1}, paged_options);
+  paged_kv_indptr = paged_kv_indptr * (prompt_len + current_step + 1);
+  auto paged_kv_last_page_len =
+      torch::ones({batch_size * beam_size}, paged_options);
 
   input.input_params.paged_kv_indices = paged_kv_indices;
   input.input_params.paged_kv_indptr = paged_kv_indptr;

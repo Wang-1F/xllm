@@ -354,15 +354,15 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
     // Start async computation for next round input (overlap with GPU
     // logits/sampling)
     // TODO: support async computation for next round input
-    if (round < total_rounds - 1 && !FLAGS_enable_graph) {
-      next_round_async_result =
-          compute_next_round_input_async(mutable_input.input_params.kv_seq_lens,
-                                         round,
-                                         batch_size,
-                                         beam_width,
-                                         max_decode_step,
-                                         paged_options);
-    }
+    // if (round < total_rounds - 1 && !FLAGS_enable_graph) {
+    //   next_round_async_result =
+    //       compute_next_round_input_async(mutable_input.input_params.kv_seq_lens,
+    //                                      round,
+    //                                      batch_size,
+    //                                      beam_width,
+    //                                      max_decode_step,
+    //                                      paged_options);
+    // }
 
     torch::Tensor hidden_states;
 
