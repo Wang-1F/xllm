@@ -143,7 +143,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
                                    /*window_size_left*/ sliding_window_,
                                    /*enable_cuda_graph*/ false,
                                    /*causal*/ false,
-                                   /*use_tensor_core*/ true);
+                                   /*use_tensor_core*/ false);
     }
 
     xllm::kernel::AttentionParams attention_params(attn_metadata);
@@ -179,7 +179,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
     // attention_params.plan_info = attn_metadata.plan_info->plan_info;
     // attention_params.use_tensor_core = false;
     const_cast<AttentionMetadata&>(attention_params.attn_metadata)
-        .use_tensor_core = true;
+        .use_tensor_core = false;
     xllm::kernel::batch_decode(attention_params);
   }
   output_tensor = output_tensor.view({-1, num_heads_ * head_size_});
