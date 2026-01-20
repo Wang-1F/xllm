@@ -40,7 +40,6 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/model_loader.h"
 #include "framework/state_dict/state_dict.h"
-#include "util/nvtx_range.h"
 #if defined(USE_CUDA) || defined(USE_ILU)
 #include "kernels/cuda/cuda_ops_api.h"
 #include "layers/cuda/flashinfer_workspace.h"
@@ -50,7 +49,6 @@ limitations under the License.
 #endif
 #include "models/model_registry.h"
 #include "util/threadpool.h"
-#include "util/timer.h"
 
 DECLARE_int32(max_batch_size);
 
@@ -148,19 +146,14 @@ void ConcurrentRecWorkerImpl::load_model(std::unique_ptr<ModelLoader> loader) {
 
   // Load weights for the first model instance (using the original loader)
   multi_stream_pipelines_[0]->model_->load_model(std::move(loader));
-  LOG(INFO) << "Loaded weights for model instance 0";
 
   // Create new loaders and load weights for other model instances
   for (size_t i = 1; i < multi_stream_pipelines_.size(); ++i) {
     auto model_loader = ModelLoader::create(model_weights_path);
     CHECK(model_loader != nullptr)
-        << "Failed to create ModelLoader for model instance " << i;
+        << "Failed to create ModelLoader for model instance";
     multi_stream_pipelines_[i]->model_->load_model(std::move(model_loader));
-    LOG(INFO) << "Loaded weights for model instance " << i;
   }
-
-  LOG(INFO) << "Loaded weights for all " << multi_stream_pipelines_.size()
-            << " models";
 }
 
 folly::SemiFuture<std::optional<ForwardOutput>>
@@ -277,7 +270,6 @@ void ConcurrentRecWorkerImpl::warmup(const ForwardInput& inputs) {
   }
   for (auto index : warmup_indices) {
     multi_stream_pipelines_[index]->warmup(inputs);
-    LOG(INFO) << "Warmup finished for index: " << index;
   }
 
   warmup_set_.insert(inputs.input_params.num_sequences);
@@ -306,9 +298,6 @@ void ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::
 std::optional<ForwardOutput>
 ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
     const ForwardInput& input) {
-  util::NvtxRange nvtx_step("LlmRecPureDevicePipeline::step",
-                            util::NvtxColor::kBlue);
-  Timer timer;
   auto device = concurrent_worker_.device_;
 
   ForwardInput& mutable_input = const_cast<ForwardInput&>(input);
@@ -355,8 +344,6 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
       next_round_async_result;
 
   for (int32_t round = 0; round < total_rounds; ++round) {
-    util::NvtxRange nvtx_round("round_" + std::to_string(round),
-                               util::NvtxColor::kCyan);
     const auto& sampling_params = round > 0
                                       ? mutable_input.decoder_sampling_params
                                       : mutable_input.sampling_params;
@@ -365,71 +352,48 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
     // Update current_round_ tensor value
     current_round_.fill_(round - 1);
 
-    {
-      util::NvtxRange nvtx_prepare("prepare_round_input",
-                                   util::NvtxColor::kYellow);
-      prepare_round_input_and_schedule_next(mutable_input,
-                                            round,
-                                            total_rounds,
-                                            batch_size,
-                                            beam_width,
-                                            max_decode_step,
-                                            paged_options,
-                                            top_tokens,
-                                            beam_tensors,
-                                            next_round_async_result);
-      // if (iswarmup) {
-      //   std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      // }
-    }
+    prepare_round_input_and_schedule_next(mutable_input,
+                                          round,
+                                          total_rounds,
+                                          batch_size,
+                                          beam_width,
+                                          max_decode_step,
+                                          paged_options,
+                                          top_tokens,
+                                          beam_tensors,
+                                          next_round_async_result);
 
     torch::Tensor hidden_states;
-    {
-      util::NvtxRange nvtx_forward("model_forward", util::NvtxColor::kGreen);
-      hidden_states = executor_->forward(mutable_input.token_ids,
-                                         mutable_input.positions,
-                                         concurrent_worker_.kv_caches_,
-                                         mutable_input.input_params);
-    }
+    hidden_states = executor_->forward(mutable_input.token_ids,
+                                       mutable_input.positions,
+                                       concurrent_worker_.kv_caches_,
+                                       mutable_input.input_params);
     if (!hidden_states.defined()) {
       return std::nullopt;
     }
 
     if (sampling_params.selected_token_idxes.defined()) {
-      {
-        util::NvtxRange nvtx_logits("compute_logits", util::NvtxColor::kOrange);
-        logits =
-            model_->logits(hidden_states, sampling_params.selected_token_idxes);
-      }
-      {
-        util::NvtxRange nvtx_sampler("sampler_forward",
-                                     util::NvtxColor::kMagenta);
-        sample_output =
-            concurrent_worker_.sampler_->forward(logits, sampling_params);
-      }
+      logits =
+          model_->logits(hidden_states, sampling_params.selected_token_idxes);
+      sample_output =
+          concurrent_worker_.sampler_->forward(logits, sampling_params);
       top_tokens = sample_output.top_tokens.to(torch::kInt32)
                        .reshape({-1, mutable_input.beam_width});
     }
     if (sample_output.top_tokens.defined()) {
       torch::Tensor top_logprobs =
           sample_output.top_logprobs.reshape({-1, beam_width});
-      {
-        util::NvtxRange nvtx_beam("beam_search", util::NvtxColor::kPurple);
-        execute_beam_search(
-            top_tokens, top_logprobs, beam_tensors, round, batch_size);
-        beam_tensors.sequence_group.copy_(beam_tensors.out_seqgroup,
-                                          /*non_blocking=*/true);
-        beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
-                                       /*non_blocking=*/true);
-      }
+      execute_beam_search(
+          top_tokens, top_logprobs, beam_tensors, round, batch_size);
+      beam_tensors.sequence_group.copy_(beam_tensors.out_seqgroup,
+                                        /*non_blocking=*/true);
+      beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
+                                     /*non_blocking=*/true);
       if (round > 0 && round < total_rounds - 1) {
-        util::NvtxRange nvtx_cache("cache_select", util::NvtxColor::kPink);
         execute_cache_select(
             beam_tensors, mutable_input, round, beam_width, layer_num);
       }
       if (round == total_rounds - 1) {
-        util::NvtxRange nvtx_output("build_final_output",
-                                    util::NvtxColor::kLightBlue);
         build_final_output(
             logits, sample_output, sampling_params, beam_tensors, output);
       }
@@ -441,7 +405,6 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
   } else {
     device.synchronize_default_stream();
   }
-  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(device.index());
   return output;
 }
@@ -492,9 +455,6 @@ void ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::warmup(
 
   auto output = step(input_on_device);
   CHECK(output.has_value()) << "Warmup failed.";
-
-  LOG(INFO) << "Warmup finished for batch size: "
-            << input.input_params.num_sequences;
 }
 
 }  // namespace xllm
