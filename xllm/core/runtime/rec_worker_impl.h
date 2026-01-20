@@ -121,69 +121,35 @@ class RecWorkerImpl : public LLMWorkerImpl {
       torch::Tensor out_seqgroup;  // [batch_size, beam_width, total_rounds]
     };
 
-    // Fixed tensors for multi-round decoding
-    struct FixedTensors {
-      torch::Tensor batch_ids;  // [batch_size, beam_width, max_decode_step]
-      torch::Tensor beams_ids;  // [batch_size, beam_width, max_decode_step]
-      torch::Tensor
-          max_decode_step_ids;  // [batch_size, beam_width, max_decode_step]
-    };
-    // Prepare beam search tensors
     BeamSearchTensors prepare_beam_search_tensors(int32_t batch_size,
                                                   int32_t beam_width,
                                                   int32_t total_rounds,
                                                   const torch::Device& device);
 
-    // Execute beam search kernel
     void execute_beam_search(const torch::Tensor& top_tokens,
                              const torch::Tensor& top_logprobs,
                              BeamSearchTensors& beam_tensors,
                              int32_t round,
                              int32_t batch_size);
 
-    // Execute cache select kernel
     void execute_cache_select(const BeamSearchTensors& beam_tensors,
                               ForwardInput& input,
                               int32_t round,
                               int32_t beam_width,
                               int32_t layer_num);
 
-    // Build final output from beam search results
     void build_final_output(const torch::Tensor& logits,
                             const SampleOutput& sample_output,
                             const SamplingParameters& sampling_params,
                             const BeamSearchTensors& beam_tensors,
                             ForwardOutput& output);
 
-    // Structure to hold async computation results for next round input.
-    // These tensors describe the paged KV layout for the *next* decode step.
     struct NextRoundInputResults {
-      // Flattened indices into full_kv_caches_ for all (batch, beam) tokens.
       torch::Tensor paged_kv_indices;
-      // Indptr for each (batch, beam) sequence in paged_kv_indices.
       torch::Tensor paged_kv_indptr;
-      // Last page length for each (batch, beam) sequence.
       torch::Tensor paged_kv_last_page_len;
     };
 
-    // Unified entry for preparing current round input and scheduling next
-    // round.
-    //
-    // Semantics:
-    //  - Phase A (consume existing async result):
-    //    If next_round_async_result has value, this method will block on
-    //    future.get(), update `input`'s paged_kv_* tensors, token_ids and
-    //    positions for the *current* round, then reset the optional to nullopt.
-    //  - Phase B (schedule async work for next round):
-    //    If round < total_rounds - 1, this method will launch
-    //    compute_next_round_input_async(...) for the upcoming round and store
-    //    the returned SemiFuture back into next_round_async_result so that
-    //    the next call to this method can consume it.
-    //
-    // By calling this method once at the beginning of each decode round,
-    // right before model_executor_->forward, we can (1) ensure current round
-    // inputs are ready and (2) maximize overlap between CPU preparation of
-    // next-round paged KV and GPU execution of the current round.
     void prepare_round_input_and_schedule_next(
         ForwardInput& input,
         int32_t round,

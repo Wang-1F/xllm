@@ -34,7 +34,6 @@ limitations under the License.
 #include "framework/model_loader.h"
 #include "models/model_registry.h"
 #include "util/env_var.h"
-#include "util/timer.h"
 
 namespace xllm {
 
@@ -92,7 +91,6 @@ void RecWorkerImpl::OneRecWorkPipeline::prepare_work_before_execute(
 
 std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
     const ForwardInput& input) {
-  Timer timer;
   worker_.device_.set_device();
 
   const auto& sampling_params = input.sampling_params;
@@ -157,7 +155,6 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
   if (!worker_.enable_schedule_overlap() && !worker_.driver_ &&
       !worker_.dp_driver_ && !worker_.options_.enable_speculative_decode()) {
     worker_.device_.synchronize_default_stream();
-    COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
     DeviceMonitor::get_instance().update_active_activation_memory(
         worker_.device_.index());
     return std::nullopt;
@@ -181,7 +178,6 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
   }
 
   worker_.device_.synchronize_default_stream();
-  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(
       worker_.device_.index());
 
@@ -339,7 +335,6 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::
 
 std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
     const ForwardInput& input) {
-  Timer timer;
   auto device = worker_.device_;
   device.set_device();
 
@@ -442,7 +437,6 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
 
   device.synchronize_default_stream();
 
-  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(device.index());
   return output;
 }
@@ -550,7 +544,6 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::
   // round).
 
   if (next_round_async_result.has_value()) {
-    LOG(INFO) << "need data.";
     // Block only here to wait for CPU-side paged KV computation.
     auto results = std::move(next_round_async_result.value()).get();
 
@@ -608,20 +601,25 @@ RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
   // Capture necessary data for async computation
   auto full_kv_offsets = full_kv_cache_offsets_->full_kv_offsets;
   auto unshared_full_kv_indices = full_kv_cache_offsets_->unshared_indices;
-  auto host_int32_options = torch::TensorOptions().dtype(torch::kInt32);
+  // auto host_int32_options = torch::TensorOptions().dtype(torch::kInt32);
   folly::Promise<NextRoundInputResults> promise;
   auto future = promise.getSemiFuture();
 
   // Launch async computation in thread pool (can overlap with GPU execution)
   threadpool_.schedule([=, this, promise = std::move(promise)]() mutable {
-    auto host_kv_seq_lens =
-        mutable_input.input_params.kv_seq_lens.to(torch::kCPU);
-    auto shared_kv_lens_each_batch = torch::diff(host_kv_seq_lens);
+    c10::StreamGuard streamGuard = worker_.prepare_stream_->set_stream_guard();
+
+    // Compute shared KV sequence lengths for each batch
+    auto shared_kv_lens_each_batch =
+        torch::diff(mutable_input.input_params.kv_seq_lens);
     int32_t max_kv_len = shared_kv_lens_each_batch.max().item<int32_t>();
+
+    // Allocate a contiguous buffer to hold all paged KV indices
     auto full_paged_kv_indices =
         torch::zeros({batch_size * beam_size * (max_kv_len + max_decode_step)},
-                     host_int32_options);
+                     paged_options);
 
+    // Fill the buffer batch by batch on CPU
     int32_t begin_index = 0;
     int32_t shared_block_id_acc = 0;
     for (int i = 0; i < batch_size; i++) {
@@ -630,6 +628,7 @@ RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
           shared_kv_lens_each_batch[i].item<int32_t>();
 
       auto target_batch_full_kv_offsets = full_kv_offsets.slice(0, i, i + 1);
+
       // [1, beam_size, target_batch_kv_seq_len]
       auto target_batch_shared_kv_offsets =
           target_batch_full_kv_offsets.slice(2, 0, target_batch_kv_seq_len);
@@ -644,7 +643,7 @@ RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
       // [1, beam_size, target_batch_kv_seq_len + current_step + 1]
       auto target_batch_full_paged_kv_indices = torch::zeros(
           {1, beam_size, (target_batch_kv_seq_len + current_step + 1)},
-          host_int32_options);
+          paged_options);
 
       auto target_batch_shared_paged_kv_indices =
           target_batch_full_paged_kv_indices.slice(
@@ -673,27 +672,28 @@ RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
       begin_index = end_index;
       shared_block_id_acc += target_batch_kv_seq_len;
     }
+
     auto paged_kv_indices = full_paged_kv_indices.slice(0, 0, begin_index);
-    paged_kv_indices = paged_kv_indices.to(paged_options.device());
 
     int32_t unshared_kv_len = current_step + 1;
     auto batch_beam_shared_kv_lens =
         (shared_kv_lens_each_batch.unsqueeze(1).expand({-1, beam_size}) +
          unshared_kv_len)
             .flatten();
+
     auto cumsum_result = torch::cumsum(batch_beam_shared_kv_lens, 0);
-    auto paged_kv_indptr = torch::cat({torch::zeros({1}, host_int32_options),
-                                       cumsum_result.to(host_int32_options)},
-                                      0);
-    paged_kv_indptr = paged_kv_indptr.to(paged_options.device());
+    auto paged_kv_indptr =
+        torch::cat({torch::zeros({1}, paged_options), cumsum_result}, 0);
+
     auto paged_kv_last_page_len =
         torch::ones({batch_size * beam_size}, paged_options);
+
+    auto ret = worker_.prepare_stream_->synchronize();
 
     NextRoundInputResults results;
     results.paged_kv_indices = paged_kv_indices;
     results.paged_kv_indptr = paged_kv_indptr;
     results.paged_kv_last_page_len = paged_kv_last_page_len;
-    LOG(INFO) << "finish compute_next_round_input_async";
     promise.setValue(results);
   });
 
@@ -702,8 +702,9 @@ RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
 
 RecWorkerImpl::LlmRecPureDevicePipeline::FullKvCacheOffsets::FullKvCacheOffsets(
     LlmRecPureDevicePipeline* pure_device_pipeline) {
-  // auto device = pure_device_pipeline->worker_.device();
-  auto paged_options = torch::TensorOptions().dtype(torch::kInt32);
+  auto device = pure_device_pipeline->worker_.device();
+  auto paged_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
   int32_t max_decode_step = get_pure_device_decode_rounds() - 1;
   full_kv_offsets =
       torch::arange(0,

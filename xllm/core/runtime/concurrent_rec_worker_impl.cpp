@@ -40,6 +40,7 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/model_loader.h"
 #include "framework/state_dict/state_dict.h"
+#include "util/nvtx_range.h"
 #if defined(USE_CUDA) || defined(USE_ILU)
 #include "kernels/cuda/cuda_ops_api.h"
 #include "layers/cuda/flashinfer_workspace.h"
@@ -305,10 +306,17 @@ void ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::
 std::optional<ForwardOutput>
 ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
     const ForwardInput& input) {
+  util::NvtxRange nvtx_step("LlmRecPureDevicePipeline::step",
+                            util::NvtxColor::kBlue);
   Timer timer;
   auto device = concurrent_worker_.device_;
 
   ForwardInput& mutable_input = const_cast<ForwardInput&>(input);
+
+#if defined(USE_CUDA)
+  mutable_input.input_params.set_flashinfer_workspace_buffer(
+      flashinfer_workspace_);
+#endif
 
   int32_t total_rounds = mutable_input.total_round;
   int32_t max_decode_step = total_rounds - 1;
@@ -335,6 +343,9 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
   mutable_input.input_params.head_dim = context_->get_model_args().head_dim();
   mutable_input.input_params.beam_width = beam_width;
   mutable_input.input_params.current_round = current_round_;
+  bool iswarmup = concurrent_worker_.warmup_set_.find(
+                      mutable_input.input_params.num_sequences) ==
+                  concurrent_worker_.warmup_set_.end();
 
   ForwardOutput output;
   torch::Tensor logits;
@@ -344,86 +355,83 @@ ConcurrentRecWorkerImpl::ConcurrentLlmRecPureDevicePipeline::step(
       next_round_async_result;
 
   for (int32_t round = 0; round < total_rounds; ++round) {
+    util::NvtxRange nvtx_round("round_" + std::to_string(round),
+                               util::NvtxColor::kCyan);
     const auto& sampling_params = round > 0
                                       ? mutable_input.decoder_sampling_params
                                       : mutable_input.sampling_params;
     mutable_input.input_params.is_prefill = round == 0;
     mutable_input.input_params.attn_metadata = nullptr;
+    // Update current_round_ tensor value
     current_round_.fill_(round - 1);
 
-    // Start async computation for next round input (overlap with GPU
-    // logits/sampling)
-    // TODO: support async computation for next round input
-    // Consume previous async result for this round (if any) and schedule
-    // async work for the next round. This keeps the blocking future.get()
-    // right before forward and maximizes overlap with GPU execution.
-    prepare_round_input_and_schedule_next(mutable_input,
-                                          round,
-                                          total_rounds,
-                                          batch_size,
-                                          beam_width,
-                                          max_decode_step,
-                                          paged_options,
-                                          top_tokens,
-                                          beam_tensors,
-                                          next_round_async_result);
+    {
+      util::NvtxRange nvtx_prepare("prepare_round_input",
+                                   util::NvtxColor::kYellow);
+      prepare_round_input_and_schedule_next(mutable_input,
+                                            round,
+                                            total_rounds,
+                                            batch_size,
+                                            beam_width,
+                                            max_decode_step,
+                                            paged_options,
+                                            top_tokens,
+                                            beam_tensors,
+                                            next_round_async_result);
+      // if (iswarmup) {
+      //   std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      // }
+    }
 
     torch::Tensor hidden_states;
-
-    hidden_states = executor_->forward(mutable_input.token_ids,
-                                       mutable_input.positions,
-                                       concurrent_worker_.kv_caches_,
-                                       mutable_input.input_params);
-
+    {
+      util::NvtxRange nvtx_forward("model_forward", util::NvtxColor::kGreen);
+      hidden_states = executor_->forward(mutable_input.token_ids,
+                                         mutable_input.positions,
+                                         concurrent_worker_.kv_caches_,
+                                         mutable_input.input_params);
+    }
     if (!hidden_states.defined()) {
       return std::nullopt;
     }
 
     if (sampling_params.selected_token_idxes.defined()) {
-      logits =
-          model_->logits(hidden_states, sampling_params.selected_token_idxes);
-      sample_output =
-          concurrent_worker_.sampler_->forward(logits, sampling_params);
+      {
+        util::NvtxRange nvtx_logits("compute_logits", util::NvtxColor::kOrange);
+        logits =
+            model_->logits(hidden_states, sampling_params.selected_token_idxes);
+      }
+      {
+        util::NvtxRange nvtx_sampler("sampler_forward",
+                                     util::NvtxColor::kMagenta);
+        sample_output =
+            concurrent_worker_.sampler_->forward(logits, sampling_params);
+      }
       top_tokens = sample_output.top_tokens.to(torch::kInt32)
                        .reshape({-1, mutable_input.beam_width});
     }
-
     if (sample_output.top_tokens.defined()) {
       torch::Tensor top_logprobs =
           sample_output.top_logprobs.reshape({-1, beam_width});
-      execute_beam_search(
-          top_tokens, top_logprobs, beam_tensors, round, batch_size);
-
-      beam_tensors.sequence_group.copy_(beam_tensors.out_seqgroup,
-                                        /*non_blocking=*/true);
-      beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
-                                     /*non_blocking=*/true);
-
+      {
+        util::NvtxRange nvtx_beam("beam_search", util::NvtxColor::kPurple);
+        execute_beam_search(
+            top_tokens, top_logprobs, beam_tensors, round, batch_size);
+        beam_tensors.sequence_group.copy_(beam_tensors.out_seqgroup,
+                                          /*non_blocking=*/true);
+        beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
+                                       /*non_blocking=*/true);
+      }
       if (round > 0 && round < total_rounds - 1) {
+        util::NvtxRange nvtx_cache("cache_select", util::NvtxColor::kPink);
         execute_cache_select(
             beam_tensors, mutable_input, round, beam_width, layer_num);
       }
-
       if (round == total_rounds - 1) {
+        util::NvtxRange nvtx_output("build_final_output",
+                                    util::NvtxColor::kLightBlue);
         build_final_output(
             logits, sample_output, sampling_params, beam_tensors, output);
-        // auto tmp_acc_logprob =
-        //     beam_tensors.acc_logprob.view({batch_size, beam_width});
-        // for (int i = 0; i < batch_size; i++) {
-        //   for (int j = 0; j < beam_width; j++) {
-        //     std::string str{};
-        //     for (int k = 0; k < beam_tensors.sequence_group.size(2); k++) {
-        //       if (k > 0) {
-        //         str += ", ";
-        //       }
-        //       str += std::to_string(
-        //           beam_tensors.sequence_group[i][j][k].item<int32_t>());
-        //     }
-        //     // str += ": ";
-        //     // str += std::to_string(tmp_acc_logprob[i][j].item<float>());
-        //     std::cout << str << std::endl;
-        //   }
-        // }
       }
     }
   }

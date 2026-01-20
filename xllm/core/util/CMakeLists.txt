@@ -18,6 +18,7 @@ cc_library(
     json_reader.h
     lightweightsemaphore.h
     net.h
+    nvtx_range.h
     pretty_print.h
     scope_guard.h
     slice.h
@@ -37,6 +38,7 @@ cc_library(
     # TODO. add following at next pr.
     json_reader.cpp
     net.cpp
+    nvtx_range.cpp
     pretty_print.cpp
     threadpool.cpp
     timer.cpp

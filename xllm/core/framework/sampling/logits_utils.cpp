@@ -15,9 +15,12 @@ limitations under the License.
 
 #include "logits_utils.h"
 
+#include <glog/logging.h>
 #include <torch/torch.h>
 
 #include <memory>
+
+#include "util/timer.h"
 
 namespace xllm {
 
@@ -125,17 +128,20 @@ void apply_top_k_top_p(torch::Tensor& logits,
 
     if (top_k.defined()) {
       auto processed_top_k = top_k.unsqueeze(1);
-      auto max_value = std::numeric_limits<int64_t>::max();
 
-      processed_top_k =
-          torch::where(processed_top_k <= 0,
-                       torch::tensor(max_value).to(processed_top_k.device()),
-                       processed_top_k);
+      auto max_value = std::numeric_limits<int64_t>::max();
+      processed_top_k = torch::where(
+          processed_top_k <= 0,
+          //  torch::tensor(max_value).to(processed_top_k.device()),
+          torch::full_like(processed_top_k, max_value),
+          processed_top_k);
 
       auto vocab_size = logits.size(-1);
       auto top_k_mask = torch::arange(vocab_size, sorted_logits.device())
                             .expand_as(sorted_logits);
+
       top_k_mask = top_k_mask >= processed_top_k;
+
       sorted_logits.masked_fill_(top_k_mask, filter_value);
     }
 
@@ -143,7 +149,9 @@ void apply_top_k_top_p(torch::Tensor& logits,
       auto processed_top_p = top_p.unsqueeze(1);
 
       auto probs = sorted_logits.softmax(/*dim=*/-1).to(torch::kFloat32);
+
       auto probs_sum = probs.cumsum(/*dim=*/-1);
+
       auto mask = (probs_sum - probs) > processed_top_p;
 
       sorted_logits.masked_fill_(mask, filter_value);
