@@ -28,11 +28,13 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/model_input_params.h"
+#include "core/kernels/cuda/piecewise_graphs.h"
+#include "core/layers/common/attention_metadata.h"
 #include "executor_impl.h"
 #include "executor_impl_factory.h"
 #include "options.h"
 
-namespace xllm {
+namespace xllm::runtime::cuda {
 
 // Helper class to hold persistent parameters for CUDA graph execution
 // Multiple CudaGraph instances can share the same CudaGraphPersistentParam
@@ -153,6 +155,14 @@ class CudaGraphPersistentParam {
     return persistent_decode_qo_indptr_;
   }
 
+  // Get two-stage decode cache with sliced tensors from persistent buffers
+  layer::TwoStageDecodeCache get_two_stage_decode_cache(
+      int64_t total_beam,
+      int64_t request_batch_size,
+      int64_t beam_width,
+      int64_t n_heads,
+      int64_t head_dim) const;
+
  private:
   const ModelArgs& args_;
   const torch::Device& device_;
@@ -173,17 +183,28 @@ class CudaGraphPersistentParam {
   torch::Tensor persistent_paged_kv_indices_;
   torch::Tensor persistent_paged_kv_last_page_len_;
   torch::Tensor persistent_decode_qo_indptr_;
+  layer::TwoStageDecodeCache persistent_two_decode_cache_;
 
   // TODO maybe not used. or use q_cu_seq_lens instead.
   torch::Tensor persistent_chunked_prefill_qo_indptr_;
+
+  // Unshared workspace buffer for two-stage decode (avoid conflict with shared
+  // stage)
+  torch::Tensor unshared_float_workspace_buffer_;
+  torch::Tensor unshared_int_workspace_buffer_;
+  torch::Tensor unshared_page_locked_int_workspace_buffer_;
 };
 
 // CUDA graph executor using libtorch CUDAGraph for memory management
 class CudaGraph {
  public:
+  // is_piecewise: if true, use piecewise graph capture for prefill
   explicit CudaGraph(CudaGraphPersistentParam& persistent_param,
-                     c10::DeviceIndex device_index)
-      : persistent_param_(persistent_param), device_index_(device_index) {
+                     c10::DeviceIndex device_index,
+                     bool is_piecewise = false)
+      : persistent_param_(persistent_param),
+        device_index_(device_index),
+        is_piecewise_(is_piecewise) {
     // Initialize capture stream in constructor
     initialize_capture_stream(device_index);
   }
@@ -217,8 +238,13 @@ class CudaGraph {
   // Initialize capture stream if not already initialized
   void initialize_capture_stream(c10::DeviceIndex device_index);
 
-  // CUDA graph for capturing and replaying
+  // CUDA graph for capturing and replaying (decode mode)
   at::cuda::CUDAGraph graph_;
+  // Piecewise graphs for prefill mode
+  PiecewiseGraphs piecewise_graph_;
+  // Whether this graph uses piecewise capture
+  bool is_piecewise_ = false;
+
   uint32_t padded_num_tokens_;
 
   // Reference to persistent parameters (shared across multiple CudaGraph
@@ -256,8 +282,12 @@ class CudaGraphExecutorImpl : public ExecutorImpl {
   torch::Device device_;
   runtime::Options options_;
 
-  // Lazy-loaded CUDA graphs for different num_tokens
+  // Lazy-loaded CUDA graphs for decode phase (by bucket_num_tokens)
   absl::flat_hash_map<uint32_t, std::unique_ptr<CudaGraph>> graphs_;
+
+  // Lazy-loaded CUDA graphs for prefill phase with piecewise capture
+  // (by bucket_num_tokens)
+  absl::flat_hash_map<uint32_t, std::unique_ptr<CudaGraph>> prefill_graphs_;
 
   // Persistent parameters shared across all CudaGraph instances
   std::unique_ptr<CudaGraphPersistentParam> persistent_param_;
@@ -265,10 +295,15 @@ class CudaGraphExecutorImpl : public ExecutorImpl {
   // CUDA graph memory pool shared across all CudaGraph instances
   decltype(at::cuda::graph_pool_handle()) graph_pool_;
 
+  // Whether to enable prefill piecewise graph
+  bool enable_prefill_piecewise_graph_;
+
   // Get bucket num_tokens for given num_tokens
   // For num_tokens < 8: use 1, 2, 4, 8
   // For num_tokens >= 8: use multiples of 8
-  uint32_t get_bucket_num_tokens(uint32_t num_tokens) const;
+  // When is_prefill=true, no_padding is disabled (prefill requires padding)
+  uint32_t get_bucket_num_tokens(uint32_t num_tokens,
+                                 bool is_prefill = false) const;
 };
 REGISTER_EXECUTOR("cuda", CudaGraphExecutorImpl);
-}  // namespace xllm
+}  // namespace xllm::runtime::cuda

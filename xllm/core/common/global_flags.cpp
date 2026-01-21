@@ -101,6 +101,12 @@ DEFINE_bool(enable_graph_no_padding,
             "Whether to enable graph execution for decode phase without "
             "padding. If true, graph will be caputured with every actual num "
             "tokens, as stride is 1.");
+
+DEFINE_bool(enable_prefill_piecewise_graph,
+            false,
+            "Whether to enable piecewise CUDA graph for prefill phase. "
+            "When enabled, attention operations use eager mode while other "
+            "operations are captured in CUDA graphs.");
 // --- vlm config ---
 
 DEFINE_int32(limit_image_per_prompt,
@@ -514,6 +520,18 @@ DEFINE_int32(max_decode_rounds,
              "Maximum number of decode rounds for multi-step decoding. "
              "0 means disabled.");
 
+DEFINE_bool(enable_beam_search_optimized,
+            false,
+            "Enable optimized beam search without ordering overhead. "
+            "Removes argsort/gather and uses unsorted topk. "
+            "Only effective in rec backend with pure_device mode. "
+            "Expected 15-25% latency reduction.");
+
 DEFINE_int32(beam_width, 1, "Beam width for beam search.");
 
 DEFINE_int64(max_token_per_req, 1024, "Max token per request.");
+
+DEFINE_bool(enable_xattention_two_stage_decode,
+            false,
+            "Whether to enable two-stage decode in xattention (shared uses "
+            "batch_prefill, unshared uses batch_decode).");

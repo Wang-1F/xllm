@@ -102,6 +102,12 @@ void decoder_reshape_and_cache(torch::Tensor proj_k,
                                torch::Tensor block_table,
                                torch::Tensor step);
 
+void decoder_reshape_and_cache_simple(torch::Tensor proj_k,
+                                      torch::Tensor proj_v,
+                                      torch::Tensor unshared_k_cache,
+                                      torch::Tensor unshared_v_cache,
+                                      torch::Tensor step);
+
 void cache_select(const torch::Tensor& beam_index,
                   std::vector<torch::Tensor>& unshared_k_cache,
                   std::vector<torch::Tensor>& unshared_v_cache,
@@ -134,5 +140,20 @@ void beam_search(torch::Tensor acc_logprob,
                  torch::Tensor out_sequence_group,
                  uint32_t batch_size,
                  uint32_t current_step);
+
+void fused_qk_norm_rope(
+    torch::Tensor& qkv,       // Combined QKV tensor [num_tokens,
+                              // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    int64_t num_heads_q,      // Number of query heads
+    int64_t num_heads_k,      // Number of key heads
+    int64_t num_heads_v,      // Number of value heads
+    int64_t head_dim,         // Dimension per head
+    double eps,               // Epsilon for RMS normalization
+    torch::Tensor& q_weight,  // RMSNorm weights for query [head_dim]
+    torch::Tensor& k_weight,  // RMSNorm weights for key [head_dim]
+    torch::Tensor& cos_sin_cache,  // Cos/sin cache [max_position, rotary_dim]
+    bool interleaved,            // Whether RoPE is applied in interleaved style
+    torch::Tensor& position_ids  // Position IDs for RoPE [num_tokens]
+);
 
 }  // namespace xllm::kernel::cuda

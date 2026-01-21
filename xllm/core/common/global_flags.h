@@ -89,6 +89,8 @@ DECLARE_bool(enable_graph);
 
 DECLARE_bool(enable_graph_no_padding);
 
+DECLARE_bool(enable_prefill_piecewise_graph);
+
 DECLARE_int32(max_seq_len_for_graph_mode);
 
 DECLARE_bool(enable_chunked_prefill);
@@ -247,11 +249,15 @@ DECLARE_bool(enable_constrained_decoding);
 
 DECLARE_int32(max_decode_rounds);
 
+DECLARE_bool(enable_beam_search_optimized);
+
 DECLARE_int32(beam_width);
 
 DECLARE_int64(max_token_per_req);
 
 DECLARE_uint32(rec_worker_max_concurrency);
+
+DECLARE_bool(enable_xattention_two_stage_decode);
 
 #if defined(USE_NPU)
 DECLARE_string(npu_kernel_backend);
