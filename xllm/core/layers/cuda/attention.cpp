@@ -258,29 +258,57 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> AttentionImpl::forward(
           // 6. 配置 AttentionParams
           xllm::kernel::AttentionParams shared_attention_params;
           shared_attention_params.query = query_reshaped;
+          LOG(INFO) << "query_reshaped.shape: " << query_reshaped.sizes();
           shared_attention_params.key = shared_k_cache_packed;
+          LOG(INFO) << "shared_k_cache_packed.shape: "
+                    << shared_k_cache_packed.sizes();
           shared_attention_params.value = shared_v_cache_packed;
+          LOG(INFO) << "shared_v_cache_packed.shape: "
+                    << shared_v_cache_packed.sizes();
           shared_attention_params.q_cu_seq_lens = q_cu_seq_lens;
+          LOG(INFO) << "q_cu_seq_lens.shape: " << q_cu_seq_lens.sizes();
           shared_attention_params.kv_cu_seq_lens = kv_cu_seq_lens;
+          LOG(INFO) << "kv_cu_seq_lens.shape: " << kv_cu_seq_lens.sizes();
           shared_attention_params.output =
               shared_o.view({batch_size * beam_size, num_heads_, head_size_})
                   .contiguous();
+          LOG(INFO) << "shared_attention_params.output.shape: "
+                    << shared_attention_params.output.sizes();
           shared_attention_params.output_lse =
               shared_lse.view({batch_size * beam_size, num_heads_, 1})
                   .contiguous();
+          LOG(INFO) << "shared_attention_params.output_lse.shape: "
+                    << shared_attention_params.output_lse.value().sizes();
           shared_attention_params.return_lse = true;
           shared_attention_params.window_size_left = sliding_window_;
+          LOG(INFO) << "shared_attention_params.window_size_left: "
+                    << sliding_window_;
           shared_attention_params.scale = scale_;
+          LOG(INFO) << "shared_attention_params.scale: " << scale_;
           shared_attention_params.compute_dtype = attn_metadata.compute_dtype;
+          LOG(INFO) << "shared_attention_params.compute_dtype: "
+                    << attn_metadata.compute_dtype;
           // for flashinfer
           shared_attention_params.float_workspace_buffer =
               FlashinferWorkspace::get_instance().get_float_workspace_buffer();
+          LOG(INFO) << "shared_attention_params.float_workspace_buffer.shape: "
+                    << FlashinferWorkspace::get_instance()
+                           .get_float_workspace_buffer()
+                           .sizes();
           shared_attention_params.int_workspace_buffer =
               FlashinferWorkspace::get_instance().get_int_workspace_buffer();
+          LOG(INFO) << "shared_attention_params.int_workspace_buffer.shape: "
+                    << FlashinferWorkspace::get_instance()
+                           .get_int_workspace_buffer()
+                           .sizes();
           shared_attention_params.page_locked_int_workspace_buffer =
               FlashinferWorkspace::get_instance()
                   .get_page_locked_int_workspace_buffer();
-
+          LOG(INFO) << "shared_attention_params.page_locked_int_workspace_"
+                       "buffer.shape: "
+                    << FlashinferWorkspace::get_instance()
+                           .get_page_locked_int_workspace_buffer()
+                           .sizes();
           // 7. 调用 batch_prefill
           xllm::kernel::batch_prefill(shared_attention_params);
           // LOG(INFO) << "improved_fa_decode shared_o: " << shared_o;

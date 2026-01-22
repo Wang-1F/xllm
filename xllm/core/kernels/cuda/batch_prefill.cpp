@@ -57,6 +57,7 @@ void batch_prefill(torch::Tensor float_workspace_buffer,
                                 /*use_sliding_window=*/false,
                                 /*use_logits_soft_cap=*/false,
                                 /*use_fp16_qk_reduction=*/false);
+    LOG(INFO) << "uri: " << uri;
   }
 
   torch::Tensor qo_indptr_host;
@@ -107,6 +108,12 @@ void batch_prefill(torch::Tensor float_workspace_buffer,
             query.size(-1),  // head_dim_qk
             value.size(-1),  // head_dim_vo
             /*causal=*/false);
+    LOG(INFO) << "qo_indptr_host: " << qo_indptr_host;
+    LOG(INFO) << "kv_cu_seq_lens_host: " << kv_cu_seq_lens_host;
+    LOG(INFO) << "kv_len_arr_host: " << kv_len_arr_host;
+    LOG(INFO) << "total_num_rows: " << total_num_rows;
+    LOG(INFO) << "batch_size: " << batch_size;
+
     // Only print debug logs for decode shared calls
     // LOG(INFO) << "float_workspace_buffer.shape: " <<
     // float_workspace_buffer.sizes(); LOG(INFO) << "int_workspace_buffer.shape:
@@ -236,6 +243,8 @@ void batch_prefill(torch::Tensor float_workspace_buffer,
             /*logits_soft_cap=*/0.0,
             sm_scale,
             /*token_pos_in_items_len=*/0);
+        LOG(INFO) << "q_cu_seq_lens: " << q_cu_seq_lens;
+        LOG(INFO) << "kv_cu_seq_lens: " << kv_cu_seq_lens;
       }
     }
   }
