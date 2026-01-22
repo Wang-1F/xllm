@@ -73,6 +73,7 @@ LLMEngine::LLMEngine(const runtime::Options& options,
 
   dp_size_ = options_.dp_size();
   worker_clients_num_ = worker_clients_.size();
+  LOG(INFO) << "worker_clients_num_: " << worker_clients_num_;
   dp_local_tp_size_ = worker_clients_num_ / dp_size_;
 
   // create ThreadPool for link cluster
@@ -140,21 +141,28 @@ bool LLMEngine::init_model() {
 
   tokenizer_ = model_loader->tokenizer();
   CHECK(tokenizer_ != nullptr);
-
+  LOG(INFO) << "before args_";
   args_ = model_loader->model_args();
   quant_args_ = model_loader->quant_args();
   tokenizer_args_ = model_loader->tokenizer_args();
-
+  LOG(INFO) << "after args_";
   // compute the number of local kv heads and head dim
   const int world_size = dp_size_ > 1 ? (dp_local_tp_size_)
                                       : static_cast<int>(worker_clients_num_);
+  LOG(INFO) << "after world_size";
   const int64_t n_heads = args_.n_heads();
+  LOG(INFO) << "before n_kv_heads";
   const int64_t n_kv_heads = args_.n_kv_heads().value_or(n_heads);
+  LOG(INFO) << "before n_local_kv_heads_";
+  LOG(INFO) << "world_size: " << world_size;
   n_local_kv_heads_ = std::max<int64_t>(1, n_kv_heads / world_size);
+  LOG(INFO) << "after n_local_q_heads_";
   n_local_q_heads_ = std::max<int64_t>(1, n_heads / world_size);
+  LOG(INFO) << "after n_local_kv_heads_";
   head_dim_ = args_.head_dim();
+  LOG(INFO) << "after head_dim_";
   dtype_ = util::parse_dtype(args_.dtype(), options_.devices()[0]);
-
+  LOG(INFO) << "after dtype_";
   // key + value for all layers
   LOG(INFO) << "Block info, block_size: " << options_.block_size()
             << ", n_local_kv_heads: " << n_local_kv_heads_
@@ -313,16 +321,18 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
         kv_cache_cap.n_blocks, block_size, 1, args_.qk_rope_head_dim()});
   } else {
     if (FLAGS_max_decode_rounds > 0) {
-      kv_cache_shape.emplace_back(std::vector<int64_t>{kv_cache_cap.n_blocks,
-                                                       block_size,
-                                                       FLAGS_max_decode_rounds - 1,
-                                                       n_local_kv_heads_,
-                                                       head_dim_});
-      kv_cache_shape.emplace_back(std::vector<int64_t>{kv_cache_cap.n_blocks,
-                                                       block_size,
-                                                       FLAGS_max_decode_rounds - 1,
-                                                       n_local_kv_heads_,
-                                                       head_dim_});
+      kv_cache_shape.emplace_back(
+          std::vector<int64_t>{kv_cache_cap.n_blocks,
+                               block_size,
+                               FLAGS_max_decode_rounds - 1,
+                               n_local_kv_heads_,
+                               head_dim_});
+      kv_cache_shape.emplace_back(
+          std::vector<int64_t>{kv_cache_cap.n_blocks,
+                               block_size,
+                               FLAGS_max_decode_rounds - 1,
+                               n_local_kv_heads_,
+                               head_dim_});
     } else {
       kv_cache_shape.emplace_back(std::vector<int64_t>{
           kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});

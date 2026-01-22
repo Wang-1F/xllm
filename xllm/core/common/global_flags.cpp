@@ -480,6 +480,16 @@ DEFINE_bool(enable_constrained_decoding,
             "that the output meets specific format or structural requirements "
             "through pre-defined rules.");
 
+DEFINE_bool(
+    enable_fa_decode,
+    false,
+    "Whether to use batch_prefill for shared attention in decode mode.");
+
+DEFINE_bool(enable_improved_fa,
+            false,
+            "Whether to use improved batch_prefill for shared attention in "
+            "decode mode (optimized version without expand).");
+
 #if defined(USE_NPU)
 DEFINE_string(
     npu_kernel_backend,
