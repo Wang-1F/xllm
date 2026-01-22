@@ -51,33 +51,40 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
   torch::Tensor v_cache = kv_cache.get_v_cache();
 
   if (attn_metadata.is_prefill) {
-    CHECK(!attn_metadata.is_chunked_prefill)
-        << "chunked prefill is not supported";
+    if (attn_metadata.enable_cuda_graph) {
+      CHECK(attn_metadata.plan_info->plan_info.defined())
+          << "plan_info plan_info should not be null when enable_cuda_graph is "
+             "true";
+      VLOG(50) << "no need to update plan_info for CUDA graph";
+    } else {
+      CHECK(!attn_metadata.is_chunked_prefill)
+          << "chunked prefill is not supported";
 
-    // maybe we need to update shared attn state before execute attention,
-    // currently we update flashinfer step_wise_attn_state_ at layer 0.
-    bool causal = attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
-    flashinfer::update_plan_info(
-        attn_metadata.plan_info,
-        causal ? xllm::kernel::cuda::determine_attention_backend(
-                     /*pos_encoding_mode=*/0,
-                     /*use_fp16_qk_reduction=*/false,
-                     /*use_custom_mask=*/false)
-               : "fa2",
-        attn_metadata,
-        query.scalar_type(),
-        key.scalar_type(),
-        output_tensor.scalar_type(),
-        head_size_,
-        head_size_,
-        num_heads_,
-        num_kv_heads_,
-        /*block_size*/ k_cache.size(1),
-        /*window_size_left*/ sliding_window_,
-        /*enable_cuda_graph*/ false,
-        /*causal*/ causal,
-        /*use_tensor_core*/ true);
-
+      // maybe we need to update shared attn state before execute attention,
+      // currently we update flashinfer step_wise_attn_state_ at layer 0.
+      bool causal =
+          attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
+      flashinfer::update_plan_info(
+          attn_metadata.plan_info,
+          causal ? xllm::kernel::cuda::determine_attention_backend(
+                       /*pos_encoding_mode=*/0,
+                       /*use_fp16_qk_reduction=*/false,
+                       /*use_custom_mask=*/false)
+                 : "fa2",
+          attn_metadata,
+          query.scalar_type(),
+          key.scalar_type(),
+          output_tensor.scalar_type(),
+          head_size_,
+          head_size_,
+          num_heads_,
+          num_kv_heads_,
+          /*block_size*/ k_cache.size(1),
+          /*window_size_left*/ sliding_window_,
+          /*enable_cuda_graph*/ false,
+          /*causal*/ causal,
+          /*use_tensor_core*/ true);
+    }
     xllm::kernel::cuda::prefill_reshape_and_cache(
         key, value, attn_metadata.full_k_cache, attn_metadata.full_v_cache);
     xllm::kernel::AttentionParams attention_params(attn_metadata);
@@ -104,17 +111,16 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
     uint32_t total_beam = query.size(0);
     uint32_t beam_size = total_beam / batch_size;
 
-    // [batch_size * beam_size * max_decode_step, num_kv_heads_, head_size_]
-    key = key.view({batch_size, beam_size, num_kv_heads_, head_size_})
-              .contiguous();
-    value = value.view({batch_size, beam_size, num_kv_heads_, head_size_})
-                .contiguous();
-    xllm::kernel::cuda::decoder_reshape_and_cache(
+    // View proj_k/proj_v to [T, kv_heads, head_dim] where T = batch_size *
+    // beam_size
+    key = key.view({batch_size, beam_size, num_kv_heads_, head_size_});
+    value = value.view({batch_size, beam_size, num_kv_heads_, head_size_});
+
+    xllm::kernel::cuda::decoder_reshape_and_cache_simple(
         key,
         value,
         attn_metadata.unshared_k_cache,
         attn_metadata.unshared_v_cache,
-        attn_metadata.naive_block_table,
         attn_metadata.step);
 
     torch::Tensor full_k_cache = attn_metadata.full_k_cache.unsqueeze(1);

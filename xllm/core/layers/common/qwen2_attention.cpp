@@ -20,6 +20,9 @@ limitations under the License.
 #include <tuple>
 
 #include "core/common/rec_model_utils.h"
+#if defined(USE_CUDA)
+#include "kernels/cuda/cuda_ops_api.h"
+#endif
 
 namespace {
 inline bool is_qwen3_model(const std::string& model_type) {
@@ -137,19 +140,69 @@ torch::Tensor Qwen2AttentionImpl::forward(
 
   torch::Tensor q, k;
   if (is_qwen3_style_) {
+    // Fused q/k norm + rope kernel is temporarily disabled due to precision
+    // concerns. The fused implementation showed slight numerical differences
+    // compared to the separated operations, so we fall back to the step-by-step
+    // approach for now.
+    //
+    // TODO: Revisit the fused kernel implementation and fix precision issues
+    // before re-enabling.
+    // #if defined(USE_CUDA)
+    //     auto q_weight = q_norm_->weight();
+    //     auto k_weight = k_norm_->weight();
+    //     auto eps = q_norm_->eps();
+    //     auto cos_sin_cache = rotary_emb_->get_cuda_cos_sin_cache();
+    //     torch::Tensor position_ids;
+    //     if (positions.dim() == 2) {
+    //       if (positions[0].dtype() == torch::kInt32) {
+    //         position_ids = positions[0];
+    //       } else {
+    //         VLOG(20) << "positions[0].dtype() != torch::kInt32, converting to
+    //         "
+    //                     "torch::kInt32";
+    //         position_ids = positions[0].to(torch::kInt32);
+    //       }
+    //     } else {
+    //       if (positions.dtype() == torch::kInt32) {
+    //         position_ids = positions;
+    //       } else {
+    //         VLOG(20) << "positions.dtype() != torch::kInt32, converting to "
+    //                     "torch::kInt32";
+    //         position_ids = positions.to(torch::kInt32);
+    //       }
+    //     }
+    //     xllm::kernel::cuda::fused_qk_norm_rope(qkv,
+    //                                            num_heads_,
+    //                                            num_kv_heads_,
+    //                                            num_kv_heads_,
+    //                                            head_dim_,
+    //                                            eps,
+    //                                            q_weight,
+    //                                            k_weight,
+    //                                            cos_sin_cache,
+    //                                            false,
+    //                                            position_ids);
+    //     q = qkv.slice(/*dim=*/-1, 0, q_size_);
+    //     k = qkv.slice(/*dim=*/-1, q_size_, q_size_ + kv_size_);
+    // #else
     // 2. q-norm
     q = std::get<0>(q_norm_->forward(sliced_q));
 
     // 3. k-norm
     k = std::get<0>(k_norm_->forward(sliced_k));
+    // 4. rope
+    rotary_emb_->forward(q, k, positions, attn_metadata);
+    // #endif
   } else {
     // Qwen2 does not use q/k norm, use sliced tensors directly
     q = sliced_q;
     k = sliced_k;
   }
 
+#if !defined(USE_CUDA)
   // 4. rope
   rotary_emb_->forward(q, k, positions, attn_metadata);
+#endif
   q = q.view({T, q_size_});
   k = k.view({T, kv_size_});
 
