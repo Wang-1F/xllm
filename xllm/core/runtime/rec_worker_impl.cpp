@@ -25,9 +25,14 @@ limitations under the License.
 #include <vector>
 
 #include "common/device_monitor.h"
+#include "common/global_flags.h"
 #include "common/metrics.h"
 #include "common/types.h"
 #include "framework/model/model_input_params.h"
+#if defined(USE_CUDA)
+#include "kernels/cuda/cuda_ops_api.h"
+#include "platform/cuda/device_capture_lock.h"
+#endif
 #include "framework/model_loader.h"
 #include "models/model_registry.h"
 #include "util/env_var.h"
@@ -51,8 +56,8 @@ void RecWorkerImpl::LlmRecWorkPipeline::prepare_work_before_execute(
     const ForwardInput& inputs,
     ForwardInput& processed_inputs) {
   worker_.WorkerImpl::prepare_work_before_execute(inputs, processed_inputs);
-  // LlmRecDefault (pure qwen3) does not process mm_data.
-  // For mm_data processing, use LlmRecWithMmDataWorkPipeline.
+
+  worker_.prepare_multi_modal_data(processed_inputs);
 }
 
 std::optional<ForwardOutput> RecWorkerImpl::LlmRecWorkPipeline::step(
@@ -185,96 +190,577 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
   return output;
 }
 
-// ============================================================
-// LlmRecWithMmDataWorkPipeline Implementation (qwen3 with embedding)
-// ============================================================
-
-RecWorkerImpl::LlmRecWithMmDataWorkPipeline::LlmRecWithMmDataWorkPipeline(
+RecWorkerImpl::LlmRecPureDevicePipeline::LlmRecPureDevicePipeline(
     RecWorkerImpl& worker)
-    : worker_(worker) {}
+    : worker_(worker) {
+  full_kv_cache_offsets_ = std::make_unique<FullKvCacheOffsets>(this);
+  allocate_kv_caches_related();
+}
 
-bool RecWorkerImpl::LlmRecWithMmDataWorkPipeline::create_model(
+bool RecWorkerImpl::LlmRecPureDevicePipeline::create_model(
     RecWorkerImpl& worker,
     ModelContext& context) {
   return worker.LLMWorkerImpl::init_model(context);
 }
 
-ForwardInput RecWorkerImpl::LlmRecWithMmDataWorkPipeline::prepare_inputs(
+ForwardInput RecWorkerImpl::LlmRecPureDevicePipeline::prepare_inputs(
     Batch& batch) {
-  return worker_.WorkerImpl::prepare_inputs(batch);
+  ThreadPool* thread_pool = worker_.input_builder_thread_pool_
+                                ? worker_.input_builder_thread_pool_.get()
+                                : nullptr;
+
+  return batch.prepare_rec_forward_input(worker_.options_.num_decoding_tokens(),
+                                         /*min_decoding_batch_size=*/0,
+                                         worker_.context_.get_model_args(),
+                                         thread_pool);
 }
 
-void RecWorkerImpl::LlmRecWithMmDataWorkPipeline::prepare_work_before_execute(
+void RecWorkerImpl::LlmRecPureDevicePipeline::prepare_work_before_execute(
     const ForwardInput& inputs,
     ForwardInput& processed_inputs) {
   worker_.WorkerImpl::prepare_work_before_execute(inputs, processed_inputs);
 
-  if (!inputs.input_params.mm_data.valid()) {
-    return;
-  }
+  worker_.prepare_multi_modal_data(processed_inputs);
 
-  torch::Tensor input_embedding;
-  torch::Tensor input_tokens_tensor;
-  torch::Tensor input_indices_tensor;
-
-  const auto& mm_data = inputs.input_params.mm_data;
-  const auto& processed_mm_data = processed_inputs.input_params.mm_data;
-
-  if (auto res = processed_mm_data.get<torch::Tensor>(LLM_REC_INPUT_TOKENS)) {
-    input_tokens_tensor = res.value();
-  }
-
-  // Input indices are generated on host side.
-  if (auto res = mm_data.get<torch::Tensor>(LLM_REC_INPUT_INDICES)) {
-    input_indices_tensor = res.value();
-  }
-
-  if (auto res =
-          processed_mm_data.get<torch::Tensor>(LLM_REC_INPUT_EMBEDDING)) {
-    input_embedding = res.value();
-  }
-
-  if (input_embedding.defined()) {
-    input_embedding = input_embedding.to(worker_.dtype());
-  }
-
-  if (input_indices_tensor.defined()) {
-    CHECK(input_tokens_tensor.defined())
-        << "LLM_REC_INPUT_TOKENS is required when LLM_REC_INPUT_INDICES is "
-           "set.";
-
-#if defined(USE_NPU)
-    layer::NpuWordEmbedding npu_word_embedding =
-        worker_.get_npu_word_embedding();
-    torch::Tensor input_tokens_embedding =
-        npu_word_embedding(input_tokens_tensor, 0);
-#else
-    layer::WordEmbedding word_embedding = worker_.get_word_embedding();
-    torch::Tensor input_tokens_embedding =
-        word_embedding->forward(input_tokens_tensor);
+#if defined(USE_NPU) || defined(USE_CUDA)
+  prepare_kv_caches_related_for_input(inputs, processed_inputs);
 #endif
+}
 
-    if (input_embedding.defined()) {
-      torch::Tensor input_indices_cpu =
-          input_indices_tensor.to(torch::kCPU).to(torch::kInt64).contiguous();
-      const auto* input_indices_ptr = input_indices_cpu.data_ptr<int64_t>();
-      std::vector<int64_t> input_indices(
-          input_indices_ptr, input_indices_ptr + input_indices_cpu.numel());
+void RecWorkerImpl::LlmRecPureDevicePipeline::allocate_kv_caches_related() {
+  auto dtype = worker_.dtype();
+  auto device = worker_.device();
+  auto kv_cache_options = torch::TensorOptions().dtype(dtype).device(device);
+  auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  int32_t num_layers = worker_.context_.get_model_args().n_layers();
 
-      processed_inputs.input_params.input_embedding =
-          worker_.merge_embeddings_by_indices(
-              input_tokens_embedding, input_embedding, input_indices);
-    } else {
-      processed_inputs.input_params.input_embedding = input_tokens_embedding;
+  int32_t full_kv_len =
+      max_tokens_per_batch_ +
+      max_seqs_per_batch_ * beam_width_ * (get_pure_device_decode_rounds() - 1);
+  int64_t num_kv_heads =
+      worker_.context_.get_model_args().n_kv_heads().value_or(
+          worker_.context_.get_model_args().n_heads());
+  int64_t head_dim = worker_.context_.get_model_args().head_dim();
+
+  cached_full_k_caches_.resize(num_layers);
+  cached_full_v_caches_.resize(num_layers);
+
+  for (int32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+    auto target_layer_full_k_cache =
+        torch::zeros({full_kv_len, num_kv_heads, head_dim}, kv_cache_options);
+    auto target_layer_full_v_cache =
+        torch::zeros({full_kv_len, num_kv_heads, head_dim}, kv_cache_options);
+
+    cached_full_k_caches_[layer_id] = target_layer_full_k_cache;
+    cached_full_v_caches_[layer_id] = target_layer_full_v_cache;
+  }
+
+  cached_naive_block_table_ =
+      torch::arange(max_seqs_per_batch_, int_options).unsqueeze(1);
+  cached_current_round_tensor_ = torch::zeros({1}, int_options);
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::
+    prepare_kv_caches_related_for_input(const ForwardInput& inputs,
+                                        ForwardInput& processed_inputs) {
+  auto device = worker_.device();
+  auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto& input_params = processed_inputs.input_params;
+  auto& llm_rec_params = input_params.llm_rec_pure_device_params;
+
+  int32_t batch_size = inputs.input_params.paged_kv_last_page_len.numel();
+  int32_t beam_width = inputs.beam_width;
+  int32_t total_round = inputs.total_round;
+  const auto& shape = inputs.full_kv_shape;
+  CHECK(shape.size() == 3) << "the dims of full_kv_shape should be three.";
+  int32_t full_kv_len = shape[0];
+  int64_t num_kv_heads = shape[1];
+  int64_t head_dim = shape[2];
+  int32_t num_layers = worker_.context_.get_model_args().n_layers();
+  int32_t max_decode_step = total_round - 1;
+  int32_t unshared_offset = max_tokens_per_batch_;
+
+  if (!cached_full_k_caches_.empty() && cached_full_k_caches_[0].defined()) {
+    llm_rec_params.full_k_caches.reserve(num_layers);
+    llm_rec_params.full_v_caches.reserve(num_layers);
+    llm_rec_params.unshared_k_caches.reserve(num_layers);
+    llm_rec_params.unshared_v_caches.reserve(num_layers);
+
+    for (int32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      auto layer_full_k_cache = cached_full_k_caches_[layer_id];
+      auto layer_full_v_cache = cached_full_v_caches_[layer_id];
+
+      auto layer_unshared_k_cache =
+          layer_full_k_cache.slice(0, unshared_offset, full_kv_len);
+      auto layer_unshared_v_cache =
+          layer_full_v_cache.slice(0, unshared_offset, full_kv_len);
+
+      layer_unshared_k_cache =
+          layer_unshared_k_cache
+              .view({static_cast<int64_t>(max_seqs_per_batch_),
+                     static_cast<int64_t>(beam_width),
+                     static_cast<int64_t>(max_decode_step),
+                     num_kv_heads,
+                     head_dim})
+              .slice(0, 0, batch_size);
+      layer_unshared_v_cache =
+          layer_unshared_v_cache
+              .view({static_cast<int64_t>(max_seqs_per_batch_),
+                     static_cast<int64_t>(beam_width),
+                     static_cast<int64_t>(max_decode_step),
+                     num_kv_heads,
+                     head_dim})
+              .slice(0, 0, batch_size);
+
+      llm_rec_params.full_k_caches.emplace_back(layer_full_k_cache);
+      llm_rec_params.full_v_caches.emplace_back(layer_full_v_cache);
+      llm_rec_params.unshared_k_caches.emplace_back(layer_unshared_k_cache);
+      llm_rec_params.unshared_v_caches.emplace_back(layer_unshared_v_cache);
     }
-  } else if (input_embedding.defined()) {
-    processed_inputs.input_params.input_embedding = input_embedding;
+  }
+
+  input_params.block_tables = cached_naive_block_table_.slice(0, 0, batch_size);
+
+  const auto& decode_positions = processed_inputs.decode_positions_vec;
+  llm_rec_params.decode_positions_tensor_list.clear();
+  if (!decode_positions.empty() && beam_width > 0 && total_round > 1) {
+    const int32_t num_sequences = static_cast<int32_t>(decode_positions.size());
+    for (int32_t round_idx = 0; round_idx < total_round - 1; ++round_idx) {
+      std::vector<int32_t> position_buffer;
+      position_buffer.reserve(static_cast<size_t>(num_sequences * beam_width));
+      for (int32_t seq_idx = 0; seq_idx < num_sequences; ++seq_idx) {
+        const int32_t base_position = decode_positions[seq_idx] + round_idx;
+        for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
+          position_buffer.push_back(base_position);
+        }
+      }
+      llm_rec_params.decode_positions_tensor_list.push_back(
+          torch::tensor(position_buffer, int_options));
+    }
   }
 }
 
-std::optional<ForwardOutput> RecWorkerImpl::LlmRecWithMmDataWorkPipeline::step(
+std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
     const ForwardInput& input) {
-  return worker_.LLMWorkerImpl::step(input);
+  Timer timer;
+  auto device = worker_.device_;
+  device.set_device();
+
+  ForwardInput& mutable_input = const_cast<ForwardInput&>(input);
+
+  int32_t total_rounds = mutable_input.total_round;
+  int32_t max_decode_step = total_rounds - 1;
+  int32_t batch_size =
+      mutable_input.input_params.paged_kv_last_page_len.numel();
+  int32_t beam_width = mutable_input.beam_width;
+  int32_t num_layers =
+      static_cast<int32_t>(worker_.context_.get_model_args().n_layers());
+
+  auto paged_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
+  CHECK_GT(worker_.kv_caches_.size(), 0) << "KV caches are not initialized.";
+
+  BeamSearchTensors beam_tensors =
+      prepare_beam_search_tensors(batch_size, beam_width, total_rounds, device);
+
+  auto& llm_rec_params = mutable_input.input_params.llm_rec_pure_device_params;
+  llm_rec_params.beam_width = beam_width;
+
+  ForwardOutput output;
+  torch::Tensor logits;
+  SampleOutput sample_output;
+  torch::Tensor top_tokens;
+  std::optional<folly::SemiFuture<NextRoundInputResults>>
+      next_round_async_result;
+
+  for (int32_t round = 0; round < total_rounds; ++round) {
+    const auto& sampling_params = round > 0
+                                      ? mutable_input.decoder_sampling_params
+                                      : mutable_input.sampling_params;
+    mutable_input.input_params.is_prefill = round == 0;
+    mutable_input.input_params.attn_metadata = nullptr;
+    cached_current_round_tensor_.fill_(round - 1);
+    llm_rec_params.current_round_tensor = cached_current_round_tensor_;
+
+    // Consume async result for current round and schedule next round's async
+    // computation.
+    prepare_round_input_and_schedule_next(mutable_input,
+                                          round,
+                                          total_rounds,
+                                          batch_size,
+                                          beam_width,
+                                          max_decode_step,
+                                          paged_options,
+                                          top_tokens,
+                                          beam_tensors,
+                                          next_round_async_result);
+
+    torch::Tensor hidden_states;
+    hidden_states =
+        worker_.model_executor_->forward(mutable_input.token_ids,
+                                         mutable_input.positions,
+                                         worker_.kv_caches_,
+                                         mutable_input.input_params);
+
+    if (!hidden_states.defined()) {
+      return std::nullopt;
+    }
+
+    if (sampling_params.selected_token_idxes.defined()) {
+      logits = worker_.model_->logits(hidden_states,
+                                      sampling_params.selected_token_idxes);
+      sample_output = worker_.sampler_->forward(logits, sampling_params);
+      top_tokens = sample_output.top_tokens.to(torch::kInt32)
+                       .reshape({-1, mutable_input.beam_width});
+    }
+
+    if (sample_output.top_tokens.defined()) {
+      torch::Tensor top_logprobs =
+          sample_output.top_logprobs.reshape({-1, beam_width});
+      execute_beam_search(
+          top_tokens, top_logprobs, beam_tensors, round, batch_size);
+
+      beam_tensors.sequence_group.copy_(beam_tensors.out_seqgroup,
+                                        /*non-blocking=*/true);
+      beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
+                                     /*non-blocking=*/true);
+
+      if (round > 0 && round < total_rounds - 1) {
+        execute_cache_select(
+            beam_tensors, mutable_input, round, beam_width, num_layers);
+      }
+
+      if (round == total_rounds - 1) {
+        build_final_output(
+            logits, sample_output, sampling_params, beam_tensors, output);
+      }
+    }
+  }
+
+  device.synchronize_default_stream();
+
+  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
+  DeviceMonitor::get_instance().update_active_activation_memory(device.index());
+  return output;
+}
+
+RecWorkerImpl::LlmRecPureDevicePipeline::BeamSearchTensors
+RecWorkerImpl::LlmRecPureDevicePipeline::prepare_beam_search_tensors(
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t total_rounds,
+    const torch::Device& device) {
+  auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto fp32_options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+
+  BeamSearchTensors tensors;
+  tensors.sequence_group =
+      torch::zeros({batch_size, beam_width, total_rounds}, int_options);
+  int64_t num_seq = batch_size * beam_width;
+  tensors.acc_logprob = torch::zeros({num_seq, 1}, fp32_options);
+  tensors.out_log_probs = torch::zeros({num_seq, 1}, fp32_options);
+  tensors.out_token_ids = torch::zeros({num_seq, 1}, int_options);
+  tensors.out_token_index = torch::zeros({num_seq, 1}, int_options);
+  tensors.out_beam_count_prefix_sums = torch::zeros({num_seq, 1}, int_options);
+  tensors.out_seqgroup = torch::zeros_like(tensors.sequence_group);
+  return tensors;
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::execute_beam_search(
+    const torch::Tensor& top_tokens,
+    const torch::Tensor& top_logprobs,
+    BeamSearchTensors& beam_tensors,
+    int32_t round,
+    int32_t batch_size) {
+#if defined(USE_NPU)
+// TODO: implement beam search for NPU
+#elif defined(USE_CUDA)
+  xllm::kernel::cuda::beam_search(beam_tensors.acc_logprob,
+                                  beam_tensors.sequence_group,
+                                  top_tokens,
+                                  top_logprobs,
+                                  beam_tensors.out_log_probs,
+                                  beam_tensors.out_token_ids,
+                                  beam_tensors.out_token_index,
+                                  beam_tensors.out_beam_count_prefix_sums,
+                                  beam_tensors.out_seqgroup,
+                                  batch_size,
+                                  round);
+#endif
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::execute_cache_select(
+    const BeamSearchTensors& beam_tensors,
+    ForwardInput& input,
+    int32_t round,
+    int32_t beam_width,
+    int32_t num_layers) {
+#if defined(USE_NPU)
+// TODO: implement cache select for NPU
+#elif defined(USE_CUDA)
+  xllm::kernel::cuda::cache_select(
+      beam_tensors.out_token_index,
+      input.input_params.llm_rec_pure_device_params.unshared_k_caches,
+      input.input_params.llm_rec_pure_device_params.unshared_v_caches,
+      input.input_params.block_tables,
+      round - 1,
+      beam_width,
+      num_layers);
+#endif
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::build_final_output(
+    const torch::Tensor& logits,
+    const SampleOutput& sample_output,
+    const SamplingParameters& sampling_params,
+    const BeamSearchTensors& beam_tensors,
+    ForwardOutput& output) {
+  output.logits = logits;
+  output.sample_output = sample_output;
+  output.do_sample = sampling_params.do_sample;
+  output.logprobs = sampling_params.logprobs;
+  output.max_top_logprobs = sampling_params.max_top_logprobs;
+  output.beam_search_output.src_seq_idxes =
+      beam_tensors.out_token_index.reshape({-1});
+  output.beam_search_output.out_tokens =
+      beam_tensors.out_token_ids.reshape({-1});
+  output.beam_search_output.out_logprobs =
+      beam_tensors.out_log_probs.reshape({-1});
+  output.beam_sequence_group = beam_tensors.sequence_group;
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::prepare_input_for_current_round(
+    ForwardInput& input,
+    const NextRoundInputResults& results,
+    int32_t round,
+    const torch::Tensor& top_tokens,
+    const BeamSearchTensors& beam_tensors) {
+#if defined(USE_NPU)
+// TODO: implement prepare_input_for_current_round for NPU
+#elif defined(USE_CUDA)
+  input.input_params.paged_kv_indices = results.paged_kv_indices;
+  input.input_params.paged_kv_indptr = results.paged_kv_indptr;
+  input.input_params.paged_kv_last_page_len = results.paged_kv_last_page_len;
+  input.input_params.num_sequences =
+      input.input_params.paged_kv_last_page_len.numel();
+#endif
+  // previous_step corresponds to the decode step that produced tokens for
+  // this round.
+  const int32_t previous_step = round - 1;
+  if (previous_step == 0) {
+    // First decode step uses top_tokens from prefill.
+    if (top_tokens.defined()) {
+      input.token_ids = top_tokens.reshape({-1});
+    }
+  } else if (previous_step > 0) {
+    // Later steps use beam search output tokens.
+    input.token_ids = beam_tensors.out_token_ids.reshape({-1});
+  }
+
+  auto& llm_rec_params = input.input_params.llm_rec_pure_device_params;
+  if (!llm_rec_params.decode_positions_tensor_list.empty() &&
+      previous_step >= 0 &&
+      previous_step < static_cast<int32_t>(
+                          llm_rec_params.decode_positions_tensor_list.size())) {
+    input.positions =
+        llm_rec_params.decode_positions_tensor_list[previous_step];
+  }
+
+  // Mark as decode batch and clear explicit input embedding (reuse
+  // token_ids).
+  input.input_params.batch_forward_type = BatchForwardType(2);
+  input.input_params.input_embedding = torch::Tensor();
+}
+
+void RecWorkerImpl::LlmRecPureDevicePipeline::
+    prepare_round_input_and_schedule_next(
+        ForwardInput& input,
+        int32_t round,
+        int32_t total_rounds,
+        int32_t batch_size,
+        int32_t beam_width,
+        int32_t max_decode_step,
+        const torch::TensorOptions& paged_options,
+        const torch::Tensor& top_tokens,
+        const BeamSearchTensors& beam_tensors,
+        std::optional<folly::SemiFuture<NextRoundInputResults>>&
+            next_round_async_result) {
+  // Phase A: consume async result for the current round (prepared in last
+  // round).
+  if (next_round_async_result.has_value()) {
+    // Block only here to wait for CPU-side paged KV computation.
+    auto results = std::move(next_round_async_result.value()).get();
+    prepare_input_for_current_round(
+        input, results, round, top_tokens, beam_tensors);
+
+    // Ensure this future is not consumed twice.
+    next_round_async_result.reset();
+  }
+
+  // Phase B: schedule async computation for the next round, if any.
+  if (round < total_rounds - 1) {
+    next_round_async_result =
+        compute_next_round_input_async(input.input_params.kv_seq_lens,
+                                       round,
+                                       batch_size,
+                                       beam_width,
+                                       max_decode_step,
+                                       paged_options);
+  }
+}
+
+folly::SemiFuture<
+    RecWorkerImpl::LlmRecPureDevicePipeline::NextRoundInputResults>
+RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
+    const torch::Tensor& kv_seq_lens,
+    int32_t current_step,
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t max_decode_step,
+    const torch::TensorOptions& paged_options) {
+  folly::Promise<NextRoundInputResults> promise;
+  auto future = promise.getSemiFuture();
+
+#if defined(USE_NPU)
+// TODO: implement compute_next_round_input_async for NPU
+#elif defined(USE_CUDA)
+  // Capture necessary data for async computation
+  auto full_kv_offsets = full_kv_cache_offsets_->full_kv_offsets;
+  auto full_kv_mask = full_kv_cache_offsets_->full_kv_mask;
+  auto full_kv_indices = full_kv_cache_offsets_->full_kv_indices;
+  auto unshared_full_kv_offsets = full_kv_cache_offsets_->unshared_offsets;
+  auto real_max_decode_step_ids = full_kv_cache_offsets_->max_decode_step_ids;
+  uint32_t unshared_kv_begin_offset = max_tokens_per_batch_;
+
+  // Launch async computation in thread pool (can overlap with GPU execution)
+  threadpool_.schedule([=, this, promise = std::move(promise)]() mutable {
+    // Protect CUDA graph capture from conflicting GPU work submitted on
+    // prepare_stream_ while capture is in progress. Use shared lock to allow
+    // multiple prepare operations to run concurrently, but prevent conflicts
+    // with capture operations. This mirrors the NPU DeviceCaptureLock usage in
+    // WorkerImpl::prepare_work_before_execute.
+    std::optional<std::shared_lock<std::shared_mutex>> lock_guard;
+    if (worker_.options_.enable_graph()) {
+      auto& replay_lock =
+          ::xllm::cuda::DeviceCaptureLock::get_instance().get_read_lock(
+              worker_.device_.index());
+      lock_guard.emplace(replay_lock);
+    }
+    c10::StreamGuard streamGuard = worker_.prepare_stream_->set_stream_guard();
+    auto shared_kv_offsets =
+        full_kv_offsets.slice(2, 0, max_token_per_req_).slice(0, 0, batch_size);
+
+    auto shared_kv_lens_each_batch = torch::diff(kv_seq_lens);
+
+    auto shared_kv_lens_each_batch_broadcast =
+        shared_kv_lens_each_batch.unsqueeze(1).unsqueeze(1);
+
+    auto shared_mask =
+        full_kv_mask.slice(2, 0, max_token_per_req_).slice(0, 0, batch_size);
+
+    shared_mask.copy_(shared_kv_offsets < shared_kv_lens_each_batch_broadcast);
+
+    auto kv_lens_batch_offsets = kv_seq_lens.slice(0, 0, -1);
+
+    auto kv_lens_batch_offsets_broadcast =
+        kv_lens_batch_offsets.unsqueeze(1).unsqueeze(1);
+
+    auto shared_kv_indices =
+        full_kv_indices.slice(2, 0, max_token_per_req_).slice(0, 0, batch_size);
+
+    shared_kv_indices.copy_(kv_lens_batch_offsets_broadcast +
+                            shared_kv_offsets);
+
+    auto unshared_kv_offsets = unshared_full_kv_offsets.slice(0, 0, batch_size);
+    int32_t unshared_kv_len = beam_width * max_decode_step;
+    auto unshared_kv_indices =
+        full_kv_indices
+            .slice(2, max_token_per_req_, max_token_per_req_ + unshared_kv_len)
+            .slice(0, 0, batch_size);
+    unshared_kv_indices.copy_(unshared_kv_offsets + unshared_kv_begin_offset);
+
+    auto unshared_mask =
+        full_kv_mask
+            .slice(2, max_token_per_req_, max_token_per_req_ + unshared_kv_len)
+            .slice(0, 0, batch_size);
+    auto real_max_decode_step_ids_slice =
+        real_max_decode_step_ids.slice(0, 0, batch_size);
+    unshared_mask.copy_(real_max_decode_step_ids_slice <= current_step);
+
+    unshared_kv_len = current_step + 1;
+
+    auto batch_beam_shared_kv_lens =
+        (shared_kv_lens_each_batch.unsqueeze(1).expand({-1, beam_width}) +
+         unshared_kv_len)
+            .flatten();
+    auto cumsum_result = torch::cumsum(batch_beam_shared_kv_lens, 0);
+    auto paged_kv_indptr = torch::cat(
+        {torch::zeros({1}, paged_options), cumsum_result.to(paged_options)}, 0);
+    auto paged_kv_indices = full_kv_indices.masked_select(full_kv_mask);
+    auto paged_kv_last_page_len =
+        torch::ones({batch_size * beam_width}, paged_options);
+    worker_.prepare_stream_->synchronize();
+
+    NextRoundInputResults results;
+    results.paged_kv_indices = paged_kv_indices;
+    results.paged_kv_indptr = paged_kv_indptr;
+    results.paged_kv_last_page_len = paged_kv_last_page_len;
+    promise.setValue(results);
+  });
+#endif
+  return future;
+}
+
+RecWorkerImpl::LlmRecPureDevicePipeline::FullKvCacheOffsets::FullKvCacheOffsets(
+    LlmRecPureDevicePipeline* pure_device_pipeline) {
+#if defined(USE_NPU)
+// TODO: implement FullKvCacheOffsets for NPU
+#elif defined(USE_CUDA)
+  auto device = pure_device_pipeline->worker_.device();
+  auto paged_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
+  int32_t max_decode_step = get_pure_device_decode_rounds() - 1;
+  full_kv_offsets =
+      torch::arange(0,
+                    pure_device_pipeline->max_token_per_req_ + max_decode_step,
+                    paged_options)
+          .unsqueeze(0)
+          .expand({pure_device_pipeline->max_seqs_per_batch_, -1})
+          .unsqueeze(1)
+          .expand({-1, pure_device_pipeline->beam_width_, -1});
+  full_kv_mask =
+      torch::zeros({pure_device_pipeline->max_seqs_per_batch_,
+                    pure_device_pipeline->beam_width_,
+                    pure_device_pipeline->max_token_per_req_ + max_decode_step},
+                   paged_options)
+          .to(torch::kBool);
+  full_kv_indices = torch::zeros_like(full_kv_offsets);
+
+  auto batch_ids =
+      torch::arange(0, pure_device_pipeline->max_seqs_per_batch_, paged_options)
+          .unsqueeze(1)
+          .unsqueeze(2)
+          .expand({-1, pure_device_pipeline->beam_width_, max_decode_step}) *
+      (pure_device_pipeline->beam_width_ * max_decode_step);
+
+  auto beams_ids =
+      torch::arange(0, pure_device_pipeline->beam_width_, paged_options)
+          .unsqueeze(0)
+          .unsqueeze(2)
+          .expand({pure_device_pipeline->max_seqs_per_batch_,
+                   -1,
+                   max_decode_step}) *
+      max_decode_step;
+
+  max_decode_step_ids = torch::arange(0, max_decode_step, paged_options)
+                            .unsqueeze(0)
+                            .unsqueeze(1)
+                            .expand({pure_device_pipeline->max_seqs_per_batch_,
+                                     pure_device_pipeline->beam_width_,
+                                     -1});
+  unshared_offsets = batch_ids + beams_ids + max_decode_step_ids;
+#endif
 }
 
 RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
@@ -300,7 +786,6 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
   // Create work pipeline first
   auto pipeline_type = get_rec_pipeline_type(rec_model_kind_);
   work_pipeline_ = create_pipeline(pipeline_type, *this);
-
   // Let pipeline create model
   return work_pipeline_->create_model(*this, context);
 }
@@ -315,6 +800,67 @@ void RecWorkerImpl::prepare_work_before_execute(
     ForwardInput& processed_inputs) {
   CHECK(work_pipeline_ != nullptr) << "RecWorkerImpl is not initialized.";
   work_pipeline_->prepare_work_before_execute(inputs, processed_inputs);
+}
+
+void RecWorkerImpl::prepare_multi_modal_data(ForwardInput& processed_inputs) {
+  if (!processed_inputs.input_params.mm_data.valid()) {
+    return;
+  }
+
+  torch::Tensor multi_modal_values;
+  torch::Tensor multi_modal_indices;
+
+  const auto& processed_mm_data = processed_inputs.input_params.mm_data;
+  if (auto res = processed_mm_data.get<torch::Tensor>("MULTI_MODAL_VALUES")) {
+    multi_modal_values = res.value();
+  }
+
+  if (auto res = processed_mm_data.get<torch::Tensor>("MULTI_MODAL_INDICES")) {
+    multi_modal_indices = res.value();
+  }
+
+  if (!multi_modal_values.defined() || !multi_modal_indices.defined()) {
+    return;
+  }
+
+#if defined(USE_NPU)
+  layer::NpuWordEmbedding npu_word_embedding = get_npu_word_embedding();
+  torch::Tensor input_tokens_embedding =
+      npu_word_embedding(processed_inputs.token_ids, 0);
+#else
+  layer::WordEmbedding word_embedding = get_word_embedding();
+  torch::Tensor input_tokens_embedding =
+      word_embedding->forward(processed_inputs.token_ids);
+#endif
+
+  std::vector<torch::indexing::TensorIndex> indices = {
+      torch::indexing::TensorIndex(multi_modal_indices),
+      torch::indexing::Slice()};
+
+  input_tokens_embedding.index_put_(indices, multi_modal_values);
+  processed_inputs.input_params.input_embedding = input_tokens_embedding;
+}
+
+std::optional<ForwardOutput> RecWorkerImpl::step(const ForwardInput& input) {
+  CHECK(work_pipeline_ != nullptr) << "RecWorkerImpl is not initialized.";
+  return work_pipeline_->step(input);
+}
+
+std::unique_ptr<RecWorkerImpl::RecWorkPipeline> RecWorkerImpl::create_pipeline(
+    RecPipelineType type,
+    RecWorkerImpl& worker) {
+  switch (type) {
+    case RecPipelineType::kLlmRecDefault:
+      return std::make_unique<LlmRecWorkPipeline>(worker);
+    case RecPipelineType::kOneRecDefault:
+      return std::make_unique<OneRecWorkPipeline>(worker);
+    case RecPipelineType::kLlmRecPureDevicePipeline:
+      return std::make_unique<LlmRecPureDevicePipeline>(worker);
+    default:
+      LOG(FATAL) << "Unknown RecWorkerImpl pipeline type: "
+                 << static_cast<int>(type);
+      return nullptr;
+  }
 }
 
 torch::Tensor RecWorkerImpl::merge_embeddings_by_indices(
@@ -356,31 +902,6 @@ torch::Tensor RecWorkerImpl::merge_embeddings_by_indices(
                     input_tokens_embedding);
 
   return merged;
-}
-
-std::optional<ForwardOutput> RecWorkerImpl::step(const ForwardInput& input) {
-  CHECK(work_pipeline_ != nullptr) << "RecWorkerImpl is not initialized.";
-  return work_pipeline_->step(input);
-}
-
-// ============================================================
-// RecWorkerImpl pipeline factory (static method)
-// ============================================================
-std::unique_ptr<RecWorkerImpl::RecWorkPipeline> RecWorkerImpl::create_pipeline(
-    RecPipelineType type,
-    RecWorkerImpl& worker) {
-  switch (type) {
-    case RecPipelineType::kLlmRecDefault:
-      return std::make_unique<LlmRecWorkPipeline>(worker);
-    case RecPipelineType::kLlmRecWithMmData:
-      return std::make_unique<LlmRecWithMmDataWorkPipeline>(worker);
-    case RecPipelineType::kOneRecDefault:
-      return std::make_unique<OneRecWorkPipeline>(worker);
-    default:
-      LOG(FATAL) << "Unknown RecWorkerImpl pipeline type: "
-                 << static_cast<int>(type);
-      return nullptr;
-  }
 }
 
 }  // namespace xllm

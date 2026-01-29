@@ -180,6 +180,7 @@ int run() {
       .enable_prefix_cache(FLAGS_enable_prefix_cache)
       .max_tokens_per_batch(FLAGS_max_tokens_per_batch)
       .max_seqs_per_batch(FLAGS_max_seqs_per_batch)
+      .max_token_per_req(FLAGS_max_token_per_req)
       .max_tokens_per_chunk_for_prefill(FLAGS_max_tokens_per_chunk_for_prefill)
       .num_speculative_tokens(FLAGS_num_speculative_tokens)
       .num_request_handling_threads(FLAGS_num_request_handling_threads)
@@ -240,7 +241,8 @@ int run() {
       .max_requests_per_batch(FLAGS_max_requests_per_batch)
       .enable_continuous_kvcache(FLAGS_enable_continuous_kvcache)
       .enable_shm(FLAGS_enable_shm)
-      .is_local(is_local);
+      .is_local(is_local)
+      .beam_width(FLAGS_beam_width);
 
   InstanceName::name()->set_name(options.instance_name().value_or(""));
 

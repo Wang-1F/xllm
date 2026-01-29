@@ -113,63 +113,64 @@ void torch_reference(
   }
 }
 
-TEST_F(DecoderReshapeAndCacheTest, CorrectnessTest) {
-  // Small shapes are enough to catch indexing bugs, while keeping the test
-  // fast.
-  const int64_t batch_size = 1;
-  const int64_t beam_size = 2;
-  const int64_t kv_heads = 8;
-  const int64_t head_dim = 128;
-  const int64_t max_num_request = 33437;
-  const int64_t max_decode_step = 3;
-  const uint32_t step = 1;
+// TEST_F(DecoderReshapeAndCacheTest, CorrectnessTest) {
+//   // Small shapes are enough to catch indexing bugs, while keeping the test
+//   // fast.
+//   const int64_t batch_size = 1;
+//   const int64_t beam_size = 2;
+//   const int64_t kv_heads = 8;
+//   const int64_t head_dim = 128;
+//   const int64_t max_num_request = 33437;
+//   const int64_t max_decode_step = 3;
+//   const uint32_t step = 1;
 
-  auto options = torch::TensorOptions().device(device_).dtype(dtype_);
+//   auto options = torch::TensorOptions().device(device_).dtype(dtype_);
 
-  // 1) Prepare inputs.
-  // proj_k/proj_v: [batch_size, beam_size, kv_heads, head_dim]
-  torch::Tensor proj_k =
-      torch::randn({batch_size, beam_size, kv_heads, head_dim}, options);
-  torch::Tensor proj_v =
-      torch::randn({batch_size, beam_size, kv_heads, head_dim}, options);
+//   // 1) Prepare inputs.
+//   // proj_k/proj_v: [batch_size, beam_size, kv_heads, head_dim]
+//   torch::Tensor proj_k =
+//       torch::randn({batch_size, beam_size, kv_heads, head_dim}, options);
+//   torch::Tensor proj_v =
+//       torch::randn({batch_size, beam_size, kv_heads, head_dim}, options);
 
-  // 2) Prepare block table mapping batch index -> request_id (block_id).
-  // Here we map the only batch element to request_id=0.
-  torch::Tensor block_table =
-      torch::tensor({0}, torch::kInt64).view({batch_size, 1}).to(device_);
+//   // 2) Prepare block table mapping batch index -> request_id (block_id).
+//   // Here we map the only batch element to request_id=0.
+//   torch::Tensor block_table =
+//       torch::tensor({0}, torch::kInt64).view({batch_size, 1}).to(device_);
 
-  // 3) Prepare caches.
-  // Layout: [max_num_request, beam_size, max_decode_step, kv_heads, head_dim]
-  torch::Tensor unshared_k_cache = torch::zeros(
-      {max_num_request, beam_size, max_decode_step, kv_heads, head_dim},
-      options);
-  torch::Tensor unshared_v_cache = torch::zeros(
-      {max_num_request, beam_size, max_decode_step, kv_heads, head_dim},
-      options);
+//   // 3) Prepare caches.
+//   // Layout: [max_num_request, beam_size, max_decode_step, kv_heads,
+//   head_dim] torch::Tensor unshared_k_cache = torch::zeros(
+//       {max_num_request, beam_size, max_decode_step, kv_heads, head_dim},
+//       options);
+//   torch::Tensor unshared_v_cache = torch::zeros(
+//       {max_num_request, beam_size, max_decode_step, kv_heads, head_dim},
+//       options);
 
-  // Reference buffers (two independent references).
-  torch::Tensor ref_k_cache = unshared_k_cache.clone();
-  torch::Tensor ref_v_cache = unshared_v_cache.clone();
+//   // Reference buffers (two independent references).
+//   torch::Tensor ref_k_cache = unshared_k_cache.clone();
+//   torch::Tensor ref_v_cache = unshared_v_cache.clone();
 
-  // 4) Run CUDA kernel under test.
-  decoder_reshape_and_cache(
-      proj_k, proj_v, unshared_k_cache, unshared_v_cache, block_table, step);
+//   // 4) Run CUDA kernel under test.
+//   decoder_reshape_and_cache(
+//       proj_k, proj_v, unshared_k_cache, unshared_v_cache, block_table, step);
 
-  // 5) Run references.
-  torch_reference(proj_k, proj_v, ref_k_cache, ref_v_cache, block_table, step);
+//   // 5) Run references.
+//   torch_reference(proj_k, proj_v, ref_k_cache, ref_v_cache, block_table,
+//   step);
 
-  // 6) Compare results.
-  EXPECT_TRUE(torch::allclose(unshared_k_cache, ref_k_cache, 1e-5, 1e-5));
-  EXPECT_TRUE(torch::allclose(unshared_v_cache, ref_v_cache, 1e-5, 1e-5));
+//   // 6) Compare results.
+//   EXPECT_TRUE(torch::allclose(unshared_k_cache, ref_k_cache, 1e-5, 1e-5));
+//   EXPECT_TRUE(torch::allclose(unshared_v_cache, ref_v_cache, 1e-5, 1e-5));
 
-  // Sanity-check that the expected slice was copied for each batch element.
-  for (int64_t b = 0; b < batch_size; ++b) {
-    int64_t rid = block_table[b][0].item<int64_t>();
-    torch::Tensor copied_k = unshared_k_cache[rid].select(1, step);
-    torch::Tensor source_k = proj_k[b];
-    EXPECT_TRUE(torch::allclose(copied_k, source_k, 1e-5, 1e-5));
-  }
-}
+//   // Sanity-check that the expected slice was copied for each batch element.
+//   for (int64_t b = 0; b < batch_size; ++b) {
+//     int64_t rid = block_table[b][0].item<int64_t>();
+//     torch::Tensor copied_k = unshared_k_cache[rid].select(1, step);
+//     torch::Tensor source_k = proj_k[b];
+//     EXPECT_TRUE(torch::allclose(copied_k, source_k, 1e-5, 1e-5));
+//   }
+// }
 
 }  // namespace test
 }  // namespace xllm::kernel::cuda

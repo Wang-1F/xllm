@@ -18,7 +18,6 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <tuple>
-#include <variant>
 
 #include "framework/kv_cache/kv_cache.h"
 #include "layers/common/attention_metadata.h"
@@ -26,39 +25,32 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-class BaseAttentionImpl;
-class XAttentionImpl;
-
-// AttentionImpl acts as a strategy selector, using std::variant to manage
-// different attention implementations (BaseAttentionImpl for standard mode,
-// XAttentionImpl for pure device mode).
-class AttentionImpl : public torch::nn::Module {
+// XAttentionImpl is now an independent class (not inheriting from
+// AttentionImpl) to avoid infinite recursion. It stores its own copy of
+// parameters.
+class XAttentionImpl {
  public:
-  AttentionImpl() = default;
+  XAttentionImpl(int num_heads,
+                 int head_size,
+                 float scale,
+                 int num_kv_heads,
+                 int sliding_window);
 
-  AttentionImpl(int num_heads,
-                int head_size,
-                float scale,
-                int num_kv_heads,
-                int sliding_window);
-
-  virtual std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
+  std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
       const AttentionMetadata& attn_metadata,
       torch::Tensor& query,
       torch::Tensor& key,
       torch::Tensor& value,
+      torch::Tensor& output,
       KVCache& kv_cache);
 
- protected:
-  // Use std::variant to manage different implementations, avoiding if-else
-  // logic and making the code more elegant and type-safe.
-  // Use shared_ptr to allow forward declaration (unique_ptr requires complete
-  // type definition).
-  std::variant<std::shared_ptr<BaseAttentionImpl>,
-               std::shared_ptr<XAttentionImpl>>
-      attention_impl_;
+ private:
+  int num_heads_;
+  int head_size_;
+  float scale_;
+  int num_kv_heads_;
+  int sliding_window_;
 };
-TORCH_MODULE(Attention);
 
 }  // namespace layer
 }  // namespace xllm

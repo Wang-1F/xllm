@@ -82,6 +82,12 @@ AttentionMetadata AttentionMetadataBuilder::build(
 #endif
 
   // TODO: set use_tensor_core from options.
+  // for xattention
+  if (params.llm_rec_pure_device_params.current_round_tensor.defined() &&
+      params.llm_rec_pure_device_params.current_round_tensor.numel() > 0) {
+    attn_metadata.step_tensor =
+        params.llm_rec_pure_device_params.current_round_tensor;
+  }
 
   return attn_metadata;
 }

@@ -51,12 +51,13 @@ RecPureDeviceBatchInputBuilder::RecPureDeviceBatchInputBuilder(
     std::vector<BlockTransferInfo>* swap_block_transfer_infos,
     const uint64_t batch_id,
     const ModelArgs* args,
+    BatchForwardType batch_forward_type,
     ThreadPool* thread_pool)
     : allowed_max_tokens_(allowed_max_tokens),
       input_embeddings_vec_(input_embeddings_vec),
       mm_data_vec_(mm_data_vec),
       args_(args),
-      batch_forward_type_(BatchForwardType::DECODE),
+      batch_forward_type_(batch_forward_type),
       swap_block_transfer_infos_(swap_block_transfer_infos),
       thread_pool_(thread_pool),
       batch_id_(batch_id) {
@@ -70,6 +71,7 @@ RecPureDeviceBatchInputBuilder::RecPureDeviceBatchInputBuilder(
   }
 
   num_sequences_ = static_cast<int32_t>(sequences_.size());
+  CHECK_GT(num_sequences_, 0);
 
   if (args_ != nullptr) {
     use_mrope_ = (args_->rope_scaling_rope_type() == "mrope");
@@ -411,8 +413,9 @@ ForwardInput RecPureDeviceBatchInputBuilder::state_to_forward_input() {
 
     int32_t decode_rounds = get_pure_device_decode_rounds();
     forward_input.full_kv_shape = {
-        batch_size * FLAGS_max_token_per_req +
-            batch_size * FLAGS_beam_width * std::max(0, decode_rounds - 1),
+        FLAGS_max_seqs_per_batch * FLAGS_max_token_per_req +
+            FLAGS_max_seqs_per_batch * FLAGS_beam_width *
+                std::max(0, decode_rounds - 1),
         n_kv_heads,
         head_dim};
   }

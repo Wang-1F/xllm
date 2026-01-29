@@ -17,7 +17,10 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <memory>
 #include <tuple>
+
+#include "core/common/rec_model_utils.h"
 
 namespace {
 inline bool is_qwen3_model(const std::string& model_type) {
@@ -131,13 +134,14 @@ torch::Tensor Qwen2AttentionImpl::forward(
     // 3. k-norm
     k = std::get<0>(k_norm_->forward(k));
   }
-
   // 4. rope
   rotary_emb_->forward(q, k, positions, attn_metadata);
+
   q = q.view({T, q_size_});
   k = k.view({T, kv_size_});
 
   // 5. store k/v cache and do attention
+  // Output tensor is now created internally by AttentionImpl::forward
   auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
 
   // 6. output projection

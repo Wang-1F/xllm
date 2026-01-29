@@ -45,6 +45,7 @@ class RecPureDeviceBatchInputBuilder : public RecBatchInputBuilder {
       std::vector<BlockTransferInfo>* swap_block_transfer_infos,
       const uint64_t batch_id,
       const ModelArgs* args,
+      BatchForwardType batch_forward_type,
       ThreadPool* thread_pool = nullptr);
 
   ~RecPureDeviceBatchInputBuilder() override = default;
