@@ -5,10 +5,16 @@ cc_library(
     cuda_layers
   HDRS
     attention.h
+    attention_impl_base.h
+    flashinfer_attention.h
+    xattention.h
     flashinfer_workspace.h
     flashinfer_planinfo.h
   SRCS
     attention.cpp
+    attention_impl_base.cpp
+    xattention.cpp
+    flashinfer_attention.cpp
     flashinfer_workspace.cpp
     flashinfer_planinfo.cpp
   DEPS
