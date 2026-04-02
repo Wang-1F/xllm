@@ -58,6 +58,7 @@ cc_test(
     common_test
   SRCS
     rate_limiter_test.cpp
+    rec_model_utils_test.cpp
   DEPS
     common
     absl::synchronization

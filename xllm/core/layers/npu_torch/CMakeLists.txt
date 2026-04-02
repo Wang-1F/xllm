@@ -6,6 +6,7 @@ cc_library(
   HDRS
     fused_moe.h
     attention.h
+    mtgr_decoder_layer_impl.h
     qwen3_gated_delta_net_base.h
     qwen3_next_attention.h
     qwen3_next_gated_delta_net.h
@@ -16,6 +17,7 @@ cc_library(
   SRCS
     fused_moe.cpp
     attention.cpp
+    mtgr_decoder_layer_impl.cpp
     qwen3_gated_delta_net_base.cpp
     qwen3_next_attention.cpp
     qwen3_next_gated_delta_net.cpp

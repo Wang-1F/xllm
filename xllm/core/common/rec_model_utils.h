@@ -67,13 +67,17 @@ inline constexpr bool is_onerec_model_type(std::string_view model_type) {
   return model_type == "onerec";
 }
 
+inline constexpr bool is_mtgr_model_type(std::string_view model_type) {
+  return model_type == "mtgr";
+}
+
 inline constexpr bool is_llmrec_model_type(std::string_view model_type) {
   return model_type == "qwen2" || model_type == "qwen3" ||
          model_type == "qwen3_moe";
 }
 
 inline constexpr RecModelKind get_rec_model_kind(std::string_view model_type) {
-  if (is_onerec_model_type(model_type)) {
+  if (is_onerec_model_type(model_type) || is_mtgr_model_type(model_type)) {
     return RecModelKind::kOneRec;
   }
   if (is_llmrec_model_type(model_type)) {

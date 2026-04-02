@@ -37,6 +37,7 @@ cc_library(
     layers
   HDRS
     onerec_block_layer.h
+    mtgr_decoder_layer.h
     qwen2_decoder_layer.h
     qwen2_vision_layer.h
     qwen2_5_vision_layer.h
