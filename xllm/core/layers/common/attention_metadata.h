@@ -142,6 +142,18 @@ struct AttentionMetadata {
   // custom attention mask
   torch::Tensor attn_mask;
 
+  // GenRec segmented prefill metadata:
+  // sequence layout [history | context | real_time | target].
+  int64_t genrec_history_len = 0;
+  int64_t genrec_context_len = 0;
+  int64_t genrec_real_time_len = 0;
+  int64_t genrec_target_len = 0;
+  // Optional per-batch lengths. Shape can be [batch] or [1].
+  torch::Tensor genrec_history_lens;
+  torch::Tensor genrec_context_lens;
+  torch::Tensor genrec_real_time_lens;
+  torch::Tensor genrec_target_lens;
+
 #if defined(USE_NPU)
   // for npu
   torch::Tensor kv_seq_lens_host;

@@ -23,7 +23,7 @@ limitations under the License.
 #include "framework/state_dict/state_dict.h"
 #include "layers/common/dense_mlp.h"
 #include "layers/common/qwen3_next_rms_norm.h"
-#include "layers/npu_torch/qwen3_next_attention.h"
+#include "layers/npu_torch/custom_mask_attention.h"
 
 namespace xllm {
 namespace layer {
@@ -41,7 +41,7 @@ class MTGRDecoderLayerImpl : public torch::nn::Module {
                         const ModelInputParams& input_params);
 
  private:
-  Qwen3NextAttention attention_{nullptr};
+  CustomMaskAttention attention_{nullptr};
   DenseMLP mlp_{nullptr};
   Qwen3NextRMSNorm input_norm_{nullptr};
   Qwen3NextRMSNorm post_norm_{nullptr};

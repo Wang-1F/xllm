@@ -6,11 +6,13 @@ cc_library(
   NAME
     npu_kernels
   HDRS
+    genrec_attention.h
     npu_ops_api.h
   SRCS
     active.cpp
     attention.cpp
     fused_layernorm.cpp
+    genrec_attention.cpp
     matmul.cpp
     npu_grouped_matmul.cpp
     npu_moe_gating_topk_softmax.cpp
@@ -20,3 +22,5 @@ cc_library(
   DEPS
     :torch_npu_kernels
 )
+
+add_subdirectory(tests)

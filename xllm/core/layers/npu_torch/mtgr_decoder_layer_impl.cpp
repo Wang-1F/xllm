@@ -27,7 +27,7 @@ MTGRDecoderLayerImpl::MTGRDecoderLayerImpl(const ModelContext& context,
 
   attention_ = register_module(
       "self_attn",
-      Qwen3NextAttention(
+      CustomMaskAttention(
           model_args, quant_args, parallel_args, options, layer_id));
 
   input_norm_ = register_module(
