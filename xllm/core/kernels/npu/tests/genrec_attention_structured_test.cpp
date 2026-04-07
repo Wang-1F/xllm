@@ -1025,11 +1025,13 @@ torch::Tensor combine_two_way_attention_update_like_benchmark(
       {bsh, d},
       torch::TensorOptions().dtype(torch::kFloat32).device(out1.device()));
 
-  aclTensor* local_out_acls[2] = {torch_to_acl_tensor_row_major_nd(local_out1_flat),
-                                  torch_to_acl_tensor_row_major_nd(local_out2_flat)};
-  aclTensor* lse_acls[2] = {torch_to_acl_tensor_row_major_nd(lse1_flat),
-                            torch_to_acl_tensor_row_major_nd(lse2_flat)};
-  aclTensor* out_acl = torch_to_acl_tensor_row_major_nd(out_flat);
+  // Merge inputs are already contiguous flattened ND tensors; use their
+  // native strides directly to avoid any manual stride descriptor mismatch.
+  aclTensor* local_out_acls[2] = {torch_to_acl_tensor(local_out1_flat),
+                                  torch_to_acl_tensor(local_out2_flat)};
+  aclTensor* lse_acls[2] = {torch_to_acl_tensor(lse1_flat),
+                            torch_to_acl_tensor(lse2_flat)};
+  aclTensor* out_acl = torch_to_acl_tensor(out_flat);
 
   aclTensorList* local_out_list = aclCreateTensorList(local_out_acls, 2);
   CHECK_NE(local_out_list, nullptr);
@@ -1052,6 +1054,8 @@ torch::Tensor combine_two_way_attention_update_like_benchmark(
   if (ws_size > 0) {
     CHECK_EQ(aclrtMalloc(&ws_ptr, ws_size, ACL_MEM_MALLOC_HUGE_FIRST), ACL_SUCCESS)
         << "aclrtMalloc AttentionUpdate workspace";
+    CHECK_EQ(aclrtMemset(ws_ptr, ws_size, 0, ws_size), ACL_SUCCESS)
+        << "aclrtMemset AttentionUpdate workspace";
   }
 
   ret = aclnnAttentionUpdate(ws_ptr, ws_size, executor, stream);
@@ -1108,13 +1112,15 @@ torch::Tensor combine_three_way_attention_update_like_benchmark(
       {bsh, d},
       torch::TensorOptions().dtype(torch::kFloat32).device(out1.device()));
 
-  aclTensor* local_out_acls[3] = {torch_to_acl_tensor_row_major_nd(local_out1_flat),
-                                  torch_to_acl_tensor_row_major_nd(local_out2_flat),
-                                  torch_to_acl_tensor_row_major_nd(local_out3_flat)};
-  aclTensor* lse_acls[3] = {torch_to_acl_tensor_row_major_nd(lse1_flat),
-                            torch_to_acl_tensor_row_major_nd(lse2_flat),
-                            torch_to_acl_tensor_row_major_nd(lse3_flat)};
-  aclTensor* out_acl = torch_to_acl_tensor_row_major_nd(out_flat);
+  // Merge inputs are already contiguous flattened ND tensors; use their
+  // native strides directly to avoid any manual stride descriptor mismatch.
+  aclTensor* local_out_acls[3] = {torch_to_acl_tensor(local_out1_flat),
+                                  torch_to_acl_tensor(local_out2_flat),
+                                  torch_to_acl_tensor(local_out3_flat)};
+  aclTensor* lse_acls[3] = {torch_to_acl_tensor(lse1_flat),
+                            torch_to_acl_tensor(lse2_flat),
+                            torch_to_acl_tensor(lse3_flat)};
+  aclTensor* out_acl = torch_to_acl_tensor(out_flat);
 
   aclTensorList* local_out_list = aclCreateTensorList(local_out_acls, 3);
   CHECK_NE(local_out_list, nullptr);
@@ -1137,6 +1143,8 @@ torch::Tensor combine_three_way_attention_update_like_benchmark(
   if (ws_size > 0) {
     CHECK_EQ(aclrtMalloc(&ws_ptr, ws_size, ACL_MEM_MALLOC_HUGE_FIRST), ACL_SUCCESS)
         << "aclrtMalloc AttentionUpdate workspace";
+    CHECK_EQ(aclrtMemset(ws_ptr, ws_size, 0, ws_size), ACL_SUCCESS)
+        << "aclrtMemset AttentionUpdate workspace";
   }
 
   ret = aclnnAttentionUpdate(ws_ptr, ws_size, executor, stream);
@@ -1181,7 +1189,8 @@ void run_genrec_v2_single_batch(
     const torch::Tensor& key,
     const torch::Tensor& value,
     const AttentionMetadata& attn_metadata,
-    torch::Tensor& output) {
+    torch::Tensor& output,
+    bool enable_reference_checks) {
 
   int32_t device_id = query.device().index();
   aclrtStream stream = c10_npu::getCurrentNPUStream(device_id).stream();
@@ -1244,14 +1253,16 @@ void run_genrec_v2_single_batch(
     execute_planned_attention(hist_plan, stream);
     destroy_planned_attention(hist_plan);
     output.slice(0, i, i + 1).slice(2, 0, h).copy_(hist_out);
-    expect_npu_attention_matches_reference("history",
-                                           stream,
-                                           output.slice(0, i, i + 1).slice(2, 0, h),
-                                           hist_query,
-                                           hist_key,
-                                           hist_value,
-                                           optional_attn_mask(hist_attn_metadata),
-                                           scale);
+    if (enable_reference_checks) {
+      expect_npu_attention_matches_reference("history",
+                                             stream,
+                                             output.slice(0, i, i + 1).slice(2, 0, h),
+                                             hist_query,
+                                             hist_key,
+                                             hist_value,
+                                             optional_attn_mask(hist_attn_metadata),
+                                             scale);
+    }
     
 
     // ---context + real_time + target 部分---
@@ -1276,22 +1287,24 @@ void run_genrec_v2_single_batch(
                                               crt_lse);
     execute_planned_attention(crt_plan, stream);
     destroy_planned_attention(crt_plan);
-    expect_npu_lse_matches_reference("crt_context_rt_t",
-                                     stream,
-                                     crt_lse,
-                                     crt_query,
-                                     crt_key,
-                                     optional_attn_mask(crt_attn_metadata),
-                                     scale,
-                                     "batch0_02_crt_lse");
-    expect_npu_attention_matches_reference("crt_context_rt_t",
-                                           stream,
-                                           crt_out,
-                                           crt_query,
-                                           crt_key,
-                                           crt_value,
-                                           optional_attn_mask(crt_attn_metadata),
-                                           scale);
+    if (enable_reference_checks) {
+      expect_npu_lse_matches_reference("crt_context_rt_t",
+                                       stream,
+                                       crt_lse,
+                                       crt_query,
+                                       crt_key,
+                                       optional_attn_mask(crt_attn_metadata),
+                                       scale,
+                                       "batch0_02_crt_lse");
+      expect_npu_attention_matches_reference("crt_context_rt_t",
+                                             stream,
+                                             crt_out,
+                                             crt_query,
+                                             crt_key,
+                                             crt_value,
+                                             optional_attn_mask(crt_attn_metadata),
+                                             scale);
+    }
 
     // context 部分来自 step2a，直接回写最终输出。
     output.slice(0, i, i + 1).slice(2, h, h + c).copy_(crt_out.slice(2, 0, c));
@@ -1318,22 +1331,24 @@ void run_genrec_v2_single_batch(
                                             rt_lse);
     execute_planned_attention(rt_plan, stream);
     destroy_planned_attention(rt_plan);
-    expect_npu_lse_matches_reference("rt_realtime_t",
-                                     stream,
-                                     rt_lse,
-                                     rt_query,
-                                     rt_key,
-                                     optional_attn_mask(rt_attn_metadata),
-                                     scale,
-                                     "batch0_03_rt_lse");
-    expect_npu_attention_matches_reference("rt_realtime_t",
-                                           stream,
-                                           rt_out,
-                                           rt_query,
-                                           rt_key,
-                                           rt_value,
-                                           optional_attn_mask(rt_attn_metadata),
-                                           scale);
+    if (enable_reference_checks) {
+      expect_npu_lse_matches_reference("rt_realtime_t",
+                                       stream,
+                                       rt_lse,
+                                       rt_query,
+                                       rt_key,
+                                       optional_attn_mask(rt_attn_metadata),
+                                       scale,
+                                       "batch0_03_rt_lse");
+      expect_npu_attention_matches_reference("rt_realtime_t",
+                                             stream,
+                                             rt_out,
+                                             rt_query,
+                                             rt_key,
+                                             rt_value,
+                                             optional_attn_mask(rt_attn_metadata),
+                                             scale);
+    }
 
     // ---target 部分---
     auto target_out = make_out(t);
@@ -1357,22 +1372,24 @@ void run_genrec_v2_single_batch(
                                                 target_lse);
     execute_planned_attention(target_plan, stream);
     destroy_planned_attention(target_plan);
-    expect_npu_lse_matches_reference("target",
-                                     stream,
-                                     target_lse,
-                                     target_query,
-                                     target_key,
-                                     optional_attn_mask(target_attn_metadata),
-                                     scale,
-                                     "batch0_04_target_lse");
-    expect_npu_attention_matches_reference("target",
-                                           stream,
-                                           target_out,
-                                           target_query,
-                                           target_key,
-                                           target_value,
-                                           optional_attn_mask(target_attn_metadata),
-                                           scale);
+    if (enable_reference_checks) {
+      expect_npu_lse_matches_reference("target",
+                                       stream,
+                                       target_lse,
+                                       target_query,
+                                       target_key,
+                                       optional_attn_mask(target_attn_metadata),
+                                       scale,
+                                       "batch0_04_target_lse");
+      expect_npu_attention_matches_reference("target",
+                                             stream,
+                                             target_out,
+                                             target_query,
+                                             target_key,
+                                             target_value,
+                                             optional_attn_mask(target_attn_metadata),
+                                             scale);
+    }
 
     // lse combine：与 genrec_attention_test（tm 风格 FP32 展平 + row-major ND）同路径，aclnnAttentionUpdate。
     auto combined_real_time_output = output.slice(0, i, i + 1).slice(2, h + c, h + c + r);
@@ -1383,6 +1400,15 @@ void run_genrec_v2_single_batch(
           rt_out.slice(2, 0, r),
           rt_lse.slice(2, 0, r),
           stream);
+      if (enable_reference_checks) {
+        expect_npu_lse_merge_matches_reference("lse_merge_real_time",
+                                               stream,
+                                               rt_merged,
+                                               {crt_out.slice(2, c, c + r),
+                                                rt_out.slice(2, 0, r)},
+                                               {crt_lse.slice(2, c, c + r),
+                                                rt_lse.slice(2, 0, r)});
+      }
       combined_real_time_output.copy_(rt_merged);
     }
 
@@ -1396,25 +1422,38 @@ void run_genrec_v2_single_batch(
           target_out,
           target_lse,
           stream);
+      if (enable_reference_checks) {
+        expect_npu_lse_merge_matches_reference("lse_merge_target",
+                                               stream,
+                                               tgt_merged,
+                                               {crt_out.slice(2, c + r, c + r + t),
+                                                rt_out.slice(2, r, r + t),
+                                                target_out},
+                                               {crt_lse.slice(2, c + r, c + r + t),
+                                                rt_lse.slice(2, r, r + t),
+                                                target_lse});
+      }
       combined_target_output.copy_(tgt_merged);
     }
 
-    print_genrec_merge_pipeline_diagnostics(i,
-                                            query,
-                                            key,
-                                            value,
-                                            output,
-                                            crt_out,
-                                            crt_lse,
-                                            rt_out,
-                                            rt_lse,
-                                            target_out,
-                                            target_lse,
-                                            h,
-                                            c,
-                                            r,
-                                            t,
-                                            scale);
+    if (enable_reference_checks) {
+      print_genrec_merge_pipeline_diagnostics(i,
+                                              query,
+                                              key,
+                                              value,
+                                              output,
+                                              crt_out,
+                                              crt_lse,
+                                              rt_out,
+                                              rt_lse,
+                                              target_out,
+                                              target_lse,
+                                              h,
+                                              c,
+                                              r,
+                                              t,
+                                              scale);
+    }
   }
 }
 
@@ -1438,13 +1477,14 @@ TEST_F(GenRecDirectRunTest, DirectRunGenRecV2SingleBatch) {
   // constexpr uint64_t kGenRecStructuredTestRngSeed = 20260404ULL;
   // torch::manual_seed(kGenRecStructuredTestRngSeed);
 
-  // BNSD
-  auto query =
-      torch::randn({kBatchSize, kNumHeads, total, kHeadDim}, opts_);
-  auto key =
-      torch::randn({kBatchSize, kNumKvHeads, total, kHeadDim}, opts_);
-  auto value =
-      torch::randn({kBatchSize, kNumKvHeads, total, kHeadDim}, opts_);
+  // Match genrec_attention_test V2 input construction path:
+  // generate [S, N, D] then convert to contiguous BNSD.
+  auto query_seq = torch::randn({total, kNumHeads, kHeadDim}, opts_);
+  auto key_seq = torch::randn({total, kNumKvHeads, kHeadDim}, opts_);
+  auto value_seq = torch::randn({total, kNumKvHeads, kHeadDim}, opts_);
+  auto query = query_seq.unsqueeze(0).permute({0, 2, 1, 3}).contiguous();
+  auto key = key_seq.unsqueeze(0).permute({0, 2, 1, 3}).contiguous();
+  auto value = value_seq.unsqueeze(0).permute({0, 2, 1, 3}).contiguous();
   auto output = torch::empty_like(query);
 
   dump_tensor_text("batch0_00_in_query.txt", stream_, query);
@@ -1464,11 +1504,29 @@ TEST_F(GenRecDirectRunTest, DirectRunGenRecV2SingleBatch) {
   attn_metadata.compressed_causal_mask = create_compressed_causal_mask_2048(query.device());
   attn_metadata.diagonal_mask = create_diagonal_mask(kTarget, query.device());
 
+  // Warmup is intentionally kept outside run_genrec_v2_single_batch to keep
+  // that function semantically "single-pass run". Warmup input is generated
+  // independently from the formal request input to mimic service deployment.
+  auto warmup_query_seq = torch::randn({total, kNumHeads, kHeadDim}, opts_);
+  auto warmup_key_seq = torch::randn({total, kNumKvHeads, kHeadDim}, opts_);
+  auto warmup_value_seq = torch::randn({total, kNumKvHeads, kHeadDim}, opts_);
+  auto warmup_query = warmup_query_seq.unsqueeze(0).permute({0, 2, 1, 3}).contiguous();
+  auto warmup_key = warmup_key_seq.unsqueeze(0).permute({0, 2, 1, 3}).contiguous();
+  auto warmup_value = warmup_value_seq.unsqueeze(0).permute({0, 2, 1, 3}).contiguous();
+  auto warmup_output = torch::empty_like(warmup_query);
+  run_genrec_v2_single_batch(warmup_query,
+                             warmup_key,
+                             warmup_value,
+                             attn_metadata,
+                             warmup_output,
+                             /*enable_reference_checks=*/false);
+
   run_genrec_v2_single_batch(query,
                              key,
                              value,
                              attn_metadata,
-                             output);
+                             output,
+                             /*enable_reference_checks=*/true);
 
   ASSERT_EQ(aclrtSynchronizeStream(stream_), ACL_SUCCESS);
   // 与 run_genrec_v2_single_batch 内 plan_segment_attention 使用同一 float scale，
