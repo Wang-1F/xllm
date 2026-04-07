@@ -48,3 +48,20 @@ cc_test(
     GTest::gtest_main
     glog::glog
 )
+
+cc_test(
+  NAME
+    genrec_attention_structured_test_BSH
+  SRCS
+    genrec_attention_structured_test_BSH.cpp
+  INCLUDES
+    /usr/local/Ascend/ascend-toolkit/latest/include
+    /usr/local/Ascend/cann-8.5.0/aarch64-linux/include
+  DEPS
+    torch
+    ascendcl
+    nnopbase
+    opapi
+    GTest::gtest_main
+    glog::glog
+)
