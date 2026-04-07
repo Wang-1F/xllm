@@ -75,6 +75,25 @@ aclTensor* TorchToAclTensor(const torch::Tensor& t) {
   return acl_t;
 }
 
+// Row-major strides matching CANN aclnnAttentionUpdate samples; some builds are
+// strict about ND stride descriptors compared to raw torch::Tensor::strides().
+aclTensor* TorchToAclTensorRowMajorNd(const torch::Tensor& t) {
+  CHECK(t.is_contiguous()) << "TorchToAclTensorRowMajorNd requires contiguous tensor";
+  auto shape = t.sizes().vec();
+  std::vector<int64_t> stride(shape.size(), 1);
+  for (int64_t i = static_cast<int64_t>(shape.size()) - 2; i >= 0; --i) {
+    stride[static_cast<size_t>(i)] =
+        shape[static_cast<size_t>(i + 1)] * stride[static_cast<size_t>(i + 1)];
+  }
+  aclTensor* acl_t = aclCreateTensor(
+      shape.data(), shape.size(), ToAclDtype(t.scalar_type()), stride.data(),
+      0, aclFormat::ACL_FORMAT_ND, shape.data(), shape.size(), t.data_ptr());
+  CHECK_NE(acl_t, nullptr)
+      << "aclCreateTensor failed for tensor with shape [" << t.sizes()
+      << "], dtype=" << t.scalar_type();
+  return acl_t;
+}
+
 // ---------------------------------------------------------------------------
 // Wall-clock timing with device synchronisation.
 // ---------------------------------------------------------------------------
@@ -128,174 +147,6 @@ class SegmentedPrefillAttentionTest : public ::testing::Test {
   aclrtStream stream_{nullptr};
 };
 
-// ===========================================================================
-// Correctness: verify output is finite and non-zero
-// ===========================================================================
-// TEST_F(SegmentedPrefillAttentionTest, CorrectnessBasic) {
-//   constexpr int64_t kNumHeads = 8;
-//   constexpr int64_t kNumKvHeads = 8;
-//   constexpr int64_t kHeadDim = 64;
-//   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
-
-//   std::vector<Segment> segments = {{0, 10}, {30, 20}, {70, 15}};
-//   auto ctxs =
-//       BuildSegmentCtxs(kNumHeads, kNumKvHeads, kHeadDim, segments, opts_);
-//   RunSegmentedPrefill(ctxs, kNumHeads, kNumKvHeads, scale, stream_);
-//   CHECK_EQ(aclrtSynchronizeStream(stream_), ACL_SUCCESS);
-
-//   for (size_t i = 0; i < segments.size(); ++i) {
-//     const auto& seg = segments[i];
-//     const auto& out = ctxs[i].out;
-
-//     ASSERT_EQ(out.size(0), 1);
-//     ASSERT_EQ(out.size(1), kNumHeads);
-//     ASSERT_EQ(out.size(2), seg.length);
-//     ASSERT_EQ(out.size(3), kHeadDim);
-
-//     auto out_f32 = out.to(torch::kCPU).to(torch::kFloat32);
-//     EXPECT_TRUE(torch::isfinite(out_f32).all().item<bool>())
-//         << "Segment " << i << " (start=" << seg.start
-//         << ", len=" << seg.length << ") has non-finite values";
-//     EXPECT_GT(out_f32.abs().sum().item<float>(), 0.0f)
-//         << "Segment " << i << " output is all zeros";
-//   }
-// }
-
-// // ===========================================================================
-// // Correctness: compare aclnn output with a PyTorch FP32 CPU reference
-// // ===========================================================================
-// TEST_F(SegmentedPrefillAttentionTest, CorrectnessVsReference) {
-//   constexpr int64_t kSeqLen = 64;
-//   constexpr int64_t kNumHeads = 8;
-//   constexpr int64_t kNumKvHeads = 8;
-//   constexpr int64_t kHeadDim = 64;
-//   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
-
-//   auto q = torch::randn({1, kNumHeads, kSeqLen, kHeadDim}, opts_);
-//   auto k = torch::randn({1, kNumKvHeads, kSeqLen, kHeadDim}, opts_);
-//   auto v = torch::randn({1, kNumKvHeads, kSeqLen, kHeadDim}, opts_);
-//   auto mask = CreateCausalMask(kSeqLen, device_);
-//   auto out = torch::empty_like(q);
-
-//   SegmentCtx ctx{q, k, v, mask, out};
-//   RunAclnnAttention(ctx, kNumHeads, kNumKvHeads, scale, stream_);
-//   CHECK_EQ(aclrtSynchronizeStream(stream_), ACL_SUCCESS);
-
-//   auto ref = ReferenceAttention(q, k, v, scale);
-//   auto out_f32 = out.to(torch::kCPU).to(torch::kFloat32);
-//   float max_diff = (out_f32 - ref).abs().max().item<float>();
-//   EXPECT_LT(max_diff, 5e-2f)
-//       << "aclnn output diverges from FP32 reference, max_diff=" << max_diff;
-// }
-
-// // ===========================================================================
-// // Benchmarks – pipelined: pre-allocated workspace + reused ACL descriptors
-// // ===========================================================================
-// TEST_F(SegmentedPrefillAttentionTest, BenchFewLargeSegments) {
-//   constexpr int64_t kNumHeads = 32;
-//   constexpr int64_t kNumKvHeads = 8;
-//   constexpr int64_t kHeadDim = 128;
-//   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
-
-//   std::vector<Segment> segments = {{0, 256}, {512, 512}, {1280, 256}};
-//   auto ctxs =
-//       BuildSegmentCtxs(kNumHeads, kNumKvHeads, kHeadDim, segments, opts_);
-//   double ms = BenchmarkSegmentedPrefill(ctxs, kNumHeads, kNumKvHeads, scale,
-//                                         kDeviceId, stream_, 5, 50);
-//   LogBenchResult("FewLarge(3seg,1024tok)", segments, ms);
-// }
-
-// TEST_F(SegmentedPrefillAttentionTest, BenchMediumSegments) {
-//   constexpr int64_t kNumHeads = 32;
-//   constexpr int64_t kNumKvHeads = 8;
-//   constexpr int64_t kHeadDim = 128;
-//   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
-
-//   std::vector<Segment> segments = {
-//       {0, 128},    {256, 256},  {768, 128},
-//       {1024, 256}, {1536, 128}, {1792, 256},
-//   };
-//   auto ctxs =
-//       BuildSegmentCtxs(kNumHeads, kNumKvHeads, kHeadDim, segments, opts_);
-//   double ms = BenchmarkSegmentedPrefill(ctxs, kNumHeads, kNumKvHeads, scale,
-//                                         kDeviceId, stream_, 5, 50);
-//   LogBenchResult("Medium(6seg,1152tok)", segments, ms);
-// }
-
-// TEST_F(SegmentedPrefillAttentionTest, BenchManySmallSegments) {
-//   constexpr int64_t kNumHeads = 32;
-//   constexpr int64_t kNumKvHeads = 8;
-//   constexpr int64_t kHeadDim = 128;
-//   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
-
-//   std::vector<Segment> segments;
-//   for (int i = 0; i < 32; ++i) {
-//     segments.push_back({i * 256, 64});
-//   }
-//   auto ctxs =
-//       BuildSegmentCtxs(kNumHeads, kNumKvHeads, kHeadDim, segments, opts_);
-//   double ms = BenchmarkSegmentedPrefill(ctxs, kNumHeads, kNumKvHeads, scale,
-//                                         kDeviceId, stream_, 5, 50);
-//   LogBenchResult("ManySmall(32seg,2048tok)", segments, ms);
-// }
-
-// TEST_F(SegmentedPrefillAttentionTest, BenchLargeSegments) {
-//   constexpr int64_t kNumHeads = 32;
-//   constexpr int64_t kNumKvHeads = 8;
-//   constexpr int64_t kHeadDim = 128;
-//   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
-
-//   std::vector<Segment> segments = {
-//       {0, 1024},
-//       {2048, 2048},
-//       {6144, 1024},
-//       {8192, 2048},
-//   };
-//   auto ctxs =
-//       BuildSegmentCtxs(kNumHeads, kNumKvHeads, kHeadDim, segments, opts_);
-//   double ms = BenchmarkSegmentedPrefill(ctxs, kNumHeads, kNumKvHeads, scale,
-//                                         kDeviceId, stream_, 3, 20);
-//   LogBenchResult("Large(4seg,6144tok)", segments, ms);
-// }
-
-// TEST_F(SegmentedPrefillAttentionTest, BenchGQAConfig) {
-//   constexpr int64_t kNumHeads = 64;
-//   constexpr int64_t kNumKvHeads = 8;
-//   constexpr int64_t kHeadDim = 128;
-//   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
-
-//   std::vector<Segment> segments = {
-//       {0, 256},
-//       {512, 512},
-//       {1280, 256},
-//       {1792, 512},
-//   };
-//   auto ctxs =
-//       BuildSegmentCtxs(kNumHeads, kNumKvHeads, kHeadDim, segments, opts_);
-//   double ms = BenchmarkSegmentedPrefill(ctxs, kNumHeads, kNumKvHeads, scale,
-//                                         kDeviceId, stream_, 5, 50);
-//   LogBenchResult("GQA(4seg,1536tok,H64/KV8)", segments, ms);
-// }
-
-// ===========================================================================
-// Generative Recommendation: 4-part heterogeneous attention
-//
-// Sequence: [history | context | real_time | target]
-// Mask rules:
-//   history:   causal (only attend to previous history tokens)
-//   context:   full attention on all history + context
-//   real_time: full on history+context, causal within real_time
-//   target:    full on h+c+rt, each target token only sees itself
-//
-// Computation plan per batch (5 attn launches + 2 combines):
-//   Step 1:  q=history, kv=history, causal
-//   Step 2a: q=ctx+rt, kv=h+ctx, full  (output + lse)
-//   Step 2b: q=rt, kv=rt, causal        (output + lse)
-//   Combine: 2a[rt portion] ⊕ 2b → real_time final output
-//   Step 3a: q=target, kv=h+ctx+rt, full (output + lse)
-//   Step 3b: q=target, kv=target, diag   (output + lse)
-//   Combine: 3a ⊕ 3b → target final output
-// ===========================================================================
 
 struct SeqPartLengths {
   int64_t history;

@@ -17,7 +17,10 @@ limitations under the License.
 
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
+#include <vector>
+
 #include "acl/acl.h"
+#include "aclnnop/aclnn_attention_update.h"
 #include "aclnnop/aclnn_fused_infer_attention_score_v3.h"
 #include "core/kernels/npu/utils.h"
 
@@ -191,6 +194,158 @@ void destroy_planned_attention(PlannedAttentionCall& plan) {
   }
 }
 
+struct PlannedLseAttentionUpdateCall {
+  uint64_t workspace_size = 0;
+  aclOpExecutor* executor = nullptr;
+
+  std::vector<aclTensor*> local_out_acls;
+  std::vector<aclTensor*> lse_acls;
+  aclTensorList* local_out_list = nullptr;
+  aclTensorList* lse_list = nullptr;
+  aclTensor* out_acl = nullptr;
+  aclTensor* lse_out_acl = nullptr;
+};
+
+PlannedLseAttentionUpdateCall plan_lse_attention_update(
+    const std::vector<torch::Tensor>& local_out_flats,
+    const std::vector<torch::Tensor>& lse_flats,
+    torch::Tensor& out_flat,
+    const std::optional<torch::Tensor>& lse_out_flat) {
+  PlannedLseAttentionUpdateCall plan;
+  CHECK(!local_out_flats.empty()) << "local_out_flats must not be empty";
+  CHECK_EQ(local_out_flats.size(), lse_flats.size())
+      << "local_out_flats size must match lse_flats size";
+
+  plan.local_out_acls.reserve(local_out_flats.size());
+  plan.lse_acls.reserve(lse_flats.size());
+  for (size_t i = 0; i < local_out_flats.size(); ++i) {
+    aclTensor* local_out_acl = nullptr;
+    aclTensor* lse_acl = nullptr;
+    create_acltensor(&local_out_acl, local_out_flats[i]);
+    create_acltensor(&lse_acl, lse_flats[i]);
+    plan.local_out_acls.push_back(local_out_acl);
+    plan.lse_acls.push_back(lse_acl);
+  }
+
+  create_acltensor(&plan.out_acl, out_flat);
+  if (lse_out_flat.has_value()) {
+    create_acltensor(&plan.lse_out_acl, lse_out_flat.value());
+  }
+
+  plan.local_out_list =
+      aclCreateTensorList(plan.local_out_acls.data(), plan.local_out_acls.size());
+  plan.lse_list = aclCreateTensorList(plan.lse_acls.data(), plan.lse_acls.size());
+  CHECK_NE(plan.local_out_list, nullptr);
+  CHECK_NE(plan.lse_list, nullptr);
+
+  auto ret = aclnnAttentionUpdateGetWorkspaceSize(
+      plan.lse_list,
+      plan.local_out_list,
+      /*updateType=*/(plan.lse_out_acl != nullptr ? 1 : 0),
+      plan.out_acl,
+      plan.lse_out_acl,
+      &plan.workspace_size,
+      &plan.executor);
+  CHECK_EQ(ret, ACL_SUCCESS)
+      << "aclnnAttentionUpdateGetWorkspaceSize failed: " << ret;
+  return plan;
+}
+
+void execute_planned_lse_attention_update(
+    const PlannedLseAttentionUpdateCall& plan,
+    const torch::Device& device,
+    aclrtStream stream) {
+  void* workspace_ptr = nullptr;
+  if (plan.workspace_size > 0) {
+    auto& workspace = get_workspace_cache(device, plan.workspace_size);
+    workspace_ptr = workspace.data_ptr();
+  }
+  auto ret =
+      aclnnAttentionUpdate(workspace_ptr, plan.workspace_size, plan.executor, stream);
+  CHECK_EQ(ret, ACL_SUCCESS) << "aclnnAttentionUpdate failed: " << ret;
+}
+
+void destroy_planned_lse_attention_update(PlannedLseAttentionUpdateCall& plan) {
+  if (plan.local_out_list != nullptr) {
+    aclDestroyTensorList(plan.local_out_list);
+  }
+  if (plan.lse_list != nullptr) {
+    aclDestroyTensorList(plan.lse_list);
+  }
+  if (plan.out_acl != nullptr) {
+    aclDestroyTensor(plan.out_acl);
+  }
+  if (plan.lse_out_acl != nullptr) {
+    aclDestroyTensor(plan.lse_out_acl);
+  }
+  for (auto* t : plan.local_out_acls) {
+    if (t != nullptr) {
+      aclDestroyTensor(t);
+    }
+  }
+  for (auto* t : plan.lse_acls) {
+    if (t != nullptr) {
+      aclDestroyTensor(t);
+    }
+  }
+}
+
+struct LseAttentionUpdateResult {
+  torch::Tensor out;
+  std::optional<torch::Tensor> lse;
+};
+
+LseAttentionUpdateResult lse_attn_update(const std::vector<torch::Tensor>& local_outs,
+                                         const std::vector<torch::Tensor>& lses,
+                                         bool need_lse_out,
+                                         aclrtStream stream) {
+  CHECK(!local_outs.empty()) << "local_outs must not be empty";
+  CHECK_EQ(local_outs.size(), lses.size())
+      << "local_outs size must match lses size";
+  for (size_t i = 0; i < local_outs.size(); ++i) {
+    CHECK_EQ(local_outs[i].sizes(), local_outs[0].sizes())
+        << "all local_outs must have same shape";
+    CHECK_EQ(lses[i].sizes(), lses[0].sizes()) << "all lses must have same shape";
+  }
+  CHECK_EQ(local_outs[0].dim(), 4);
+  CHECK_EQ(lses[0].dim(), 4);
+
+  const int64_t b = local_outs[0].size(0);
+  const int64_t n = local_outs[0].size(1);
+  const int64_t s = local_outs[0].size(2);
+  const int64_t d = local_outs[0].size(3);
+  const int64_t bsh = b * n * s;
+
+  std::vector<torch::Tensor> local_out_flats;
+  std::vector<torch::Tensor> lse_flats;
+  local_out_flats.reserve(local_outs.size());
+  lse_flats.reserve(lses.size());
+  for (size_t i = 0; i < local_outs.size(); ++i) {
+    local_out_flats.push_back(local_outs[i].contiguous().view({bsh, d}));
+    lse_flats.push_back(lses[i].contiguous().view({bsh}));
+  }
+
+  auto out_flat = torch::empty({bsh, d}, local_outs[0].options());
+  std::optional<torch::Tensor> lse_out_flat = std::nullopt;
+  if (need_lse_out) {
+    lse_out_flat = torch::empty(
+        {bsh},
+        torch::TensorOptions().dtype(torch::kFloat32).device(local_outs[0].device()));
+  }
+
+  auto plan =
+      plan_lse_attention_update(local_out_flats, lse_flats, out_flat, lse_out_flat);
+  execute_planned_lse_attention_update(plan, local_outs[0].device(), stream);
+  destroy_planned_lse_attention_update(plan);
+
+  LseAttentionUpdateResult result;
+  result.out = out_flat.view({b, n, s, d});
+  if (lse_out_flat.has_value()) {
+    result.lse = lse_out_flat.value().view({b, n, s, 1});
+  }
+  return result;
+}
+
 torch::Tensor create_full_attention_mask(int64_t q_len,
                                          int64_t kv_len,
                                          torch::Device device) {
@@ -209,50 +364,6 @@ torch::Tensor create_compressed_causal_mask_2048(torch::Device device) {
                      torch::TensorOptions().dtype(torch::kBool).device(device))
       .triu(1)
       .contiguous();
-}
-
-torch::Tensor combine_flash_outputs(const torch::Tensor& o1,
-                                    const torch::Tensor& lse1,
-                                    const torch::Tensor& o2,
-                                    const torch::Tensor& lse2) {
-  auto max_l = torch::maximum(lse1, lse2);
-  auto e1 = torch::exp(lse1 - max_l);
-  auto e2 = torch::exp(lse2 - max_l);
-  auto o1_f = o1.to(torch::kFloat32);
-  auto o2_f = o2.to(torch::kFloat32);
-  return ((o1_f * e1 + o2_f * e2) / (e1 + e2)).to(o1.scalar_type());
-}
-
-torch::Tensor combine_flash_outputs_three(const torch::Tensor& o1,
-                                          const torch::Tensor& lse1,
-                                          const torch::Tensor& o2,
-                                          const torch::Tensor& lse2,
-                                          const torch::Tensor& o3,
-                                          const torch::Tensor& lse3) {
-  auto m = torch::maximum(torch::maximum(lse1, lse2), lse3);
-  auto e1 = torch::exp(lse1 - m);
-  auto e2 = torch::exp(lse2 - m);
-  auto e3 = torch::exp(lse3 - m);
-  auto o1_f = o1.to(torch::kFloat32);
-  auto o2_f = o2.to(torch::kFloat32);
-  auto o3_f = o3.to(torch::kFloat32);
-  return ((o1_f * e1 + o2_f * e2 + o3_f * e3) / (e1 + e2 + e3))
-      .to(o1.scalar_type());
-}
-
-torch::Tensor combine_lse_two(const torch::Tensor& lse1,
-                              const torch::Tensor& lse2) {
-  auto max_l = torch::maximum(lse1, lse2);
-  return max_l + torch::log(torch::exp(lse1 - max_l) + torch::exp(lse2 - max_l));
-}
-
-torch::Tensor combine_lse_three(const torch::Tensor& lse1,
-                                const torch::Tensor& lse2,
-                                const torch::Tensor& lse3) {
-  auto max_l = torch::maximum(torch::maximum(lse1, lse2), lse3);
-  return max_l +
-         torch::log(torch::exp(lse1 - max_l) + torch::exp(lse2 - max_l) +
-                    torch::exp(lse3 - max_l));
 }
 
 void run_genrec_v2_single_batch(
@@ -397,29 +508,38 @@ void run_genrec_v2_single_batch(
   execute_planned_attention(plan_3, workspace_ptr, workspace_size, stream);
   destroy_planned_attention(plan_3);
 
+  const bool need_lse_out =
+      softmax_lse.has_value() && valid_tensor(softmax_lse.value()) &&
+      softmax_lse.value().dim() == 4 && softmax_lse.value().size(2) >= total;
+
   auto rt_out_2a = out_2a.slice(2, c, c + r);
   auto rt_lse_2a = lse_2a.slice(2, c, c + r);
   auto rt_out_2b = out_2b.slice(2, 0, r);
   auto rt_lse_2b = lse_2b.slice(2, 0, r);
-  auto rt_final =
-      combine_flash_outputs(rt_out_2a, rt_lse_2a, rt_out_2b, rt_lse_2b);
-  auto rt_lse_final = combine_lse_two(rt_lse_2a, rt_lse_2b);
+  auto rt_update = lse_attn_update({rt_out_2a, rt_out_2b},
+                                   {rt_lse_2a, rt_lse_2b},
+                                   need_lse_out,
+                                   stream);
+  auto rt_final = rt_update.out;
+  auto rt_lse_final = rt_update.lse;
 
   auto tgt_out_2a = out_2a.slice(2, c + r, c + r + t);
   auto tgt_lse_2a = lse_2a.slice(2, c + r, c + r + t);
   auto tgt_out_2b = out_2b.slice(2, r, r + t);
   auto tgt_lse_2b = lse_2b.slice(2, r, r + t);
-  auto tgt_final = combine_flash_outputs_three(
-      tgt_out_2a, tgt_lse_2a, tgt_out_2b, tgt_lse_2b, out_3, lse_3);
-  auto tgt_lse_final = combine_lse_three(tgt_lse_2a, tgt_lse_2b, lse_3);
+  auto tgt_update = lse_attn_update({tgt_out_2a, tgt_out_2b, out_3},
+                                    {tgt_lse_2a, tgt_lse_2b, lse_3},
+                                    need_lse_out,
+                                    stream);
+  auto tgt_final = tgt_update.out;
+  auto tgt_lse_final = tgt_update.lse;
 
   int64_t offset = h + c;
   output.slice(2, offset, offset + r).copy_(rt_final);
   offset += r;
   output.slice(2, offset, offset + t).copy_(tgt_final);
 
-  if (softmax_lse.has_value() && valid_tensor(softmax_lse.value()) &&
-      softmax_lse.value().dim() == 4 && softmax_lse.value().size(2) >= total) {
+  if (need_lse_out) {
     auto lse_out = softmax_lse.value();
     lse_out.zero_();
     int64_t lse_offset = 0;
@@ -431,9 +551,9 @@ void run_genrec_v2_single_batch(
     lse_offset += h;
     lse_out.slice(2, lse_offset, lse_offset + c).copy_(lse_2a.slice(2, 0, c));
     lse_offset += c;
-    lse_out.slice(2, lse_offset, lse_offset + r).copy_(rt_lse_final);
+    lse_out.slice(2, lse_offset, lse_offset + r).copy_(rt_lse_final.value());
     lse_offset += r;
-    lse_out.slice(2, lse_offset, lse_offset + t).copy_(tgt_lse_final);
+    lse_out.slice(2, lse_offset, lse_offset + t).copy_(tgt_lse_final.value());
   }
 }
 

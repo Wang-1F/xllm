@@ -18,6 +18,86 @@ limitations under the License.
 #include "segmented_prefill_attention_test.cpp"
 #include "aclnnop/aclnn_attention_update.h"
 
+#include <cstdio>
+#include <sstream>
+#include <string>
+
+namespace {
+
+std::string TorchTensorBrief(const torch::Tensor& t) {
+  std::ostringstream oss;
+  oss << "sizes=[";
+  for (int i = 0; i < t.dim(); ++i) {
+    if (i) oss << ",";
+    oss << t.size(i);
+  }
+  oss << "] strides=[";
+  for (int i = 0; i < t.dim(); ++i) {
+    if (i) oss << ",";
+    oss << t.stride(i);
+  }
+  oss << "] dtype=" << static_cast<int>(t.scalar_type())
+      << " contig=" << (t.is_contiguous() ? 1 : 0) << " numel=" << t.numel();
+  return oss.str();
+}
+
+// Debug aclnnAttentionUpdate inputs (stderr — works without glog init).
+// For performance runs keep this disabled to avoid host-side overhead.
+constexpr bool kDebugAttentionUpdate = false;
+void LogAttentionUpdateBeforeGetWs(const char* where,
+                                   int64_t b,
+                                   int64_t n,
+                                   int64_t seq,
+                                   int64_t d,
+                                   int64_t bsh,
+                                   int sp,
+                                   int64_t update_type,
+                                   const void* lse_out,
+                                   const torch::Tensor& lo1,
+                                   const torch::Tensor& lo2,
+                                   const torch::Tensor& lse_a,
+                                   const torch::Tensor& lse_b,
+                                   const torch::Tensor& out,
+                                   const torch::Tensor* lo3,
+                                   const torch::Tensor* lse_c) {
+  if (!kDebugAttentionUpdate) return;
+  fprintf(stderr,
+          "[AttentionUpdate][%s] b=%lld n=%lld s=%lld d=%lld bsh=%lld sp=%d "
+          "updateType=%lld lseOut=%p\n",
+          where, static_cast<long long>(b), static_cast<long long>(n),
+          static_cast<long long>(seq), static_cast<long long>(d),
+          static_cast<long long>(bsh), sp,
+          static_cast<long long>(update_type), lse_out);
+  fprintf(stderr, "  device=%s\n", out.device().str().c_str());
+  fprintf(stderr, "  localOut[0]: %s\n", TorchTensorBrief(lo1).c_str());
+  fprintf(stderr, "  localOut[1]: %s\n", TorchTensorBrief(lo2).c_str());
+  if (lo3 != nullptr) {
+    fprintf(stderr, "  localOut[2]: %s\n", TorchTensorBrief(*lo3).c_str());
+  }
+  fprintf(stderr, "  lse[0]: %s\n", TorchTensorBrief(lse_a).c_str());
+  fprintf(stderr, "  lse[1]: %s\n", TorchTensorBrief(lse_b).c_str());
+  if (lse_c != nullptr) {
+    fprintf(stderr, "  lse[2]: %s\n", TorchTensorBrief(*lse_c).c_str());
+  }
+  fprintf(stderr, "  out: %s\n", TorchTensorBrief(out).c_str());
+  fprintf(stderr,
+          "  check: lse[0].size(0)=%lld localOut[0].size(0)=%lld "
+          "out.size(0)=%lld (should be equal)\n",
+          static_cast<long long>(lse_a.size(0)),
+          static_cast<long long>(lo1.size(0)),
+          static_cast<long long>(out.size(0)));
+  fflush(stderr);
+}
+
+// Step-by-step stderr trace (last line before crash = faulting stage).
+inline void AuTrace(const char* tag, const char* step) {
+  if (!kDebugAttentionUpdate) return;
+  fprintf(stderr, "[AU][%s] %s\n", tag, step);
+  fflush(stderr);
+}
+
+}  // namespace
+
 namespace xllm::kernel::npu::test {
 
 using namespace util;
@@ -36,6 +116,7 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecAttention) {
   const int64_t seq_len = parts.total();  // 2508
 
   const int64_t total_S = kBatchSize * seq_len;
+  // [bs, n, d]
   auto q_all = torch::randn({total_S, kNumHeads, kHeadDim}, opts_);
   auto k_all = torch::randn({total_S, kNumKvHeads, kHeadDim}, opts_);
   auto v_all = torch::randn({total_S, kNumKvHeads, kHeadDim}, opts_);
@@ -56,7 +137,6 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecAttention) {
   for (auto& batch : all_batches)
     for (auto& call : batch) call.CreateAcl();
 
-  torch::Tensor combine_workspace;
   auto combine_two_way_attention_update =
       [&](const torch::Tensor& out1,
           const torch::Tensor& lse1,
@@ -73,22 +153,34 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecAttention) {
     const int64_t d = out1.size(3);
     const int64_t bsh = b * n * s;
 
-    auto local_out1_flat = out1.contiguous().view({bsh, d});
-    auto local_out2_flat = out2.contiguous().view({bsh, d});
-    auto lse1_flat = lse1.contiguous().view({bsh});
-    auto lse2_flat = lse2.contiguous().view({bsh});
-    auto out_flat = torch::empty({bsh, d}, out1.options());
+    // See V2 combine: FP32 localOut/out for aclnnAttentionUpdate on this stack.
+    auto local_out1_flat =
+        out1.contiguous().reshape({bsh, d}).to(torch::kFloat32);
+    auto local_out2_flat =
+        out2.contiguous().reshape({bsh, d}).to(torch::kFloat32);
+    auto lse1_flat =
+        lse1.squeeze(-1).to(torch::kFloat32).contiguous().reshape({bsh});
+    auto lse2_flat =
+        lse2.squeeze(-1).to(torch::kFloat32).contiguous().reshape({bsh});
+    auto out_flat = torch::empty(
+        {bsh, d},
+        torch::TensorOptions().dtype(torch::kFloat32).device(out1.device()));
 
-    aclTensor* local_out_acls[2] = {TorchToAclTensor(local_out1_flat),
-                                    TorchToAclTensor(local_out2_flat)};
-    aclTensor* lse_acls[2] = {TorchToAclTensor(lse1_flat),
-                              TorchToAclTensor(lse2_flat)};
-    aclTensor* out_acl = TorchToAclTensor(out_flat);
+    aclTensor* local_out_acls[2] = {TorchToAclTensorRowMajorNd(local_out1_flat),
+                                    TorchToAclTensorRowMajorNd(local_out2_flat)};
+    aclTensor* lse_acls[2] = {TorchToAclTensorRowMajorNd(lse1_flat),
+                              TorchToAclTensorRowMajorNd(lse2_flat)};
+    aclTensor* out_acl = TorchToAclTensorRowMajorNd(out_flat);
 
     aclTensorList* local_out_list = aclCreateTensorList(local_out_acls, 2);
     CHECK_NE(local_out_list, nullptr);
     aclTensorList* lse_list = aclCreateTensorList(lse_acls, 2);
     CHECK_NE(lse_list, nullptr);
+
+    LogAttentionUpdateBeforeGetWs("BenchGenRecAttention_V1_2way", b, n, s, d,
+                                    bsh, 2, 0, nullptr, local_out1_flat,
+                                    local_out2_flat, lse1_flat, lse2_flat,
+                                    out_flat, nullptr, nullptr);
 
     uint64_t ws_size = 0;
     aclOpExecutor* executor = nullptr;
@@ -100,33 +192,80 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecAttention) {
         /*lseOut=*/nullptr,
         &ws_size,
         &executor);
+    if (kDebugAttentionUpdate) {
+      fprintf(stderr,
+              "[AttentionUpdate][BenchGenRecAttention_V1_2way] "
+              "aclnnAttentionUpdateGetWorkspaceSize -> ret=%d ws_size=%llu "
+              "executor=%p\n",
+              static_cast<int>(ret),
+              static_cast<unsigned long long>(ws_size),
+              static_cast<void*>(executor));
+      fflush(stderr);
+    }
+    AuTrace("V1_2way", "01 after GetWs log");
     CHECK_EQ(ret, ACL_SUCCESS) << "aclnnAttentionUpdateGetWorkspaceSize failed: "
                                << ret;
+    AuTrace("V1_2way", "02 CHECK GetWs ok");
 
     void* ws_ptr = nullptr;
     if (ws_size > 0) {
-      if (!combine_workspace.defined() ||
-          combine_workspace.device() != out1.device() ||
-          static_cast<uint64_t>(combine_workspace.numel()) < ws_size) {
-        combine_workspace = torch::empty(
-            {static_cast<int64_t>(ws_size)},
-            torch::TensorOptions().dtype(torch::kUInt8).device(out1.device()));
+      AuTrace("V1_2way", "03 aclrtMalloc workspace (avoid torch cross-call reuse)");
+      CHECK_EQ(aclrtMalloc(&ws_ptr, ws_size, ACL_MEM_MALLOC_HUGE_FIRST),
+               ACL_SUCCESS)
+          << "aclrtMalloc AttentionUpdate workspace";
+      if (kDebugAttentionUpdate) {
+        fprintf(stderr, "[AU][V1_2way] 04 ws_ptr=%p ws_size=%llu\n", ws_ptr,
+                static_cast<unsigned long long>(ws_size));
+        fflush(stderr);
       }
-      ws_ptr = combine_workspace.data_ptr();
+    } else {
+      AuTrace("V1_2way", "04 ws_size==0 skip device workspace");
     }
 
+    AuTrace("V1_2way", "05 before aclnnAttentionUpdate");
     ret = aclnnAttentionUpdate(ws_ptr, ws_size, executor, stream_);
+    AuTrace("V1_2way", "06 after aclnnAttentionUpdate (sync still pending)");
     CHECK_EQ(ret, ACL_SUCCESS) << "aclnnAttentionUpdate failed: " << ret;
+    // aclnnAttentionUpdate is asynchronous; destroying aclTensor / lists while
+    // the device may still read them causes segfault on the next launch.
+    AuTrace("V1_2way", "07 before aclrtSynchronizeStream");
+    CHECK_EQ(aclrtSynchronizeStream(stream_), ACL_SUCCESS)
+        << "aclrtSynchronizeStream after aclnnAttentionUpdate";
+    AuTrace("V1_2way", "08 after aclrtSynchronizeStream");
+    if (ws_ptr != nullptr) {
+      CHECK_EQ(aclrtFree(ws_ptr), ACL_SUCCESS) << "aclrtFree workspace";
+      ws_ptr = nullptr;
+    }
+    // Must release executor before the next GetWorkspaceSize; otherwise the
+    // runtime can segfault on the following aclnn op (see aclDestroyAclOpExecutor).
+    
 
-    aclDestroyTensorList(local_out_list);
-    aclDestroyTensorList(lse_list);
+    // out_acl wraps out_flat.data_ptr(); aclDestroyTensor(out_acl) can
+    // invalidate that device memory for PyTorch — clone BEFORE any aclDestroy.
+    AuTrace("V1_2way", "10a clone+cast output (before aclDestroyTensor)");
+    torch::Tensor output_flag_copy = out_flat.clone();
+    output_flag_copy = output_flag_copy.to(out1.scalar_type());
+    output_flag_copy = output_flag_copy.contiguous();
+    AuTrace("V1_2way", "10b view BNSD on detached copy");
+    torch::Tensor out_ret = output_flag_copy.view({b, n, s, d});
+
+    // aclDestroyTensorList already releases tensors in the list; do NOT
+    // aclDestroyTensor those same pointers again (double-free → next GetWs crash).
+
+    AuTrace("V1_2way", "11 aclDestroyTensorList(local_out), aclDestroyTensorList(lse)");
+    if (local_out_list != nullptr) {
+      aclDestroyTensorList(local_out_list);
+    }
+    if (lse_list != nullptr) {
+      aclDestroyTensorList(lse_list);
+    }
+    // aclDestroyTensor(local_out_acls[0]);
+    // aclDestroyTensor(local_out_acls[1]);
+    // aclDestroyTensor(lse_acls[0]);
+    // aclDestroyTensor(lse_acls[1]);
     aclDestroyTensor(out_acl);
-    aclDestroyTensor(local_out_acls[0]);
-    aclDestroyTensor(local_out_acls[1]);
-    aclDestroyTensor(lse_acls[0]);
-    aclDestroyTensor(lse_acls[1]);
-
-    return out_flat.view({b, n, s, d});
+    AuTrace("V1_2way", "16 acl cleanup done, return");
+    return out_ret;
   };
 
   const char* step_tags[] = {"hist_causal", "ctx_rt_full", "rt_causal",
@@ -173,10 +312,13 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecAttention) {
         // Keep combine behavior consistent with the measured round.
         auto rt_out_2a = batch0[1].out.slice(2, parts.context);
         auto rt_lse_2a = batch0[1].lse.slice(2, parts.context);
+
+        (void)combine_two_way_attention_update(
+          batch0[3].out, batch0[3].lse, batch0[4].out, batch0[4].lse);
+        CHECK_EQ(aclrtSynchronizeStream(stream_), ACL_SUCCESS);
         (void)combine_two_way_attention_update(
             rt_out_2a, rt_lse_2a, batch0[2].out, batch0[2].lse);
-        (void)combine_two_way_attention_update(
-            batch0[3].out, batch0[3].lse, batch0[4].out, batch0[4].lse);
+        
         CHECK_EQ(aclrtSynchronizeStream(stream_), ACL_SUCCESS);
       }
 
@@ -349,7 +491,6 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecV2Attention) {
   for (auto& batch : all_batches)
     for (auto& call : batch) call.CreateAcl();
 
-  torch::Tensor combine_workspace;
   auto combine_two_way_attention_update =
       [&](const torch::Tensor& out1,
           const torch::Tensor& lse1,
@@ -366,22 +507,33 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecV2Attention) {
     const int64_t d = out1.size(3);
     const int64_t bsh = b * n * s;
 
-    auto local_out1_flat = out1.contiguous().view({bsh, d});
-    auto local_out2_flat = out2.contiguous().view({bsh, d});
-    auto lse1_flat = lse1.contiguous().view({bsh});
-    auto lse2_flat = lse2.contiguous().view({bsh});
-    auto out_flat = torch::empty({bsh, d}, out1.options());
+    auto local_out1_flat =
+        out1.contiguous().reshape({bsh, d}).to(torch::kFloat32);
+    auto local_out2_flat =
+        out2.contiguous().reshape({bsh, d}).to(torch::kFloat32);
+    auto lse1_flat =
+        lse1.squeeze(-1).to(torch::kFloat32).contiguous().reshape({bsh});
+    auto lse2_flat =
+        lse2.squeeze(-1).to(torch::kFloat32).contiguous().reshape({bsh});
+    auto out_flat = torch::empty(
+        {bsh, d},
+        torch::TensorOptions().dtype(torch::kFloat32).device(out1.device()));
 
-    aclTensor* local_out_acls[2] = {TorchToAclTensor(local_out1_flat),
-                                    TorchToAclTensor(local_out2_flat)};
-    aclTensor* lse_acls[2] = {TorchToAclTensor(lse1_flat),
-                              TorchToAclTensor(lse2_flat)};
-    aclTensor* out_acl = TorchToAclTensor(out_flat);
+    aclTensor* local_out_acls[2] = {TorchToAclTensorRowMajorNd(local_out1_flat),
+                                    TorchToAclTensorRowMajorNd(local_out2_flat)};
+    aclTensor* lse_acls[2] = {TorchToAclTensorRowMajorNd(lse1_flat),
+                              TorchToAclTensorRowMajorNd(lse2_flat)};
+    aclTensor* out_acl = TorchToAclTensorRowMajorNd(out_flat);
 
     aclTensorList* local_out_list = aclCreateTensorList(local_out_acls, 2);
     CHECK_NE(local_out_list, nullptr);
     aclTensorList* lse_list = aclCreateTensorList(lse_acls, 2);
     CHECK_NE(lse_list, nullptr);
+
+    LogAttentionUpdateBeforeGetWs("BenchGenRecV2_2way", b, n, s, d, bsh, 2, 0,
+                                    nullptr, local_out1_flat, local_out2_flat,
+                                    lse1_flat, lse2_flat, out_flat, nullptr,
+                                    nullptr);
 
     uint64_t ws_size = 0;
     aclOpExecutor* executor = nullptr;
@@ -393,33 +545,63 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecV2Attention) {
         /*lseOut=*/nullptr,
         &ws_size,
         &executor);
+    if (kDebugAttentionUpdate) {
+      fprintf(stderr,
+              "[AttentionUpdate][BenchGenRecV2_2way] "
+              "aclnnAttentionUpdateGetWorkspaceSize -> ret=%d ws_size=%llu "
+              "executor=%p\n",
+              static_cast<int>(ret),
+              static_cast<unsigned long long>(ws_size),
+              static_cast<void*>(executor));
+      fflush(stderr);
+    }
+    AuTrace("V2_2way", "01 after GetWs log");
     CHECK_EQ(ret, ACL_SUCCESS) << "aclnnAttentionUpdateGetWorkspaceSize failed: "
                                << ret;
 
     void* ws_ptr = nullptr;
     if (ws_size > 0) {
-      if (!combine_workspace.defined() ||
-          combine_workspace.device() != out1.device() ||
-          static_cast<uint64_t>(combine_workspace.numel()) < ws_size) {
-        combine_workspace = torch::empty(
-            {static_cast<int64_t>(ws_size)},
-            torch::TensorOptions().dtype(torch::kUInt8).device(out1.device()));
+      CHECK_EQ(aclrtMalloc(&ws_ptr, ws_size, ACL_MEM_MALLOC_HUGE_FIRST),
+               ACL_SUCCESS)
+          << "aclrtMalloc AttentionUpdate workspace";
+      if (kDebugAttentionUpdate) {
+        fprintf(stderr, "[AU][V2_2way] ws_ptr=%p size=%llu\n", ws_ptr,
+                static_cast<unsigned long long>(ws_size));
+        fflush(stderr);
       }
-      ws_ptr = combine_workspace.data_ptr();
     }
 
+    AuTrace("V2_2way", "04 before aclnnAttentionUpdate");
     ret = aclnnAttentionUpdate(ws_ptr, ws_size, executor, stream_);
+    AuTrace("V2_2way", "05 after aclnnAttentionUpdate");
     CHECK_EQ(ret, ACL_SUCCESS) << "aclnnAttentionUpdate failed: " << ret;
+    AuTrace("V2_2way", "06 before aclrtSynchronizeStream");
+    CHECK_EQ(aclrtSynchronizeStream(stream_), ACL_SUCCESS)
+        << "aclrtSynchronizeStream after aclnnAttentionUpdate";
+    AuTrace("V2_2way", "07 after aclrtSynchronizeStream");
+    if (ws_ptr != nullptr) {
+      CHECK_EQ(aclrtFree(ws_ptr), ACL_SUCCESS) << "aclrtFree workspace";
+      ws_ptr = nullptr;
+    }
 
+    AuTrace("V2_2way", "08a clone+view before aclDestroy (match V1 order)");
+    torch::Tensor out_bnsd = out_flat.clone().to(out1.scalar_type());
+    torch::Tensor out_ret = out_bnsd.view({b, n, s, d});
+
+    // if (executor != nullptr) {
+    //   AuTrace("V2_2way", "08 before aclDestroyAclOpExecutor");
+    //   CHECK_EQ(static_cast<int>(aclDestroyAclOpExecutor(executor)), 0)
+    //       << "aclDestroyAclOpExecutor failed";
+    //   AuTrace("V2_2way", "09 after aclDestroyAclOpExecutor");
+    // }
+
+    // Lists own their aclTensor handles; do not aclDestroyTensor those pointers.
+    AuTrace("V2_2way", "10 aclDestroyTensorList x2, aclDestroyTensor(out)");
     aclDestroyTensorList(local_out_list);
     aclDestroyTensorList(lse_list);
     aclDestroyTensor(out_acl);
-    aclDestroyTensor(local_out_acls[0]);
-    aclDestroyTensor(local_out_acls[1]);
-    aclDestroyTensor(lse_acls[0]);
-    aclDestroyTensor(lse_acls[1]);
-
-    return out_flat.view({b, n, s, d});
+    AuTrace("V2_2way", "11 acl cleanup done, return");
+    return out_ret;
   };
   auto combine_three_way_attention_update =
       [&](const torch::Tensor& out1,
@@ -441,26 +623,39 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecV2Attention) {
     const int64_t d = out1.size(3);
     const int64_t bsh = b * n * s;
 
-    auto local_out1_flat = out1.contiguous().view({bsh, d});
-    auto local_out2_flat = out2.contiguous().view({bsh, d});
-    auto local_out3_flat = out3.contiguous().view({bsh, d});
-    auto lse1_flat = lse1.contiguous().view({bsh});
-    auto lse2_flat = lse2.contiguous().view({bsh});
-    auto lse3_flat = lse3.contiguous().view({bsh});
-    auto out_flat = torch::empty({bsh, d}, out1.options());
+    auto local_out1_flat =
+        out1.contiguous().reshape({bsh, d}).to(torch::kFloat32);
+    auto local_out2_flat =
+        out2.contiguous().reshape({bsh, d}).to(torch::kFloat32);
+    auto local_out3_flat =
+        out3.contiguous().reshape({bsh, d}).to(torch::kFloat32);
+    auto lse1_flat =
+        lse1.squeeze(-1).to(torch::kFloat32).contiguous().reshape({bsh});
+    auto lse2_flat =
+        lse2.squeeze(-1).to(torch::kFloat32).contiguous().reshape({bsh});
+    auto lse3_flat =
+        lse3.squeeze(-1).to(torch::kFloat32).contiguous().reshape({bsh});
+    auto out_flat = torch::empty(
+        {bsh, d},
+        torch::TensorOptions().dtype(torch::kFloat32).device(out1.device()));
 
-    aclTensor* local_out_acls[3] = {TorchToAclTensor(local_out1_flat),
-                                    TorchToAclTensor(local_out2_flat),
-                                    TorchToAclTensor(local_out3_flat)};
-    aclTensor* lse_acls[3] = {TorchToAclTensor(lse1_flat),
-                              TorchToAclTensor(lse2_flat),
-                              TorchToAclTensor(lse3_flat)};
-    aclTensor* out_acl = TorchToAclTensor(out_flat);
+    aclTensor* local_out_acls[3] = {TorchToAclTensorRowMajorNd(local_out1_flat),
+                                    TorchToAclTensorRowMajorNd(local_out2_flat),
+                                    TorchToAclTensorRowMajorNd(local_out3_flat)};
+    aclTensor* lse_acls[3] = {TorchToAclTensorRowMajorNd(lse1_flat),
+                              TorchToAclTensorRowMajorNd(lse2_flat),
+                              TorchToAclTensorRowMajorNd(lse3_flat)};
+    aclTensor* out_acl = TorchToAclTensorRowMajorNd(out_flat);
 
     aclTensorList* local_out_list = aclCreateTensorList(local_out_acls, 3);
     CHECK_NE(local_out_list, nullptr);
     aclTensorList* lse_list = aclCreateTensorList(lse_acls, 3);
     CHECK_NE(lse_list, nullptr);
+
+    LogAttentionUpdateBeforeGetWs("BenchGenRecV2_3way", b, n, s, d, bsh, 3, 0,
+                                    nullptr, local_out1_flat, local_out2_flat,
+                                    lse1_flat, lse2_flat, out_flat,
+                                    &local_out3_flat, &lse3_flat);
 
     uint64_t ws_size = 0;
     aclOpExecutor* executor = nullptr;
@@ -472,35 +667,62 @@ TEST_F(SegmentedPrefillAttentionTest, BenchGenRecV2Attention) {
         /*lseOut=*/nullptr,
         &ws_size,
         &executor);
+    if (kDebugAttentionUpdate) {
+      fprintf(stderr,
+              "[AttentionUpdate][BenchGenRecV2_3way] "
+              "aclnnAttentionUpdateGetWorkspaceSize -> ret=%d ws_size=%llu "
+              "executor=%p\n",
+              static_cast<int>(ret),
+              static_cast<unsigned long long>(ws_size),
+              static_cast<void*>(executor));
+      fflush(stderr);
+    }
+    AuTrace("V2_3way", "01 after GetWs log");
     CHECK_EQ(ret, ACL_SUCCESS) << "aclnnAttentionUpdateGetWorkspaceSize failed: "
                                << ret;
 
     void* ws_ptr = nullptr;
     if (ws_size > 0) {
-      if (!combine_workspace.defined() ||
-          combine_workspace.device() != out1.device() ||
-          static_cast<uint64_t>(combine_workspace.numel()) < ws_size) {
-        combine_workspace = torch::empty(
-            {static_cast<int64_t>(ws_size)},
-            torch::TensorOptions().dtype(torch::kUInt8).device(out1.device()));
+      CHECK_EQ(aclrtMalloc(&ws_ptr, ws_size, ACL_MEM_MALLOC_HUGE_FIRST),
+               ACL_SUCCESS)
+          << "aclrtMalloc AttentionUpdate workspace";
+      if (kDebugAttentionUpdate) {
+        fprintf(stderr, "[AU][V2_3way] ws_ptr=%p size=%llu\n", ws_ptr,
+                static_cast<unsigned long long>(ws_size));
+        fflush(stderr);
       }
-      ws_ptr = combine_workspace.data_ptr();
     }
 
+    AuTrace("V2_3way", "04 before aclnnAttentionUpdate");
     ret = aclnnAttentionUpdate(ws_ptr, ws_size, executor, stream_);
+    AuTrace("V2_3way", "05 after aclnnAttentionUpdate");
     CHECK_EQ(ret, ACL_SUCCESS) << "aclnnAttentionUpdate failed: " << ret;
+    AuTrace("V2_3way", "06 before aclrtSynchronizeStream");
+    CHECK_EQ(aclrtSynchronizeStream(stream_), ACL_SUCCESS)
+        << "aclrtSynchronizeStream after aclnnAttentionUpdate";
+    AuTrace("V2_3way", "07 after aclrtSynchronizeStream");
+    if (ws_ptr != nullptr) {
+      CHECK_EQ(aclrtFree(ws_ptr), ACL_SUCCESS) << "aclrtFree workspace";
+      ws_ptr = nullptr;
+    }
 
+    AuTrace("V2_3way", "08a clone+view before aclDestroy (match V1 order)");
+    torch::Tensor out_bnsd = out_flat.clone().to(out1.scalar_type());
+    torch::Tensor out_ret = out_bnsd.view({b, n, s, d});
+
+    // if (executor != nullptr) {
+    //   AuTrace("V2_3way", "08 before aclDestroyAclOpExecutor");
+    //   CHECK_EQ(static_cast<int>(aclDestroyAclOpExecutor(executor)), 0)
+    //       << "aclDestroyAclOpExecutor failed";
+    //   AuTrace("V2_3way", "09 after aclDestroyAclOpExecutor");
+    // }
+
+    AuTrace("V2_3way", "10 aclDestroyTensorList x2, aclDestroyTensor(out)");
     aclDestroyTensorList(local_out_list);
     aclDestroyTensorList(lse_list);
     aclDestroyTensor(out_acl);
-    aclDestroyTensor(local_out_acls[0]);
-    aclDestroyTensor(local_out_acls[1]);
-    aclDestroyTensor(local_out_acls[2]);
-    aclDestroyTensor(lse_acls[0]);
-    aclDestroyTensor(lse_acls[1]);
-    aclDestroyTensor(lse_acls[2]);
-
-    return out_flat.view({b, n, s, d});
+    AuTrace("V2_3way", "11 acl cleanup done, return");
+    return out_ret;
   };
 
   static const char* step_tags[4] = {"v2_hist", "v2_ctx_rt_tgt_full",
