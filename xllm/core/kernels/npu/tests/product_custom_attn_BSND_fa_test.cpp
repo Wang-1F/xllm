@@ -70,8 +70,6 @@ struct AttentionMetadata {
   torch::Tensor target_lens;
   torch::Tensor compressed_causal_mask;
   torch::Tensor diagonal_mask;
-  // 预先申请的大 full mask，运行时按实际 q/kv 长度 slice 使用。
-  torch::Tensor full_attention_mask;
   // 预先申请的共享 workspace（单流复用，aclrtMalloc 风格）。
   void* shared_workspace = nullptr;
   uint64_t shared_workspace_size = 0;
@@ -260,13 +258,6 @@ void expect_final_output_matches_reference_genrec_gold(
 
   EXPECT_LT(static_cast<float>(max_abs), kFinalMaxAbs);
   EXPECT_TRUE(allclose);
-}
-
-torch::Tensor create_full_attention_mask(int64_t q_len,
-                                         int64_t kv_len,
-                                         torch::Device device) {
-  return torch::zeros({1, 1, q_len, kv_len},
-                      torch::TensorOptions().dtype(torch::kBool).device(device));
 }
 
 torch::Tensor create_diagonal_mask(int64_t seq_len, torch::Device device) {
@@ -615,8 +606,6 @@ void run_genrec_v2_single_batch(const torch::Tensor& query,
   constexpr int64_t kSparseModeFullMask = 0;
   constexpr int64_t kSparseModeLeftUpCausal = 2;
   constexpr int64_t kDefaultWindow = 2147483647LL;
-  CHECK(valid_tensor(attn_metadata.full_attention_mask))
-      << "full_attention_mask must be set before run";
 
   auto out_opts = torch::TensorOptions().dtype(query.scalar_type()).device(query.device());
   auto lse_opts = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
@@ -660,9 +649,6 @@ void run_genrec_v2_single_batch(const torch::Tensor& query,
     auto crt_value = value.slice(0, i, i + 1).slice(1, 0, h + c);
 
     SegmentAttentionMetadata crt_meta;
-    crt_meta.attn_mask = attn_metadata.full_attention_mask.slice(2, 0, c + r + t)
-                             .slice(3, 0, h + c)
-                             .contiguous();
     crt_meta.sparse_mode = kSparseModeFullMask;
     crt_meta.pre_tokens = kDefaultWindow;
     crt_meta.next_tokens = kDefaultWindow;
@@ -775,8 +761,6 @@ TEST_F(GenRecDirectRunBSNDCleanTest, DirectRunGenRecV2SingleBatchBSNDClean) {
   attn_metadata.target_lens = torch::tensor({kTarget}, len_opts);
   attn_metadata.compressed_causal_mask = create_compressed_causal_mask_2048(query.device());
   attn_metadata.diagonal_mask = create_diagonal_mask(kTarget, query.device());
-  attn_metadata.full_attention_mask =
-      create_full_attention_mask(total, total, query.device());
   constexpr uint64_t kFixedSharedWorkspaceBytes = 256ULL * 1024ULL * 1024ULL;  // 256MB
   const uint64_t max_workspace_size = kFixedSharedWorkspaceBytes;
   attn_metadata.shared_workspace_size = max_workspace_size;

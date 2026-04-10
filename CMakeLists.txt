@@ -316,6 +316,17 @@ if(USE_NPU)
   set(CMAKE_VERBOSE_MAKEFILE ON)
   add_definitions(-DTORCH_HIGHER_THAN_PTA6)
 
+  # Resolve NPU toolkit home robustly so include/link paths never collapse to
+  # invalid roots like "/include" when NPU_HOME_PATH is unset.
+  set(XLLM_NPU_HOME_PATH "$ENV{NPU_HOME_PATH}")
+  if("${XLLM_NPU_HOME_PATH}" STREQUAL "")
+    set(XLLM_NPU_HOME_PATH "$ENV{ASCEND_HOME_PATH}")
+  endif()
+  if("${XLLM_NPU_HOME_PATH}" STREQUAL "")
+    set(XLLM_NPU_HOME_PATH "$ENV{ASCEND_TOOLKIT_HOME}")
+  endif()
+  set(XLLM_NPU_HOME_PATH "${XLLM_NPU_HOME_PATH}" CACHE INTERNAL "Resolved NPU toolkit home path")
+
   add_subdirectory(
     "${XLLM_ATB_LAYERS_SOURCE_DIR}"
     "${CMAKE_BINARY_DIR}/xllm_atb_layers"
@@ -323,14 +334,15 @@ if(USE_NPU)
   message(STATUS "Configured xllm_atb_layers from source: ${XLLM_ATB_LAYERS_SOURCE_DIR}")
 
   include_directories(
+      ${Python_INCLUDE_DIRS}
       $ENV{PYTHON_INCLUDE_PATH}
       $ENV{PYTORCH_INSTALL_PATH}/include
       $ENV{PYTORCH_INSTALL_PATH}/include/torch/csrc/api/include
       $ENV{PYTORCH_NPU_INSTALL_PATH}/include
       $ENV{PYTORCH_INSTALL_PATH}/include/torch/csrc/distributed
-      $ENV{NPU_HOME_PATH}/include
+      ${XLLM_NPU_HOME_PATH}/include
       $ENV{ATB_HOME_PATH}/include
-      $ENV{NPU_HOME_PATH}/opp/vendors/xllm/op_api/include/
+      ${XLLM_NPU_HOME_PATH}/opp/vendors/xllm/op_api/include/
       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/torch_npu_ops/
   )
   # Keep third-party warnings suppressed while providing headers expected by
@@ -343,10 +355,10 @@ if(USE_NPU)
       $ENV{PYTHON_LIB_PATH}
       $ENV{PYTORCH_INSTALL_PATH}/lib
       $ENV{PYTORCH_NPU_INSTALL_PATH}/lib
-      $ENV{NPU_HOME_PATH}/lib64
+      ${XLLM_NPU_HOME_PATH}/lib64
       $ENV{ATB_HOME_PATH}/lib
       $ENV{NPU_TOOLKIT_HOME}/lib64
-      $ENV{NPU_HOME_PATH}/opp/vendors/xllm/op_api/lib/
+      ${XLLM_NPU_HOME_PATH}/opp/vendors/xllm/op_api/lib/
   )
   link_libraries(cust_opapi)
   # avoid conflicts with xllm libruntime.a

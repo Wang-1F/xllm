@@ -48,6 +48,8 @@ aclDataType type_info::get_acl_type(const torch::ScalarType& dtype) {
       return ACL_BF16;
     case torch::kInt8:
       return ACL_INT8;
+    case torch::kBool:
+      return ACL_BOOL;
     default:
       return ACL_INT32;
   }

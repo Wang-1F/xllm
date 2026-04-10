@@ -148,11 +148,13 @@ struct AttentionMetadata {
   int64_t genrec_context_len = 0;
   int64_t genrec_real_time_len = 0;
   int64_t genrec_target_len = 0;
+  int64_t genrec_matched_prefix_len = 0;
   // Optional per-batch lengths. Shape can be [batch] or [1].
   torch::Tensor genrec_history_lens;
   torch::Tensor genrec_context_lens;
   torch::Tensor genrec_real_time_lens;
   torch::Tensor genrec_target_lens;
+  torch::Tensor genrec_matched_prefix_lens;
 
 #if defined(USE_NPU)
   // for npu

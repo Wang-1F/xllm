@@ -34,21 +34,12 @@ class MTGRAttentionImpl : public torch::nn::Module {
                     float scale,
                     int64_t num_kv_heads);
 
-  std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
+ std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
       const AttentionMetadata& attn_metadata,
       torch::Tensor& query,
       torch::Tensor& key,
       torch::Tensor& value,
       KVCache& kv_cache);
-
- private:
-  torch::Tensor build_bool_attention_mask(const AttentionMetadata& attn_metadata,
-                                          int64_t batch_idx,
-                                          int64_t q_start,
-                                          int64_t q_len,
-                                          int64_t kv_start,
-                                          int64_t kv_len,
-                                          const torch::Device& device);
 
   int64_t num_heads_ = 0;
   int64_t head_size_ = 0;

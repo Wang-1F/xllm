@@ -87,7 +87,113 @@ cc_test(
   NAME
     genrec_attention_structured_test_BSND_clean
   SRCS
-    genrec_attention_structured_test_BSND_clean.cpp
+    product_custom_attn_BSND_fa_test.cpp
+  INCLUDES
+    /usr/local/Ascend/ascend-toolkit/latest/include
+    /usr/local/Ascend/cann-8.5.0/aarch64-linux/include
+  DEPS
+    torch
+    ascendcl
+    nnopbase
+    opapi
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
+    aclnn_generec_attention_structured_test_BSND_clear
+  SRCS
+    aclnn_generec_attention_structured_test_BSND_clear.cpp
+  INCLUDES
+    /usr/local/Ascend/ascend-toolkit/latest/include
+    /usr/local/Ascend/cann-8.5.0/aarch64-linux/include
+  DEPS
+    torch
+    ascendcl
+    nnopbase
+    opapi
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
+    final_BSND_test
+  SRCS
+    final_BSND_test.cpp
+  INCLUDES
+    /usr/local/Ascend/ascend-toolkit/latest/include
+    /usr/local/Ascend/cann-8.5.0/aarch64-linux/include
+  DEPS
+    torch
+    ascendcl
+    nnopbase
+    opapi
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
+    final_BSND_benchmark
+  SRCS
+    benchmark.cpp
+  INCLUDES
+    /usr/local/Ascend/ascend-toolkit/latest/include
+    /usr/local/Ascend/cann-8.5.0/aarch64-linux/include
+  DEPS
+    torch
+    ascendcl
+    nnopbase
+    opapi
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
+    mtgr_attention_single_side_precision_test
+  SRCS
+    mtgr_attention_single_side_precision_test.cpp
+    ../utils.cpp
+  INCLUDES
+    /usr/local/Ascend/ascend-toolkit/latest/include
+    /usr/local/Ascend/cann-8.5.0/aarch64-linux/include
+  DEPS
+    npu_torch_layers
+    torch
+    ascendcl
+    nnopbase
+    opapi
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
+    atb_paged_attention_BSND_test
+  SRCS
+    atb_paged_attention_BSND_test.cpp
+  INCLUDES
+    /usr/local/Ascend/ascend-toolkit/latest/include
+    /usr/local/Ascend/cann-8.5.0/aarch64-linux/include
+  DEPS
+    torch_npu_kernels
+    atb
+    torch
+    ascendcl
+    nnopbase
+    opapi
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
+    aclnn_paged_attention_BSND_test
+  SRCS
+    aclnn_paged_attention_BSND_test.cpp
   INCLUDES
     /usr/local/Ascend/ascend-toolkit/latest/include
     /usr/local/Ascend/cann-8.5.0/aarch64-linux/include
