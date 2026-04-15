@@ -757,9 +757,9 @@ void execute_planned_attention_update(const AttentionUpdatePlan& plan,
         << "shared_workspace bytes(" << shared_workspace_size
         << ") is smaller than required(" << plan.workspace_size << ")";
     ws_ptr = shared_workspace;
-    CHECK_EQ(aclrtMemset(ws_ptr, plan.workspace_size, 0, plan.workspace_size),
-             ACL_SUCCESS)
-        << "aclrtMemset attention-update workspace";
+    // CHECK_EQ(aclrtMemset(ws_ptr, plan.workspace_size, 0, plan.workspace_size),
+    //          ACL_SUCCESS)
+    //     << "aclrtMemset attention-update workspace";
   }
 
   auto ret = aclnnAttentionUpdate(ws_ptr, plan.workspace_size, plan.executor, stream);

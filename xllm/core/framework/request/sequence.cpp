@@ -473,11 +473,43 @@ SequenceOutputType Sequence::output_type() {
 }
 
 void Sequence::generate_embeddings_output(SequenceOutput& output) {
+  LOG(INFO) << "[MTGR_TRACE][SEQUENCE] generate_embeddings_output begin "
+            << "request_id=" << request_id_ << " index=" << index_
+            << " embedding_defined=" << output_embedding_.defined();
   output.index = index_;
-  Slice<float> embedding_slice = {
-      output_embedding_.data_ptr<float>(),
-      static_cast<size_t>(output_embedding_.size(0))};
-  output.embeddings = embedding_slice;
+  if (!output_embedding_.defined()) {
+    LOG(ERROR) << "[MTGR_TRACE][SEQUENCE] output_embedding is undefined "
+               << "request_id=" << request_id_ << " index=" << index_;
+    output.embeddings = std::vector<float>{};
+    return;
+  }
+  LOG(INFO) << "[MTGR_TRACE][SEQUENCE] output_embedding raw shape="
+            << output_embedding_.sizes() << " dim=" << output_embedding_.dim()
+            << " numel=" << output_embedding_.numel()
+            << " dtype=" << output_embedding_.dtype()
+            << " device=" << output_embedding_.device();
+
+  torch::Tensor host_embedding = output_embedding_;
+  if (host_embedding.dim() > 1) {
+    host_embedding = host_embedding.reshape({-1});
+  }
+  if (host_embedding.scalar_type() != torch::kFloat32 ||
+      !host_embedding.device().is_cpu()) {
+    LOG(INFO) << "[MTGR_TRACE][SEQUENCE] converting embedding to CPU float "
+              << "request_id=" << request_id_ << " index=" << index_;
+    host_embedding = host_embedding.to(
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+  }
+  if (!host_embedding.is_contiguous()) {
+    host_embedding = host_embedding.contiguous();
+  }
+
+  const float* ptr = host_embedding.data_ptr<float>();
+  const size_t numel = static_cast<size_t>(host_embedding.numel());
+  output.embeddings = std::vector<float>(ptr, ptr + numel);
+  LOG(INFO) << "[MTGR_TRACE][SEQUENCE] generate_embeddings_output done "
+            << "request_id=" << request_id_ << " index=" << index_
+            << " output_size=" << output.embeddings->size();
 }
 
 void Sequence::generate_mm_embeddings_output(SequenceOutput& output) {
@@ -503,17 +535,32 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
   AUTO_COUNTER(detokenization_latency_seconds_non_stream);
 
   SequenceOutputType seq_output_type = output_type();
+  LOG(INFO) << "[MTGR_TRACE][SEQUENCE] generate_output begin request_id="
+            << request_id_ << " index=" << index_
+            << " output_type=" << static_cast<int>(seq_output_type)
+            << " num_tokens=" << num_tokens_
+            << " num_prompt_tokens=" << num_prompt_tokens_
+            << " finish_reason="
+            << finish_reason_.to_string().value_or("NONE");
 
   SequenceOutput output;
   // 1. return mm embeddings for output
   if (seq_output_type == SequenceOutputType::MM_EMBEDDINGS) {
+    LOG(INFO) << "[MTGR_TRACE][SEQUENCE] branch=mm_embeddings request_id="
+              << request_id_ << " index=" << index_;
     generate_mm_embeddings_output(output);
+    LOG(INFO) << "[MTGR_TRACE][SEQUENCE] branch=mm_embeddings done request_id="
+              << request_id_ << " index=" << index_;
     return output;
   }
 
   // 2. return embeddings for output
   if (seq_output_type == SequenceOutputType::EMBEDDINGS) {
+    LOG(INFO) << "[MTGR_TRACE][SEQUENCE] branch=embeddings request_id="
+              << request_id_ << " index=" << index_;
     generate_embeddings_output(output);
+    LOG(INFO) << "[MTGR_TRACE][SEQUENCE] branch=embeddings done request_id="
+              << request_id_ << " index=" << index_;
     return output;
   }
 
@@ -530,7 +577,12 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
 
   // 3. generate onerec output
   if (is_onerec_model()) {
+    LOG(INFO) << "[MTGR_TRACE][SEQUENCE] branch=onerec_tokens request_id="
+              << request_id_ << " index=" << index_ << " size=" << size;
     generate_onerec_output(ids, size, output);
+    LOG(INFO) << "[MTGR_TRACE][SEQUENCE] branch=onerec_tokens done request_id="
+              << request_id_ << " index=" << index_
+              << " token_ids=" << output.token_ids.size();
     return output;
   }
 
@@ -564,6 +616,11 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
   const size_t end = decoder_.output_offset();
   output.token_ids = ids.slice(start, end);
   generate_output_tokens_logprobs(start, end, tokenizer, output.logprobs);
+
+  LOG(INFO) << "[MTGR_TRACE][SEQUENCE] branch=tokens done request_id="
+            << request_id_ << " index=" << index_ << " text_size="
+            << output.text.size() << " token_ids=" << output.token_ids.size()
+            << " has_logprobs=" << output.logprobs.has_value();
 
   return output;
 }

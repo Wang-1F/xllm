@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "rec_master.h"
 
+#include <atomic>
 #include <absl/strings/str_join.h>
 #include <absl/time/time.h>
 #include <gflags/gflags.h>
@@ -23,6 +24,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <string>
+#include <sstream>
 #include <unordered_set>
 #include <vector>
 
@@ -43,10 +45,16 @@ namespace xllm {
 
 namespace {
 
-constexpr int32_t kDefaultPlaceholderToken = 20152019;
 constexpr const char* kOneRecSparseEmbeddingName = "sparse_embedding";
 constexpr const char* kOneRecDecoderContextEmbeddingName =
     "decoder_context_embedding";
+constexpr const char* kMtgrInputEmbeddingName = "input_embedding";
+constexpr const char* kMtgrHistoryLenName = "history_len";
+constexpr const char* kMtgrContextLenName = "context_len";
+constexpr const char* kMtgrRealTimeLenName = "real_time_len";
+constexpr const char* kMtgrRealtimeLenAlias = "realtime_len";
+constexpr const char* kMtgrTargetLenName = "target_len";
+std::atomic<uint64_t> g_mtgr_prompt_token_salt{1};
 
 std::string format_tensor_shape(const proto::InferInputTensor& tensor) {
   std::vector<std::string> dims;
@@ -57,6 +65,22 @@ std::string format_tensor_shape(const proto::InferInputTensor& tensor) {
   return "[" + absl::StrJoin(dims, ", ") + "]";
 }
 
+std::string format_torch_tensor(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+  std::ostringstream oss;
+  oss << "shape=[";
+  for (int64_t i = 0; i < tensor.dim(); ++i) {
+    if (i > 0) {
+      oss << ", ";
+    }
+    oss << tensor.size(i);
+  }
+  oss << "], dtype=" << tensor.scalar_type() << ", device=" << tensor.device();
+  return oss.str();
+}
+
 RecType get_rec_type(const ModelArgs& model_args) {
   const auto kind = get_rec_model_kind(model_args.model_type());
   switch (kind) {
@@ -64,10 +88,146 @@ RecType get_rec_type(const ModelArgs& model_args) {
       return RecType::kOneRec;
     case RecModelKind::kLlmRec:
       return RecType::kLlmRec;
+    case RecModelKind::kMtgr:
+      return RecType::kMtgr;
     case RecModelKind::kNone:
       return RecType::kNone;
   }
   return RecType::kNone;
+}
+
+uint64_t next_mtgr_prompt_token_salt() {
+  return g_mtgr_prompt_token_salt.fetch_add(1, std::memory_order_relaxed);
+}
+
+int32_t make_mtgr_non_cacheable_token(uint64_t unique_salt, int32_t position) {
+  const uint64_t mixed =
+      unique_salt * 1315423911ULL + static_cast<uint64_t>(position) + 1;
+  return -static_cast<int32_t>(0x40000000ULL + (mixed & 0x1fffffffULL));
+}
+
+}  // namespace
+
+namespace rec_master_internal {
+
+std::vector<int32_t> build_mtgr_prompt_tokens(
+    const std::optional<std::vector<int32_t>>& prompt_tokens,
+    int32_t total_seq_len,
+    int32_t cacheable_prefix_len,
+    uint64_t unique_salt) {
+  CHECK_GE(total_seq_len, 0);
+  CHECK_GE(cacheable_prefix_len, 0);
+  CHECK_LE(cacheable_prefix_len, total_seq_len);
+
+  std::vector<int32_t> result(total_seq_len);
+  if (prompt_tokens.has_value()) {
+    CHECK_EQ(static_cast<int32_t>(prompt_tokens->size()), total_seq_len);
+    std::copy(prompt_tokens->begin(), prompt_tokens->end(), result.begin());
+  } else {
+    for (int32_t pos = 0; pos < total_seq_len; ++pos) {
+      result[pos] = make_mtgr_non_cacheable_token(unique_salt, pos);
+    }
+    return result;
+  }
+
+  // MTGR only allows prefix-cache reuse before the target segment. Make the
+  // target segment request-unique so cached KV never skips the required target
+  // forward.
+  for (int32_t pos = cacheable_prefix_len; pos < total_seq_len; ++pos) {
+    result[pos] = make_mtgr_non_cacheable_token(unique_salt, pos);
+  }
+  return result;
+}
+
+}  // namespace rec_master_internal
+
+namespace {
+
+bool validate_mtgr_embedding_tensor(const proto::InferInputTensor& tensor,
+                                    const ModelArgs& model_args,
+                                    OutputCallback callback) {
+  if (!tensor.has_contents()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR input tensor '" + tensor.name() +
+                            "' has no contents");
+    return false;
+  }
+  if (tensor.data_type() != proto::DataType::FLOAT &&
+      tensor.data_type() != proto::DataType::BFLOAT16) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR input_embedding must use FLOAT(fp32) or BFLOAT16, got " +
+                            proto::DataType_Name(tensor.data_type()));
+    return false;
+  }
+  if (tensor.shape_size() != 2) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR input_embedding must be 2-D [len, hidden], got " +
+                            format_tensor_shape(tensor));
+    return false;
+  }
+  const int64_t seq_len = tensor.shape(0);
+  const int64_t hidden = tensor.shape(1);
+  if (seq_len <= 0 || hidden <= 0) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR input_embedding must have positive shape, got " +
+                            format_tensor_shape(tensor));
+    return false;
+  }
+  if (hidden != model_args.hidden_size()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR input_embedding hidden size mismatch, expected " +
+                            std::to_string(model_args.hidden_size()) +
+                            ", got " + std::to_string(hidden));
+    return false;
+  }
+  return true;
+}
+
+std::optional<int32_t> parse_mtgr_scalar_tensor(
+    const proto::InferInputTensor& tensor,
+    OutputCallback callback) {
+  int64_t numel = 1;
+  for (int i = 0; i < tensor.shape_size(); ++i) {
+    numel *= tensor.shape(i);
+  }
+  if (numel != 1) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR length tensor '" + tensor.name() +
+                            "' must contain exactly one value, got shape " +
+                            format_tensor_shape(tensor));
+    return std::nullopt;
+  }
+  if (!tensor.has_contents()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR length tensor '" + tensor.name() +
+                            "' has no contents");
+    return std::nullopt;
+  }
+
+  switch (tensor.data_type()) {
+    case proto::DataType::INT32:
+      if (tensor.contents().int_contents_size() != 1) {
+        CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                            "MTGR length tensor '" + tensor.name() +
+                                "' int contents size mismatch");
+        return std::nullopt;
+      }
+      return tensor.contents().int_contents(0);
+    case proto::DataType::INT64:
+      if (tensor.contents().int64_contents_size() != 1) {
+        CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                            "MTGR length tensor '" + tensor.name() +
+                                "' int64 contents size mismatch");
+        return std::nullopt;
+      }
+      return static_cast<int32_t>(tensor.contents().int64_contents(0));
+    default:
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "MTGR length tensor '" + tensor.name() +
+                              "' must use INT32 or INT64, got " +
+                              proto::DataType_Name(tensor.data_type()));
+      return std::nullopt;
+  }
 }
 
 bool process_onerec_inputs(
@@ -301,6 +461,168 @@ bool process_llmrec_with_mm_data_inputs(
   return true;
 }
 
+bool process_mtgr_inputs(
+    const std::optional<std::vector<int>>& prompt_tokens,
+    const std::optional<std::vector<proto::InferInputTensor>>& input_tensors,
+    const ModelArgs& model_args,
+    std::vector<int32_t>* local_prompt_tokens,
+    torch::Tensor* input_embedding,
+    MMData* processed_mm_data,
+    OutputCallback callback) {
+  if (!input_tensors.has_value() || input_tensors->empty()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR requires input_tensors to be provided");
+    return false;
+  }
+
+  if (prompt_tokens.has_value()) {
+    local_prompt_tokens->assign(prompt_tokens->begin(), prompt_tokens->end());
+  }
+
+  std::optional<int32_t> history_len;
+  std::optional<int32_t> context_len;
+  std::optional<int32_t> real_time_len;
+  std::optional<int32_t> target_len;
+
+  for (const auto& tensor : input_tensors.value()) {
+    const auto& tensor_name = tensor.name();
+    LOG(INFO) << "[MTGR_TRACE][MASTER] parsing tensor name=" << tensor_name
+              << " dtype=" << proto::DataType_Name(tensor.data_type())
+              << " shape=" << format_tensor_shape(tensor)
+              << " has_contents=" << tensor.has_contents();
+    if (tensor_name == kMtgrInputEmbeddingName) {
+      if (input_embedding->defined()) {
+        CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                            "Duplicate MTGR input tensor: " + tensor_name);
+        return false;
+      }
+      if (!validate_mtgr_embedding_tensor(tensor, model_args, callback)) {
+        return false;
+      }
+      try {
+        *input_embedding =
+            util::convert_rec_tensor_to_torch(tensor).to(torch::kBFloat16);
+        LOG(INFO) << "[MTGR_TRACE][MASTER] parsed input_embedding "
+                  << format_torch_tensor(*input_embedding);
+      } catch (const std::exception& e) {
+        CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                            "Failed to parse MTGR input_embedding: " +
+                                std::string(e.what()));
+        return false;
+      }
+      continue;
+    }
+
+    auto assign_length = [&](std::optional<int32_t>* dst) -> bool {
+      if (dst->has_value()) {
+        CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                            "Duplicate MTGR input tensor: " + tensor_name);
+        return false;
+      }
+      auto value = parse_mtgr_scalar_tensor(tensor, callback);
+      if (!value.has_value()) {
+        return false;
+      }
+      *dst = value.value();
+      return true;
+    };
+
+    if (tensor_name == kMtgrHistoryLenName) {
+      if (!assign_length(&history_len)) {
+        return false;
+      }
+    } else if (tensor_name == kMtgrContextLenName) {
+      if (!assign_length(&context_len)) {
+        return false;
+      }
+    } else if (tensor_name == kMtgrRealTimeLenName ||
+               tensor_name == kMtgrRealtimeLenAlias) {
+      if (!assign_length(&real_time_len)) {
+        return false;
+      }
+    } else if (tensor_name == kMtgrTargetLenName) {
+      if (!assign_length(&target_len)) {
+        return false;
+      }
+    } else {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Unsupported MTGR input tensor: " + tensor_name);
+      return false;
+    }
+  }
+
+  if (!input_embedding->defined()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR input_tensors must include 'input_embedding'");
+    return false;
+  }
+  if (!history_len.has_value() || !context_len.has_value() ||
+      !real_time_len.has_value() || !target_len.has_value()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR input_tensors must include history_len/context_len/real_time_len/target_len");
+    return false;
+  }
+
+  const int32_t total_seq_len = static_cast<int32_t>(input_embedding->size(0));
+  const int32_t history = history_len.value();
+  const int32_t context = context_len.value();
+  const int32_t real_time = real_time_len.value();
+  const int32_t target = target_len.value();
+  if (history < 0 || context < 0 || real_time < 0 || target <= 0) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR segment lengths must satisfy history/context/real_time >= 0 and target > 0");
+    return false;
+  }
+  if (history + context + real_time + target != total_seq_len) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR segment lengths must sum to input_embedding length");
+    return false;
+  }
+
+  if (!local_prompt_tokens->empty() &&
+      static_cast<int32_t>(local_prompt_tokens->size()) !=
+             total_seq_len) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "MTGR prompt_tokens length must equal input_embedding length");
+    return false;
+  }
+
+  const int32_t cacheable_prefix_len = history + context + real_time;
+  if (local_prompt_tokens->empty()) {
+    LOG(WARNING) << "MTGR request does not provide token_ids. "
+                 << "Disabling prefix-cache reuse for this request.";
+  }
+  std::optional<std::vector<int32_t>> prompt_tokens_for_cache =
+      local_prompt_tokens->empty()
+          ? std::nullopt
+          : std::optional<std::vector<int32_t>>(*local_prompt_tokens);
+  *local_prompt_tokens = rec_master_internal::build_mtgr_prompt_tokens(
+      prompt_tokens_for_cache,
+      total_seq_len,
+      cacheable_prefix_len,
+      next_mtgr_prompt_token_salt());
+
+  LOG(INFO) << "[MTGR_TRACE][MASTER] process_mtgr_inputs done"
+            << " total_seq_len=" << total_seq_len
+            << " history=" << history
+            << " context=" << context
+            << " real_time=" << real_time
+            << " target=" << target
+            << " cacheable_prefix_len=" << cacheable_prefix_len
+            << " prompt_tokens_in="
+            << (prompt_tokens.has_value() ? prompt_tokens->size() : 0)
+            << " prompt_tokens_out=" << local_prompt_tokens->size()
+            << " embedding=" << format_torch_tensor(*input_embedding);
+
+  MMDict mm_dict;
+  mm_dict[kMtgrHistoryLenName] = torch::tensor({history}, torch::kInt32);
+  mm_dict[kMtgrContextLenName] = torch::tensor({context}, torch::kInt32);
+  mm_dict[kMtgrRealTimeLenName] = torch::tensor({real_time}, torch::kInt32);
+  mm_dict[kMtgrTargetLenName] = torch::tensor({target}, torch::kInt32);
+  *processed_mm_data = MMData(MMType::EMBEDDING, mm_dict);
+  return true;
+}
+
 }  // namespace
 
 // ============================================================
@@ -451,6 +773,45 @@ std::shared_ptr<Request> RecMaster::OneRecMasterPipeline::generate_request(
                                       /*build_stop_checker=*/false);
 }
 
+RecMaster::MtgrMasterPipeline::MtgrMasterPipeline(RecMaster& master)
+    : RecMasterPipeline(master) {}
+
+std::shared_ptr<Request> RecMaster::MtgrMasterPipeline::generate_request(
+    std::string prompt,
+    std::optional<std::vector<int>> prompt_tokens,
+    std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+    const RequestParams& sp,
+    OutputCallback callback) {
+  Timer timer;
+  std::vector<int32_t> local_prompt_tokens;
+  torch::Tensor input_embedding;
+  MMData processed_mm_data;
+
+  if (!process_mtgr_inputs(prompt_tokens,
+                           input_tensors,
+                           master_.model_args_,
+                           &local_prompt_tokens,
+                           &input_embedding,
+                           &processed_mm_data,
+                           callback)) {
+    return nullptr;
+  }
+
+  LOG(INFO) << "[MTGR_TRACE][MASTER] build request request_id=" << sp.request_id
+            << " prompt_tokens=" << local_prompt_tokens.size()
+            << " input_embedding=" << format_torch_tensor(input_embedding);
+
+  COUNTER_ADD(tokenization_latency_seconds, timer.elapsed_seconds());
+
+  return master_.build_request_common(std::move(prompt),
+                                      std::move(local_prompt_tokens),
+                                      std::move(processed_mm_data),
+                                      std::move(input_embedding),
+                                      sp,
+                                      callback,
+                                      /*build_stop_checker=*/false);
+}
+
 // ============================================================
 // RecMaster pipeline factory (static method)
 // ============================================================
@@ -465,6 +826,8 @@ std::unique_ptr<RecMaster::RecMasterPipeline> RecMaster::create_pipeline(
       return std::make_unique<LlmRecWithMmDataMasterPipeline>(master);
     case RecPipelineType::kOneRecDefault:
       return std::make_unique<OneRecMasterPipeline>(master);
+    case RecPipelineType::kRecPrefillOnly:
+      return std::make_unique<MtgrMasterPipeline>(master);
     default:
       LOG(FATAL) << "Unknown RecMaster pipeline type: "
                  << static_cast<int>(type);
@@ -569,7 +932,8 @@ void RecMaster::handle_request(
     RequestParams sp,
     OutputCallback callback) {
   // This interface supports both OneRec and LlmRec (qwen3 without mm_data)
-  if (rec_type_ != RecType::kOneRec && rec_type_ != RecType::kLlmRec) {
+  if (rec_type_ != RecType::kOneRec && rec_type_ != RecType::kLlmRec &&
+      rec_type_ != RecType::kMtgr) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "Unsupported rec type for this interface");
     return;
@@ -700,6 +1064,7 @@ std::shared_ptr<Request> RecMaster::build_request_common(
     std::string prompt,
     std::vector<int32_t> prompt_tokens,
     MMData mm_data,
+    torch::Tensor input_embedding,
     const RequestParams& sp,
     OutputCallback callback,
     bool build_stop_checker) {
@@ -741,7 +1106,8 @@ std::shared_ptr<Request> RecMaster::build_request_common(
   sampling_param.top_k = sp.top_k;
   sampling_param.logprobs = sp.logprobs;
   sampling_param.top_logprobs = sp.top_logprobs;
-  sampling_param.is_embeddings = sp.is_embeddings;
+  sampling_param.is_embeddings =
+      sp.is_embeddings || rec_type_ == RecType::kMtgr;
   sampling_param.beam_width = sp.beam_width;
   if (best_of > sp.n) {
     sampling_param.logprobs = true;
@@ -793,6 +1159,7 @@ std::shared_ptr<Request> RecMaster::build_request_common(
   RequestState req_state(std::move(prompt),
                          std::move(prompt_tokens),
                          std::move(mm_data),
+                         std::move(input_embedding),
                          std::move(sampling_param),
                          std::move(stopping_checker),
                          capacity,
@@ -815,6 +1182,22 @@ std::shared_ptr<Request> RecMaster::build_request_common(
                                            sp.service_request_id,
                                            sp.source_xservice_addr);
   return request;
+}
+
+std::shared_ptr<Request> RecMaster::build_request_common(
+    std::string prompt,
+    std::vector<int32_t> prompt_tokens,
+    MMData mm_data,
+    const RequestParams& sp,
+    OutputCallback callback,
+    bool build_stop_checker) {
+  return build_request_common(std::move(prompt),
+                              std::move(prompt_tokens),
+                              std::move(mm_data),
+                              torch::Tensor(),
+                              sp,
+                              callback,
+                              build_stop_checker);
 }
 
 }  // namespace xllm

@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "core/common/rec_model_utils.h"
 #include "onerec_batch_input_builder.h"
+#include "rec_prefill_only_batch_input_builder.h"
 #include "rec_multi_round_batch_input_builder.h"
 
 namespace xllm {
@@ -65,6 +66,17 @@ std::unique_ptr<RecBatchInputBuilder> RecBatchInputBuilder::create(
       }
       // Fall through for non-multi-round LlmRec (not yet implemented)
       break;
+    case RecType::kMtgr:
+      return std::make_unique<RecPrefillOnlyBatchInputBuilder>(
+          sequence_groups,
+          allowed_max_tokens,
+          input_embeddings_vec,
+          mm_data_vec,
+          swap_block_transfer_infos,
+          batch_id,
+          args,
+          batch_forward_type,
+          thread_pool);
     case RecType::kNone:
       break;
   }

@@ -50,6 +50,26 @@ limitations under the License.
 
 namespace xllm {
 
+namespace {
+
+std::string format_torch_tensor(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+  std::ostringstream oss;
+  oss << "shape=[";
+  for (int64_t i = 0; i < tensor.dim(); ++i) {
+    if (i > 0) {
+      oss << ", ";
+    }
+    oss << tensor.size(i);
+  }
+  oss << "], dtype=" << tensor.scalar_type() << ", device=" << tensor.device();
+  return oss.str();
+}
+
+}  // namespace
+
 // ============================================================
 // RecWorkerImpl Implementation (base)
 // ============================================================
@@ -485,6 +505,103 @@ void RecWorkerImpl::LlmRecWithMmDataWorkPipeline::prepare_work_before_execute(
   } else if (input_embedding.defined()) {
     processed_inputs.input_params.input_embedding = input_embedding;
   }
+}
+
+ForwardInput RecWorkerImpl::RecPrefillOnlyWorkPipeline::prepare_inputs(
+    Batch& batch) {
+  ThreadPool* thread_pool =
+      runtime_.worker.input_builder_thread_pool_
+          ? runtime_.worker.input_builder_thread_pool_.get()
+          : nullptr;
+
+  auto input = batch.prepare_rec_forward_input(
+      runtime_.worker.options_.num_decoding_tokens(),
+      /*min_decoding_batch_size=*/0,
+      runtime_.context->get_model_args(),
+      thread_pool);
+  const auto* mtgr_params = input.input_params.mtgr_params();
+  LOG(INFO) << "[MTGR_TRACE][WORKER] prepare_inputs token_ids="
+            << format_torch_tensor(input.token_ids)
+            << " positions=" << format_torch_tensor(input.positions)
+            << " input_embedding="
+            << format_torch_tensor(input.input_params.input_embedding)
+            << " history_lens="
+            << format_torch_tensor(
+                   mtgr_params != nullptr ? mtgr_params->history_lens
+                                          : torch::Tensor())
+            << " context_lens="
+            << format_torch_tensor(
+                   mtgr_params != nullptr ? mtgr_params->context_lens
+                                          : torch::Tensor())
+            << " real_time_lens="
+            << format_torch_tensor(
+                   mtgr_params != nullptr ? mtgr_params->real_time_lens
+                                          : torch::Tensor())
+            << " target_lens="
+            << format_torch_tensor(
+                   mtgr_params != nullptr ? mtgr_params->target_lens
+                                          : torch::Tensor())
+            << " matched_prefix_lens="
+            << format_torch_tensor(
+                   mtgr_params != nullptr ? mtgr_params->matched_prefix_lens
+                                          : torch::Tensor());
+  return input;
+}
+
+std::optional<ForwardOutput> RecWorkerImpl::RecPrefillOnlyWorkPipeline::step(
+    const ForwardInput& input) {
+  Timer timer;
+  runtime_.worker.device_.set_device();
+
+  LOG(INFO) << "[MTGR_TRACE][WORKER] step begin token_ids="
+            << format_torch_tensor(input.token_ids)
+            << " positions=" << format_torch_tensor(input.positions)
+            << " input_embedding="
+            << format_torch_tensor(input.input_params.input_embedding)
+            << " batch_forward_type="
+            << static_cast<int32_t>(input.input_params.batch_forward_type.value());
+
+  LOG(INFO) << "[MTGR_TRACE][WORKER] calling executor->forward";
+  auto model_output = runtime_.executor->forward(input.token_ids,
+                                                 input.positions,
+                                                 runtime_.worker.kv_caches_,
+                                                 input.input_params);
+  LOG(INFO) << "[MTGR_TRACE][WORKER] executor->forward returned hidden_states="
+            << format_torch_tensor(model_output.hidden_states);
+  auto hidden_states = model_output.hidden_states;
+  if (!hidden_states.defined()) {
+    LOG(ERROR) << "[MTGR_TRACE][WORKER] hidden_states is undefined";
+    return std::nullopt;
+  }
+
+  if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
+      !runtime_.worker.options_.enable_speculative_decode()) {
+    runtime_.stream->synchronize();
+    COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
+    DeviceMonitor::get_instance().update_active_activation_memory(
+        runtime_.worker.device_.index());
+    return std::nullopt;
+  }
+
+  ForwardOutput output;
+  SampleOutput sample_output;
+  if (input.sampling_params.selected_token_idxes.defined() &&
+      input.sampling_params.selected_token_idxes.numel() > 0) {
+    sample_output.embeddings = runtime_.model->pooler(
+        hidden_states, input.sampling_params.selected_token_idxes);
+  } else {
+    sample_output.embeddings = hidden_states;
+  }
+  output.sample_output = sample_output;
+  output.embedding = sample_output.embeddings;
+  LOG(INFO) << "[MTGR_TRACE][WORKER] step output embedding="
+            << format_torch_tensor(output.embedding);
+
+  runtime_.stream->synchronize();
+  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
+  DeviceMonitor::get_instance().update_active_activation_memory(
+      runtime_.worker.device_.index());
+  return output;
 }
 
 // ============================================================
@@ -1477,7 +1594,8 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
                                        context.get_quant_args(),
                                        context.get_tensor_options());
 
-    if (rec_model_kind_ == RecModelKind::kOneRec) {
+    if (rec_model_kind_ == RecModelKind::kOneRec ||
+        rec_model_kind_ == RecModelKind::kMtgr) {
       runtime.model = create_rec_model(*runtime.context.get());
     } else {
       runtime.model = create_llm_model(*runtime.context.get());
@@ -1657,6 +1775,8 @@ std::unique_ptr<RecWorkerImpl::RecWorkPipeline> RecWorkerImpl::create_pipeline(
       return std::make_unique<LlmRecWorkPipeline>(runtime);
     case RecPipelineType::kOneRecDefault:
       return std::make_unique<OneRecWorkPipeline>(runtime);
+    case RecPipelineType::kRecPrefillOnly:
+      return std::make_unique<RecPrefillOnlyWorkPipeline>(runtime);
     case RecPipelineType::kLlmRecMultiRoundPipeline:
       return std::make_unique<LlmRecMultiRoundPipeline>(runtime);
     default:

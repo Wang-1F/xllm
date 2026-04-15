@@ -147,6 +147,47 @@ struct OneRecModelInputParams {
   }
 };
 
+struct MtgrModelInputParams {
+  torch::Tensor history_lens;
+  torch::Tensor context_lens;
+  torch::Tensor real_time_lens;
+  torch::Tensor target_lens;
+  torch::Tensor matched_prefix_lens;
+
+  MtgrModelInputParams to(const c10::Device& device) const {
+    MtgrModelInputParams result = *this;
+    result.history_lens = safe_to(history_lens, device, true);
+    result.context_lens = safe_to(context_lens, device, true);
+    result.real_time_lens = safe_to(real_time_lens, device, true);
+    result.target_lens = safe_to(target_lens, device, true);
+    result.matched_prefix_lens = safe_to(matched_prefix_lens, device, true);
+    return result;
+  }
+
+  void print() const {
+    if (history_lens.defined()) {
+      LOG(INFO) << " MtgrModelInputParams history_lens shape: "
+                << history_lens.sizes();
+    }
+    if (context_lens.defined()) {
+      LOG(INFO) << " MtgrModelInputParams context_lens shape: "
+                << context_lens.sizes();
+    }
+    if (real_time_lens.defined()) {
+      LOG(INFO) << " MtgrModelInputParams real_time_lens shape: "
+                << real_time_lens.sizes();
+    }
+    if (target_lens.defined()) {
+      LOG(INFO) << " MtgrModelInputParams target_lens shape: "
+                << target_lens.sizes();
+    }
+    if (matched_prefix_lens.defined()) {
+      LOG(INFO) << " MtgrModelInputParams matched_prefix_lens shape: "
+                << matched_prefix_lens.sizes();
+    }
+  }
+};
+
 // Parameters for LLM Rec multi-round mode (device loop, beam search).
 struct LlmRecMultiRoundParams {
   // full kv caches provided by engine for step-level decode, per layer
@@ -257,7 +298,10 @@ struct LlmRecMultiRoundParams {
 };
 
 using RecModelInputParams = std::
-    variant<std::monostate, OneRecModelInputParams, LlmRecMultiRoundParams>;
+    variant<std::monostate,
+            OneRecModelInputParams,
+            MtgrModelInputParams,
+            LlmRecMultiRoundParams>;
 
 enum class TransferType : uint8_t {
   G2H = 0,  // global memory(KVCache store) to host memory(DRAM)
@@ -417,6 +461,8 @@ struct ModelInputParams {
     // rec_params device conversion for both OneRec and LLM-Rec variants
     if (const auto* onerec = onerec_params()) {
       params.rec_params = onerec->to(device);
+    } else if (const auto* mtgr = mtgr_params()) {
+      params.rec_params = mtgr->to(device);
     } else if (const auto* llmrec = llmrec_params()) {
       params.rec_params = llmrec->to(device);
     }
@@ -446,6 +492,9 @@ struct ModelInputParams {
     if (const auto* onerec = onerec_params()) {
       LOG(INFO) << "ModelInputParams: has onerec_params";
       onerec->print();
+    } else if (const auto* mtgr = mtgr_params()) {
+      LOG(INFO) << "ModelInputParams: has mtgr_params";
+      mtgr->print();
     } else if (const auto* llmrec = llmrec_params()) {
       LOG(INFO) << "ModelInputParams: has llm_rec_multi_round_params"
                 << ", beam_width=" << llmrec->beam_width
@@ -596,6 +645,19 @@ struct ModelInputParams {
       rec_params.emplace<OneRecModelInputParams>();
     }
     return std::get<OneRecModelInputParams>(rec_params);
+  }
+
+  const MtgrModelInputParams* mtgr_params() const {
+    return std::get_if<MtgrModelInputParams>(&rec_params);
+  }
+
+  bool has_mtgr_params() const { return mtgr_params() != nullptr; }
+
+  MtgrModelInputParams& mutable_mtgr_params() {
+    if (!has_mtgr_params()) {
+      rec_params.emplace<MtgrModelInputParams>();
+    }
+    return std::get<MtgrModelInputParams>(rec_params);
   }
 
   // Accessors for LLM Rec multi-round params inside rec_params variant

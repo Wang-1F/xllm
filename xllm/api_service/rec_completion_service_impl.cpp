@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <sstream>
 #include <string>
 
 #include "common/global_flags.h"
@@ -42,6 +43,33 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+constexpr const char* kRecResultTensorName = "rec_result";
+
+std::string format_infer_tensor_shape(const proto::InferInputTensor& tensor) {
+  std::ostringstream oss;
+  oss << "[";
+  for (int i = 0; i < tensor.shape_size(); ++i) {
+    if (i > 0) {
+      oss << ", ";
+    }
+    oss << tensor.shape(i);
+  }
+  oss << "]";
+  return oss.str();
+}
+
+void initialize_response(const std::string& request_id,
+                         int64_t created_time,
+                         const std::string& model,
+                         proto::CompletionResponse* response) {
+  CHECK(response != nullptr);
+  response->Clear();
+  response->set_object("text_completion");
+  response->set_id(request_id);
+  response->set_created(created_time);
+  response->set_model(model);
+}
+
 void set_logprobs(proto::Choice* choice,
                   const std::optional<std::vector<LogProb>>& logprobs) {
   if (!logprobs.has_value() || logprobs.value().empty()) {
@@ -56,21 +84,122 @@ void set_logprobs(proto::Choice* choice,
   }
 }
 
+bool has_embedding_outputs(const RequestOutput& req_output) {
+  for (const auto& output : req_output.outputs) {
+    if (output.embeddings.has_value()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool build_embedding_output_tensor(const RequestOutput& req_output,
+                                   proto::CompletionResponse* response) {
+  CHECK(response != nullptr);
+  if (req_output.outputs.empty()) {
+    return true;
+  }
+
+  size_t embedding_dim = 0;
+  bool initialized = false;
+  for (const auto& output : req_output.outputs) {
+    if (!output.embeddings.has_value()) {
+      LOG(ERROR) << "REC embedding response contains output without embeddings";
+      return false;
+    }
+    if (!initialized) {
+      embedding_dim = output.embeddings->size();
+      initialized = true;
+      continue;
+    }
+    if (output.embeddings->size() != embedding_dim) {
+      LOG(ERROR) << "REC embedding response has inconsistent embedding dims";
+      return false;
+    }
+  }
+
+  auto* output_tensor = response->mutable_output_tensors()->Add();
+  output_tensor->set_name(kRecResultTensorName);
+  output_tensor->set_datatype(proto::DataType::FLOAT);
+  output_tensor->mutable_shape()->Add(req_output.outputs.size());
+  output_tensor->mutable_shape()->Add(static_cast<int64_t>(embedding_dim));
+
+  auto* contents = output_tensor->mutable_contents();
+  for (const auto& output : req_output.outputs) {
+    contents->mutable_fp32_contents()->Add(output.embeddings->begin(),
+                                           output.embeddings->end());
+  }
+  return true;
+}
+
+bool build_token_output_tensor(const RequestOutput& req_output,
+                               proto::CompletionResponse* response) {
+  CHECK(response != nullptr);
+  if (req_output.outputs.empty()) {
+    return true;
+  }
+
+  auto* output_tensor = response->mutable_output_tensors()->Add();
+  output_tensor->set_name(kRecResultTensorName);
+  if (FLAGS_enable_constrained_decoding) {
+    output_tensor->set_datatype(proto::DataType::INT64);
+    output_tensor->mutable_shape()->Add(req_output.outputs.size());
+    output_tensor->mutable_shape()->Add(1);
+    return true;
+  }
+
+  const size_t token_dim = req_output.outputs[0].token_ids.size();
+  for (const auto& output : req_output.outputs) {
+    if (output.token_ids.size() != token_dim) {
+      LOG(ERROR) << "REC token response has inconsistent token lengths";
+      return false;
+    }
+  }
+
+  output_tensor->set_datatype(proto::DataType::INT32);
+  output_tensor->mutable_shape()->Add(req_output.outputs.size());
+  output_tensor->mutable_shape()->Add(static_cast<int64_t>(token_dim));
+
+  auto* contents = output_tensor->mutable_contents();
+  for (const auto& output : req_output.outputs) {
+    contents->mutable_int_contents()->Add(output.token_ids.begin(),
+                                          output.token_ids.end());
+  }
+  return true;
+}
+
 bool send_result_to_client_brpc_rec(std::shared_ptr<CompletionCall> call,
                                     const std::string& request_id,
                                     int64_t created_time,
                                     const std::string& model,
                                     const RequestOutput& req_output) {
   auto& response = call->response();
-  response.set_object("text_completion");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
+  if (!rec_completion_service_internal::build_response(
+          request_id, created_time, model, req_output, &response)) {
+    return call->finish_with_error(StatusCode::UNKNOWN,
+                                   "Failed to build rec response");
+  }
+  return call->write_and_finish(response);
+}
 
-  // add choices into response
-  response.mutable_choices()->Reserve(req_output.outputs.size());
+}  // namespace
+
+namespace rec_completion_service_internal {
+
+bool build_response(const std::string& request_id,
+                    int64_t created_time,
+                    const std::string& model,
+                    const RequestOutput& req_output,
+                    proto::CompletionResponse* response) {
+  if (response == nullptr) {
+    return false;
+  }
+
+  initialize_response(request_id, created_time, model, response);
+
+  response->mutable_choices()->Reserve(req_output.outputs.size());
   for (const auto& output : req_output.outputs) {
-    auto* choice = response.add_choices();
+    auto* choice = response->add_choices();
     choice->set_index(output.index);
     choice->set_text(output.text);
     set_logprobs(choice, output.logprobs);
@@ -79,51 +208,21 @@ bool send_result_to_client_brpc_rec(std::shared_ptr<CompletionCall> call,
     }
   }
 
-  // add usage statistics
   if (req_output.usage.has_value()) {
     const auto& usage = req_output.usage.value();
-    auto* proto_usage = response.mutable_usage();
+    auto* proto_usage = response->mutable_usage();
     proto_usage->set_prompt_tokens(usage.num_prompt_tokens);
     proto_usage->set_completion_tokens(usage.num_generated_tokens);
     proto_usage->set_total_tokens(usage.num_total_tokens);
   }
 
-  // Add rec specific output tensors
-  auto output_tensor = response.mutable_output_tensors()->Add();
-  output_tensor->set_name("rec_result");
-  if (FLAGS_enable_constrained_decoding) {
-    output_tensor->set_datatype(proto::DataType::INT64);
-    output_tensor->mutable_shape()->Add(req_output.outputs.size());
-    output_tensor->mutable_shape()->Add(1);  // Single item per output
-    // TODO: add following when next pr.
-    /*
-    auto context = output_tensor->mutable_contents();
-    for (int i = 0; i < req_output.outputs.size(); ++i) {
-      if (req_output.outputs[i].item_ids.has_value()) {
-        context->mutable_int64_contents()->Add(
-            req_output.outputs[i].item_ids.value());
-      }
-    }
-    */
-  } else {
-    output_tensor->set_datatype(proto::DataType::INT32);
-
-    output_tensor->mutable_shape()->Add(req_output.outputs.size());
-    output_tensor->mutable_shape()->Add(req_output.outputs[0].token_ids.size());
-
-    auto context = output_tensor->mutable_contents();
-    for (int i = 0; i < req_output.outputs.size(); ++i) {
-      // LOG(INFO) << req_output.outputs[i].token_ids;
-      context->mutable_int_contents()->Add(
-          req_output.outputs[i].token_ids.begin(),
-          req_output.outputs[i].token_ids.end());
-    }
+  if (has_embedding_outputs(req_output)) {
+    return build_embedding_output_tensor(req_output, response);
   }
-
-  return call->write_and_finish(response);
+  return build_token_output_tensor(req_output, response);
 }
 
-}  // namespace
+}  // namespace rec_completion_service_internal
 
 RecCompletionServiceImpl::RecCompletionServiceImpl(
     RecMaster* master,
@@ -179,6 +278,26 @@ void RecCompletionServiceImpl::process_async_impl(
       tensors.push_back(rpc_request_ref.input_tensors(i));
     }
     input_tensors = std::move(tensors);
+  }
+
+  LOG(INFO) << "[MTGR_TRACE][API] request_id=" << request_params.request_id
+            << " model=" << model
+            << " has_routing=" << rpc_request.has_routing()
+            << " token_ids_size=" << rpc_request.token_ids_size()
+            << " input_tensors_size=" << rpc_request_ref.input_tensors_size()
+            << " prompt_chars=" << rpc_request_ref.prompt().size();
+  if (input_tensors.has_value()) {
+    for (size_t i = 0; i < input_tensors->size(); ++i) {
+      const auto& t = (*input_tensors)[i];
+      LOG(INFO) << "[MTGR_TRACE][API] tensor[" << i << "] name=" << t.name()
+                << " dtype=" << proto::DataType_Name(t.data_type())
+                << " shape=" << format_infer_tensor_shape(t)
+                << " has_contents=" << t.has_contents()
+                << " fp32_size=" << t.contents().fp32_contents_size()
+                << " int_size=" << t.contents().int_contents_size()
+                << " int64_size=" << t.contents().int64_contents_size()
+                << " bool_size=" << t.contents().bool_contents_size();
+    }
   }
 
   // schedule the request

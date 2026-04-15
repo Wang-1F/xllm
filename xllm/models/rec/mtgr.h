@@ -15,9 +15,11 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <sstream>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -85,9 +87,32 @@ class MTGRModelImpl : public torch::nn::Module {
     torch::NoGradGuard no_grad;
     (void)tokens;
 
+    auto format_torch_tensor = [](const torch::Tensor& tensor) -> std::string {
+      if (!tensor.defined()) {
+        return "undefined";
+      }
+      std::ostringstream oss;
+      oss << "shape=[";
+      for (int64_t i = 0; i < tensor.dim(); ++i) {
+        if (i > 0) {
+          oss << ", ";
+        }
+        oss << tensor.size(i);
+      }
+      oss << "], dtype=" << tensor.scalar_type()
+          << ", device=" << tensor.device();
+      return oss.str();
+    };
+
     auto local_positions = positions;
     CHECK(input_params.input_embedding.defined())
         << "MTGR requires input_params.input_embedding as hidden_states input.";
+
+    LOG(INFO) << "[MTGR_TRACE][MODEL] forward begin positions="
+              << format_torch_tensor(local_positions)
+              << " input_embedding="
+              << format_torch_tensor(input_params.input_embedding)
+              << " kv_caches=" << kv_caches.size();
 
     torch::Tensor h = input_params.input_embedding;
     if (h.device() != device_) {
@@ -99,13 +124,22 @@ class MTGRModelImpl : public torch::nn::Module {
 
     auto attn_metadata = layer::AttentionMetadataBuilder::build(
         input_params, model_args_, build_attention_mask(input_params));
+    LOG(INFO) << "[MTGR_TRACE][MODEL] attn_metadata built hidden=" 
+              << format_torch_tensor(h);
     for (size_t i = 0; i < layers_.size(); ++i) {
+      LOG(INFO) << "[MTGR_TRACE][MODEL] layer[" << i
+                << "] input=" << format_torch_tensor(h);
       h = layers_[i]->forward(
           h, local_positions, attn_metadata, kv_caches[i], input_params);
+      LOG(INFO) << "[MTGR_TRACE][MODEL] layer[" << i
+                << "] output=" << format_torch_tensor(h);
     }
 
     h = norm_(h);
+    LOG(INFO) << "[MTGR_TRACE][MODEL] after norm=" << format_torch_tensor(h);
     h = post_mlp_(h);
+    LOG(INFO) << "[MTGR_TRACE][MODEL] after post_mlp="
+              << format_torch_tensor(h);
     return ModelOutput(h);
   }
 
@@ -234,6 +268,7 @@ REGISTER_MODEL_ARGS(mtgr, [&] {
   LOAD_ARG_OR_FUNC(
       n_kv_heads, "num_key_value_heads", [&] { return args->n_heads(); });
   LOAD_ARG_OR(n_layers, "num_hidden_layers", 24);
+  LOAD_ARG_OR(partial_rotary_factor, "partial_rotary_factor", 1.0f);
   LOAD_ARG_OR(rms_norm_eps, "rms_norm_eps", 1e-6);
   LOAD_ARG_OR(rope_theta, "rope_theta", 10000000.0f);
   LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", false);

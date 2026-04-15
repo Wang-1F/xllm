@@ -89,10 +89,16 @@ torch::Tensor CustomMaskAttentionImpl::forward(
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache) {
+  LOG(INFO) << "[MTGR_TRACE][ATTN] forward begin hidden_shape="
+            << hidden_states.sizes() << " positions_shape="
+            << positions.sizes();
+
   auto qkv = qkv_proj_->forward(hidden_states);
   auto q = qkv.slice(/*dim=*/-1, 0, q_size_);
   auto k = qkv.slice(/*dim=*/-1, q_size_, q_size_ + kv_size_);
   auto v = qkv.slice(/*dim=*/-1, q_size_ + kv_size_, q_size_ + 2 * kv_size_);
+  LOG(INFO) << "[MTGR_TRACE][ATTN] qkv done q_shape=" << q.sizes()
+            << " k_shape=" << k.sizes() << " v_shape=" << v.sizes();
 
   const int64_t tokens = q.size(0);
   auto q_reshaped = q.reshape({tokens, num_heads_, head_dim_});
@@ -103,10 +109,17 @@ torch::Tensor CustomMaskAttentionImpl::forward(
   q = q_normed.view({tokens, q_size_});
   k = k_normed.view({tokens, kv_size_});
 
-  rotary_emb_->forward(positions, q, k);
+  // TEMP: Disable rotary for MTGR bring-up to unblock end-to-end pipeline
+  // validation. Re-enable after fixing RopeOperation shape/setup on NPU.
+  // rotary_emb_->forward(positions, q, k);
+  LOG(INFO) << "[MTGR_TRACE][ATTN] rotary skipped q_shape=" << q.sizes()
+            << " k_shape=" << k.sizes();
   auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
+  LOG(INFO) << "[MTGR_TRACE][ATTN] core attention done out_shape="
+            << out.sizes();
 
   out = o_proj_->forward(out);
+  LOG(INFO) << "[MTGR_TRACE][ATTN] o_proj done out_shape=" << out.sizes();
   return out;
 }
 

@@ -189,6 +189,16 @@ AttentionMetadata build_attention_metadata(
     }
   }
 
+  if (params.has_mtgr_params()) {
+    const auto& mtgr_params = *params.mtgr_params();
+    attn_metadata.genrec_history_lens = mtgr_params.history_lens;
+    attn_metadata.genrec_context_lens = mtgr_params.context_lens;
+    attn_metadata.genrec_real_time_lens = mtgr_params.real_time_lens;
+    attn_metadata.genrec_target_lens = mtgr_params.target_lens;
+    attn_metadata.genrec_matched_prefix_lens =
+        mtgr_params.matched_prefix_lens;
+  }
+
   return attn_metadata;
 }
 

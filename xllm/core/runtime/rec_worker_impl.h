@@ -132,6 +132,16 @@ class RecWorkerImpl : public LLMWorkerImpl {
                                      ForwardInput& processed_inputs) override;
   };
 
+  class RecPrefillOnlyWorkPipeline final : public RecWorkPipeline {
+   public:
+    explicit RecPrefillOnlyWorkPipeline(RecPipelineRuntime& runtime)
+        : RecWorkPipeline(runtime) {}
+
+    ForwardInput prepare_inputs(Batch& batch) override;
+
+    std::optional<ForwardOutput> step(const ForwardInput& input) override;
+  };
+
   class LlmRecMultiRoundPipeline final : public RecWorkPipeline {
    public:
     explicit LlmRecMultiRoundPipeline(RecPipelineRuntime& runtime);

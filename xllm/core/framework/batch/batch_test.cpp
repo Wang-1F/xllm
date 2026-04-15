@@ -27,6 +27,9 @@ limitations under the License.
 #include "framework/block/block.h"
 #include "framework/block/block_manager_impl.h"
 #include "framework/model/model_args.h"
+#include "framework/request/mm_data.h"
+#include "framework/request/rec_type.h"
+#include "framework/request/sequences_group.h"
 #include "framework/request/stopping_checker.h"
 #include "framework/sampling/sampling_params.h"
 #include "platform/device.h"
@@ -759,6 +762,74 @@ TEST(BatchTest, DPBalanceShuffle) {
   EXPECT_EQ(shifted_indices[1], 24);
   EXPECT_EQ(shifted_indices[47], 1);
   EXPECT_EQ(shifted_indices[2], 25);
+}
+
+TEST(BatchTest, MtgrRecPrefillBuilderTrimsEmbeddingAtPrefixBoundary) {
+  torch::Device device(Device::type_torch(), 0);
+  const uint32_t n_blocks = 4;
+  const uint32_t block_size = 4;
+  BlockManager::Options options;
+  options.num_blocks(n_blocks).block_size(block_size);
+  BlockManagerImpl manager(options);
+
+  RequestSamplingParam sampling_param;
+  sampling_param.is_embeddings = true;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(1);
+
+  SequenceParams seq_params;
+  seq_params.seq_capacity = 16;
+  seq_params.stopping_checker = &stopping_checker;
+  seq_params.sampling_param = &sampling_param;
+  seq_params.skip_special_tokens = true;
+  seq_params.echo = false;
+  seq_params.logprobs = false;
+  seq_params.enable_schedule_overlap = false;
+  seq_params.rec_type = RecType::kMtgr;
+
+  const std::string prompt = "mtgr";
+  std::vector<int32_t> prompt_tokens = {11, 12, 13, 14, 15};
+  torch::Tensor input_embedding =
+      torch::tensor({{1.0f, 2.0f},
+                     {3.0f, 4.0f},
+                     {5.0f, 6.0f},
+                     {7.0f, 8.0f},
+                     {9.0f, 10.0f}});
+
+  MMDict mm_dict;
+  mm_dict["history_len"] = torch::tensor({2}, torch::kInt32);
+  mm_dict["context_len"] = torch::tensor({1}, torch::kInt32);
+  mm_dict["real_time_len"] = torch::tensor({1}, torch::kInt32);
+  mm_dict["target_len"] = torch::tensor({1}, torch::kInt32);
+  MMData mm_data(MMType::EMBEDDING, mm_dict);
+
+  SequencesGroup sequence_group(
+      prompt, prompt_tokens, input_embedding, mm_data, seq_params);
+  auto* sequence = sequence_group.sequences()[0].get();
+  sequence->add_kv_blocks(manager.allocate(2));
+  sequence->kv_state().incr_kv_cache_tokens_num(/*size=*/4);
+
+  Batch batch;
+  batch.add(&sequence_group);
+  ForwardInput forward_input = batch.prepare_rec_forward_input(
+      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0, ModelArgs());
+
+  ASSERT_TRUE(forward_input.token_ids.defined());
+  EXPECT_TRUE(equal(forward_input.token_ids, std::vector<int32_t>{15}));
+  EXPECT_TRUE(equal(forward_input.positions, std::vector<int32_t>{4}));
+  EXPECT_TRUE(
+      equal(forward_input.input_params.input_embedding, std::vector<float>{9.0f,
+                                                                           10.0f}));
+
+  const auto* mtgr_params = forward_input.input_params.mtgr_params();
+  ASSERT_NE(mtgr_params, nullptr);
+  EXPECT_TRUE(equal(mtgr_params->history_lens, std::vector<int32_t>{2}));
+  EXPECT_TRUE(equal(mtgr_params->context_lens, std::vector<int32_t>{1}));
+  EXPECT_TRUE(equal(mtgr_params->real_time_lens, std::vector<int32_t>{1}));
+  EXPECT_TRUE(equal(mtgr_params->target_lens, std::vector<int32_t>{1}));
+  EXPECT_TRUE(equal(mtgr_params->matched_prefix_lens, std::vector<int32_t>{4}));
+  EXPECT_TRUE(equal(forward_input.sampling_params.selected_token_idxes,
+                    std::vector<int32_t>{0}));
 }
 
 }  // namespace xllm

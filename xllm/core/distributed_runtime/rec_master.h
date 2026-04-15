@@ -32,6 +32,16 @@ limitations under the License.
 
 namespace xllm {
 
+namespace rec_master_internal {
+
+std::vector<int32_t> build_mtgr_prompt_tokens(
+    const std::optional<std::vector<int32_t>>& prompt_tokens,
+    int32_t total_seq_len,
+    int32_t cacheable_prefix_len,
+    uint64_t unique_salt);
+
+}  // namespace rec_master_internal
+
 class RecMaster : public Master {
  public:
   explicit RecMaster(const Options& options);
@@ -132,6 +142,17 @@ class RecMaster : public Master {
         OutputCallback callback) override;
   };
 
+  class MtgrMasterPipeline final : public RecMasterPipeline {
+   public:
+    explicit MtgrMasterPipeline(RecMaster& master);
+    std::shared_ptr<Request> generate_request(
+        std::string prompt,
+        std::optional<std::vector<int>> prompt_tokens,
+        std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+        const RequestParams& sp,
+        OutputCallback callback) override;
+  };
+
   // Factory method to create pipeline (can access private classes)
   static std::unique_ptr<RecMasterPipeline> create_pipeline(
       RecPipelineType type,
@@ -140,6 +161,15 @@ class RecMaster : public Master {
   void schedule_request(RequestParams sp,
                         OutputCallback callback,
                         RequestBuilder build_request);
+
+  std::shared_ptr<Request> build_request_common(
+      std::string prompt,
+      std::vector<int32_t> prompt_tokens,
+      MMData mm_data,
+      torch::Tensor input_embedding,
+      const RequestParams& sp,
+      OutputCallback callback,
+      bool build_stop_checker);
 
   std::shared_ptr<Request> build_request_common(
       std::string prompt,

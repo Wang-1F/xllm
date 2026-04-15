@@ -17,9 +17,13 @@ limitations under the License.
 
 #include <absl/container/flat_hash_set.h>
 
+#include <cstdint>
+#include <string>
+
 #include "api_service_impl.h"
 #include "completion.pb.h"
 #include "core/distributed_runtime/rec_master.h"
+#include "core/framework/request/request_output.h"
 #include "rec.pb.h"
 #include "stream_call.h"
 
@@ -27,6 +31,16 @@ namespace xllm {
 
 using CompletionCall =
     StreamCall<proto::CompletionRequest, proto::CompletionResponse>;
+
+namespace rec_completion_service_internal {
+
+bool build_response(const std::string& request_id,
+                    int64_t created_time,
+                    const std::string& model,
+                    const RequestOutput& req_output,
+                    proto::CompletionResponse* response);
+
+}  // namespace rec_completion_service_internal
 
 // a class to handle completion requests
 class RecCompletionServiceImpl final : public APIServiceImpl<CompletionCall> {

@@ -96,11 +96,21 @@ bool SequencesGroup::expand_sequences(bool share_prefix) {
 void SequencesGroup::generate_outputs(std::vector<SequenceOutput>& outputs,
                                       const Tokenizer& tokenizer,
                                       ThreadPool* thread_pool) {
+  LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] generate_outputs begin request_id="
+            << sequence_params_.request_id << " seq_size=" << sequences_.size()
+            << " outputs_size_before=" << outputs.size()
+            << " stream=" << sequence_params_.streaming
+            << " n=" << sequence_params_.n
+            << " best_of=" << sequence_params_.best_of
+            << " is_embeddings="
+            << sequence_params_.sampling_param->is_embeddings;
   const bool has_sample_outputs =
       std::any_of(sequences_.begin(), sequences_.end(), [](const auto& seq) {
         return seq != nullptr && !seq->sample_slots().empty();
       });
   if (has_sample_outputs) {
+    LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=sample_outputs request_id="
+              << sequence_params_.request_id;
     const size_t previous_size = outputs.size();
     size_t total_outputs = previous_size;
     for (const auto& seq : sequences_) {
@@ -121,23 +131,44 @@ void SequencesGroup::generate_outputs(std::vector<SequenceOutput>& outputs,
         outputs.begin() + previous_size,
         outputs.end(),
         [](const auto& lhs, const auto& rhs) { return lhs.index < rhs.index; });
+    LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=sample_outputs done request_id="
+              << sequence_params_.request_id << " outputs_size_after="
+              << outputs.size();
     return;
   }
 
   // Check for multi-round beam search results
   if (is_rec_multi_round_mode() && check_beam_search() &&
       sequences_.size() == 1) {
+    LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=multi_round_beam request_id="
+              << sequence_params_.request_id;
     auto* base = sequences_[0].get();
     if (base->has_beam_result()) {
       generate_multi_round_output(outputs, tokenizer, *base);
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=multi_round_beam done "
+                   "request_id="
+                << sequence_params_.request_id << " outputs_size_after="
+                << outputs.size();
       return;
     }
   }
 
   if (sequence_params_.streaming) {
-    for (auto& seq : sequences_) {
+    LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=streaming request_id="
+              << sequence_params_.request_id;
+    for (size_t seq_idx = 0; seq_idx < sequences_.size(); ++seq_idx) {
+      auto& seq = sequences_[seq_idx];
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] streaming seq index="
+                << seq_idx << " request_id=" << sequence_params_.request_id
+                << " begin";
       outputs.push_back(std::move(seq->generate_output()));
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] streaming seq index="
+                << seq_idx << " request_id=" << sequence_params_.request_id
+                << " done";
     }
+    LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=streaming done request_id="
+              << sequence_params_.request_id << " outputs_size_after="
+              << outputs.size();
     return;
   }
 
@@ -145,6 +176,9 @@ void SequencesGroup::generate_outputs(std::vector<SequenceOutput>& outputs,
   auto num = std::min(sequences_.size(), n);
   outputs.reserve(num);
   if (sequences_.size() > n && !check_beam_search()) {
+    LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=topn_select request_id="
+              << sequence_params_.request_id << " seq_size="
+              << sequences_.size() << " n=" << n;
     std::vector<std::pair<float, size_t>> logprobs_vec;
     logprobs_vec.reserve(sequences_.size());
     for (size_t i = 0; i < sequences_.size(); ++i) {
@@ -161,26 +195,53 @@ void SequencesGroup::generate_outputs(std::vector<SequenceOutput>& outputs,
               [](const auto& l, const auto& r) { return l.first > r.first; });
     for (size_t i = 0; i < n; ++i) {
       const auto [logprob, index] = logprobs_vec[i];
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] topn_select choose rank=" << i
+                << " seq_index=" << index << " avg_logprob=" << logprob
+                << " request_id=" << sequence_params_.request_id << " begin";
       auto seq_output = sequences_[index]->generate_output(tokenizer);
       seq_output.index = i;
       outputs.push_back(std::move(seq_output));
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] topn_select choose rank=" << i
+                << " seq_index=" << index << " request_id="
+                << sequence_params_.request_id << " done";
     }
   } else {
     // speed up when using thread pool
     if (thread_pool && sequences_.size() > 1) {
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=parallel request_id="
+                << sequence_params_.request_id
+                << " thread_pool_size=" << thread_pool->size()
+                << " seq_size=" << sequences_.size();
       generate_outputs_parallel(outputs, tokenizer, thread_pool);
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=parallel done request_id="
+                << sequence_params_.request_id << " outputs_size_after="
+                << outputs.size();
       return;
     }
-    for (auto& seq : sequences_) {
+    for (size_t seq_idx = 0; seq_idx < sequences_.size(); ++seq_idx) {
+      auto& seq = sequences_[seq_idx];
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=serial seq index="
+                << seq_idx << " request_id=" << sequence_params_.request_id
+                << " begin";
       outputs.push_back(seq->generate_output(tokenizer));
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] branch=serial seq index="
+                << seq_idx << " request_id=" << sequence_params_.request_id
+                << " done";
     }
   }
+  LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] generate_outputs done request_id="
+            << sequence_params_.request_id << " outputs_size_after="
+            << outputs.size();
 }
 
 void SequencesGroup::generate_outputs_parallel(
     std::vector<SequenceOutput>& outputs,
     const Tokenizer& tokenizer,
     ThreadPool* thread_pool) {
+  LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] generate_outputs_parallel begin "
+               "request_id="
+            << sequence_params_.request_id << " seq_size=" << sequences_.size()
+            << " thread_pool_size=" << thread_pool->size();
   size_t seq_size = sequences_.size();
   outputs.reserve(seq_size);
   size_t num_tasks = std::min(thread_pool->size(), seq_size);
@@ -196,7 +257,13 @@ void SequencesGroup::generate_outputs_parallel(
       if (task_id >= seq_size) break;
 
       const auto& base_seq = sequences_[task_id];
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] parallel worker=" << work_id
+                << " seq index=" << task_id << " request_id="
+                << sequence_params_.request_id << " begin";
       local_outputs[work_id].emplace_back(base_seq->generate_output(tokenizer));
+      LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] parallel worker=" << work_id
+                << " seq index=" << task_id << " request_id="
+                << sequence_params_.request_id << " done";
     }
   };
 
@@ -217,6 +284,10 @@ void SequencesGroup::generate_outputs_parallel(
     outputs.insert(
         outputs.end(), local_outputs[i].begin(), local_outputs[i].end());
   }
+  LOG(INFO) << "[MTGR_TRACE][SEQ_GROUP] generate_outputs_parallel done "
+               "request_id="
+            << sequence_params_.request_id << " outputs_size_after="
+            << outputs.size();
 }
 
 void SequencesGroup::process_beam_search() {

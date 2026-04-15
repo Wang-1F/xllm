@@ -228,4 +228,23 @@ TEST(FixedStepsSchedulerTest, StepCompletesWithRequest) {
   EXPECT_NO_THROW(scheduler.step(absl::Milliseconds(500)));
 }
 
+TEST(FixedStepsSchedulerTest, PrepareBatchMtgrAllocatesKvBlocks) {
+  FLAGS_enable_prefix_cache = false;
+  FLAGS_prefill_scheduling_memory_usage_threshold = 1.0;
+  auto engine = std::make_unique<FakeEngine>(64, 32);
+  auto opt = CreateOptions(10000, 256);
+  FixedStepsScheduler scheduler(engine.get(), opt);
+  auto requests = GenRequests({64}, {10}, RecType::kMtgr);
+  scheduler.add_request(requests[0]);
+
+  ContinuousScheduler* base = &scheduler;
+  std::vector<Batch> batches = base->prepare_batch_test();
+
+  ASSERT_FALSE(batches.empty());
+  auto sequences = batches[0].get_sequences();
+  ASSERT_EQ(sequences.size(), 1u);
+  EXPECT_GT(sequences[0]->kv_state().num_kv_blocks(), 0u);
+  EXPECT_EQ(base->get_running_requests().size(), 1u);
+}
+
 }  // namespace xllm

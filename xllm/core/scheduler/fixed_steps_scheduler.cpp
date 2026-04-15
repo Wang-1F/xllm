@@ -428,6 +428,23 @@ std::vector<Batch> FixedStepsScheduler::OneRecSchedulerPipeline::create_batches(
 }
 
 std::vector<Batch>
+FixedStepsScheduler::RecPrefillOnlySchedulerPipeline::create_batches(
+    FixedStepsScheduler& scheduler,
+    BatchFactory* batch_factory) {
+  return batch_factory->create_rec_batches(
+      scheduler.running_requests_,
+      scheduler.running_sequences_,
+      scheduler.running_sequences_budgets_,
+      scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
+}
+
+bool FixedStepsScheduler::RecPrefillOnlySchedulerPipeline::allocate_kv_cache(
+    KVCacheManager* kv_cache_manager,
+    Sequence* sequence) {
+  return kv_cache_manager->allocate(sequence);
+}
+
+std::vector<Batch>
 FixedStepsScheduler::RecMultiRoundSchedulerPipeline::create_batches(
     FixedStepsScheduler& scheduler,
     BatchFactory* batch_factory) {
@@ -443,6 +460,9 @@ FixedStepsScheduler::create_scheduler_pipeline(RecType rec_type,
                                                bool is_rec_multi_round) {
   if (is_rec_multi_round) {
     return std::make_unique<RecMultiRoundSchedulerPipeline>();
+  }
+  if (rec_type == RecType::kMtgr) {
+    return std::make_unique<RecPrefillOnlySchedulerPipeline>();
   }
   if (rec_type == RecType::kLlmRec) {
     return std::make_unique<LlmRecSchedulerPipeline>();

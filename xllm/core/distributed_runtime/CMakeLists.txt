@@ -1,4 +1,5 @@
 include(cc_library)
+include(cc_test)
 
 if(USE_NPU OR USE_CUDA)
   include_directories(
@@ -122,4 +123,14 @@ cc_library(
     :chat_template
     glog::glog
     $<$<BOOL:${USE_MLU}>:torch_mlu>
+)
+
+cc_test(
+  NAME
+    rec_master_test
+  SRCS
+    rec_master_test.cpp
+  DEPS
+    :distributed_runtime
+    GTest::gtest_main
 )
