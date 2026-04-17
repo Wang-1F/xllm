@@ -33,6 +33,7 @@ set(CUDA_HEADER_FILES
   cutlass_w8a8/c3x/scaled_mm_sm90_fp8_dispatch.cuh
   fp8_quant_utils.cuh
   global_capture_instance.h
+  mtgr_flashinfer.h
   piecewise_graphs.h
   topk_last_dim.cuh
   type_convert.cuh
@@ -66,6 +67,7 @@ set(CUDA_SOURCE_FILES
   fused_qknorm_rope.cu
   global_capture_instance.cpp
   matmul.cpp
+  mtgr_flashinfer.cpp
   norm.cu
   piecewise_graphs.cpp
   rec_beam_search.cu
