@@ -194,6 +194,19 @@ cc_test(
 )
 target_link_libraries(fp8_quant_test PRIVATE brpc)
 
+cc_test(
+  NAME
+    mtgr_flashinfer_test
+  SRCS
+    mtgr_flashinfer_test.cpp
+  DEPS
+    :cuda_kernels
+    :flags
+    torch
+    GTest::gtest_main
+    glog::glog
+)
+
 # Keep CUDA benchmarks behind a plain CMake cache option instead of adding
 # another dedicated argument in `setup.py`.
 #
