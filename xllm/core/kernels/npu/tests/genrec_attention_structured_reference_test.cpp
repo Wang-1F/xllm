@@ -73,6 +73,10 @@ namespace xllm::kernel::npu::test {
 
 namespace {
 
+// Structured GenRec reference test:
+// keeps a relatively clear, integration-style implementation that covers
+// prefix-cache matched cases and serves as a historical reference baseline.
+
 struct AttentionMetadata {
   torch::Tensor history_lens;
   torch::Tensor context_lens;

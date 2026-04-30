@@ -8,6 +8,7 @@ cc_library(
     ../utils.h
   SRCS
     replace_token.cpp
+    mtgr_target_update.cpp
     top_k_top_p.cpp
     ../utils.cpp
     beam_search.cpp

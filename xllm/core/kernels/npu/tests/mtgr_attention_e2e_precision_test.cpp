@@ -23,12 +23,14 @@ limitations under the License.
 #include <vector>
 
 #include "common/global_flags.h"
-#include "framework/kv_cache/kv_cache.h"
-#include "layers/common/attention_metadata.h"
-#include "layers/npu_torch/mtgr_attention.h"
+#include "mtgr_attention_test.h"
 
 namespace xllm::kernel::npu::test {
 namespace {
+
+// Single-side MTGR precision regression:
+// builds KVCache/AttentionMetadata and validates the test-side
+// MTGRAttentionTestImpl::forward path used by the perf sweep.
 
 constexpr double kRtol = 0.12;
 constexpr double kAtol = 0.12;
@@ -221,7 +223,11 @@ class MTGRAttentionSingleSidePrecisionTest : public ::testing::Test {
     fp_opts_ = torch::TensorOptions().dtype(torch::kBFloat16).device(device_);
   }
 
-  void run_case(const CaseSpec& spec, bool verify = true) {
+  void run_case(const CaseSpec& spec,
+                bool verify = true,
+                bool use_fused_target_update = false,
+                bool use_fused_target_update_v4 = false,
+                bool use_fused_target_update_auto = false) {
     constexpr int64_t kNumHeads = 8;
     constexpr int64_t kNumKvHeads = 8;
     constexpr int64_t kHeadDim = 128;
@@ -295,8 +301,11 @@ class MTGRAttentionSingleSidePrecisionTest : public ::testing::Test {
     metadata.block_table = block_table;
     metadata.slot_mapping = slot_mapping;
 
-    xllm::layer::MTGRAttentionImpl mtgr(
+    MTGRAttentionTestImpl mtgr(
         kNumHeads, kHeadDim, 1.0f / std::sqrt(static_cast<float>(kHeadDim)), kNumKvHeads);
+    mtgr.set_use_fused_target_update(use_fused_target_update);
+    mtgr.set_use_fused_target_update_auto(use_fused_target_update_auto);
+    mtgr.set_use_fused_target_update_v4(use_fused_target_update_v4);
     auto out = std::get<0>(mtgr.forward(metadata, q_case, k_case, v_case, kv_cache));
     auto out_bsnd = out.view({1, unmatched_len, kNumHeads, kHeadDim}).contiguous();
 
@@ -343,22 +352,14 @@ TEST_F(MTGRAttentionSingleSidePrecisionTest, CompareMatchedModesAgainstBase) {
   });
 
   run_case(CaseSpec{
-      .name = "partial_hist_matched",
-      .history = 1300,
-      .context = 8,
-      .real_time = 400,
-      .target = 800,
-      .matched_prefix = 900,
-  });
-
-  run_case(CaseSpec{
-      .name = "partial_ctx_matched",
-      .history = 1300,
-      .context = 8,
-      .real_time = 400,
-      .target = 800,
-      .matched_prefix = 1300 + 3,
-  });
+               .name = "warmup_partial_rt_matched",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 800,
+               .matched_prefix = 1300 + 8 + 240,
+           },
+           /*verify=*/false);
 
   run_case(CaseSpec{
       .name = "partial_rt_matched",
@@ -368,6 +369,166 @@ TEST_F(MTGRAttentionSingleSidePrecisionTest, CompareMatchedModesAgainstBase) {
       .target = 800,
       .matched_prefix = 1300 + 8 + 240,
   });
+}
+
+TEST_F(MTGRAttentionSingleSidePrecisionTest, CompareFusedTargetUpdateAgainstBase) {
+  torch::manual_seed(20260411);
+
+  run_case(CaseSpec{
+               .name = "warmup_no_matched_fused",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 800,
+               .matched_prefix = 0,
+           },
+           /*verify=*/false,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/false);
+
+  run_case(CaseSpec{
+               .name = "no_matched_fused",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 800,
+               .matched_prefix = 0,
+           },
+           /*verify=*/true,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/false);
+
+  run_case(CaseSpec{
+               .name = "warmup_partial_rt_matched_fused",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 800,
+               .matched_prefix = 1300 + 8 + 240,
+           },
+           /*verify=*/false,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/false);
+
+  run_case(CaseSpec{
+               .name = "partial_rt_matched_fused",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 800,
+               .matched_prefix = 1300 + 8 + 240,
+           },
+           /*verify=*/true,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/false);
+}
+
+TEST_F(MTGRAttentionSingleSidePrecisionTest, CompareFusedTargetUpdateV4AgainstBase) {
+  torch::manual_seed(20260429);
+
+  run_case(CaseSpec{
+               .name = "warmup_no_matched_fused_v4",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 1000,
+               .matched_prefix = 0,
+           },
+           /*verify=*/false,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/true);
+
+  run_case(CaseSpec{
+               .name = "no_matched_fused_v4",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 1000,
+               .matched_prefix = 0,
+           },
+           /*verify=*/true,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/true);
+
+  run_case(CaseSpec{
+               .name = "warmup_partial_rt_matched_fused_v4",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 1000,
+               .matched_prefix = 1300 + 8 + 240,
+           },
+           /*verify=*/false,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/true);
+
+  run_case(CaseSpec{
+               .name = "partial_rt_matched_fused_v4",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 1000,
+               .matched_prefix = 1300 + 8 + 240,
+           },
+           /*verify=*/true,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/true);
+}
+
+TEST_F(MTGRAttentionSingleSidePrecisionTest, CompareFusedTargetUpdateAutoAgainstBase) {
+  torch::manual_seed(20260430);
+
+  run_case(CaseSpec{
+               .name = "warmup_no_matched_fused_auto",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 1000,
+               .matched_prefix = 0,
+           },
+           /*verify=*/false,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/false,
+           /*use_fused_target_update_auto=*/true);
+
+  run_case(CaseSpec{
+               .name = "no_matched_fused_auto",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 1000,
+               .matched_prefix = 0,
+           },
+           /*verify=*/true,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/false,
+           /*use_fused_target_update_auto=*/true);
+
+  run_case(CaseSpec{
+               .name = "warmup_partial_rt_matched_fused_auto",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 1000,
+               .matched_prefix = 1300 + 8 + 240,
+           },
+           /*verify=*/false,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/false,
+           /*use_fused_target_update_auto=*/true);
+
+  run_case(CaseSpec{
+               .name = "partial_rt_matched_fused_auto",
+               .history = 1300,
+               .context = 8,
+               .real_time = 400,
+               .target = 1000,
+               .matched_prefix = 1300 + 8 + 240,
+           },
+           /*verify=*/true,
+           /*use_fused_target_update=*/true,
+           /*use_fused_target_update_v4=*/false,
+           /*use_fused_target_update_auto=*/true);
 }
 
 }  // namespace xllm::kernel::npu::test

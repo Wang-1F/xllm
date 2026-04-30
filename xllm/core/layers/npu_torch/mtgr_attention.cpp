@@ -583,6 +583,73 @@ AttentionUpdatePlan plan_attention_update_like_benchmark(
   return plan;
 }
 
+AttentionUpdatePlan plan_attention_update_from_prepared_flats(
+    const std::vector<torch::Tensor>& local_out_flats,
+    const std::vector<torch::Tensor>& lse_flats,
+    int64_t b,
+    int64_t s,
+    int64_t n,
+    int64_t d,
+    torch::ScalarType out_scalar_type) {
+  CHECK_EQ(local_out_flats.size(), lse_flats.size());
+  CHECK_GE(local_out_flats.size(), 2UL);
+
+  const int64_t bsn = b * s * n;
+  AttentionUpdatePlan plan;
+  plan.b = b;
+  plan.s = s;
+  plan.n = n;
+  plan.d = d;
+  plan.out_scalar_type = out_scalar_type;
+  plan.local_out_flats = local_out_flats;
+  plan.lse_flats = lse_flats;
+  plan.local_out_acls.assign(local_out_flats.size(), nullptr);
+  plan.lse_acls.assign(lse_flats.size(), nullptr);
+
+  for (size_t i = 0; i < local_out_flats.size(); ++i) {
+    CHECK_EQ(local_out_flats[i].dim(), 2);
+    CHECK_EQ(local_out_flats[i].size(0), bsn);
+    CHECK_EQ(local_out_flats[i].size(1), d);
+    CHECK(local_out_flats[i].is_contiguous())
+        << "local_out_flat must be contiguous";
+    CHECK_EQ(local_out_flats[i].scalar_type(), torch::kFloat32);
+
+    CHECK_EQ(lse_flats[i].dim(), 1);
+    CHECK_EQ(lse_flats[i].size(0), bsn);
+    CHECK(lse_flats[i].is_contiguous()) << "lse_flat must be contiguous";
+    CHECK_EQ(lse_flats[i].scalar_type(), torch::kFloat32);
+
+    kernel::npu::create_acltensor(&plan.local_out_acls[i], plan.local_out_flats[i]);
+    kernel::npu::create_acltensor(&plan.lse_acls[i], plan.lse_flats[i]);
+  }
+
+  plan.out_flat =
+      torch::empty({bsn, d},
+                   torch::TensorOptions().dtype(torch::kFloat32).device(
+                       local_out_flats[0].device()));
+  kernel::npu::create_acltensor(&plan.out_acl, plan.out_flat);
+
+  plan.local_out_list = aclCreateTensorList(
+      plan.local_out_acls.data(),
+      static_cast<int32_t>(plan.local_out_acls.size()));
+  CHECK_NE(plan.local_out_list, nullptr);
+  plan.lse_list = aclCreateTensorList(
+      plan.lse_acls.data(), static_cast<int32_t>(plan.lse_acls.size()));
+  CHECK_NE(plan.lse_list, nullptr);
+
+  auto ret = aclnnAttentionUpdateGetWorkspaceSize(
+      plan.lse_list,
+      plan.local_out_list,
+      /*updateType=*/0,
+      plan.out_acl,
+      /*lseOut=*/nullptr,
+      &plan.workspace_size,
+      &plan.executor);
+  CHECK_EQ(ret, ACL_SUCCESS)
+      << "aclnnAttentionUpdateGetWorkspaceSize failed: " << ret;
+  return plan;
+}
+
 void execute_planned_attention_update(const AttentionUpdatePlan& plan,
                                       const torch::Device& device,
                                       aclrtStream stream) {
@@ -612,6 +679,25 @@ void destroy_planned_attention_update(AttentionUpdatePlan& plan) {
     aclDestroyTensor(plan.out_acl);
     plan.out_acl = nullptr;
   }
+}
+
+std::pair<torch::Tensor, torch::Tensor> build_target_diagonal_attn_analytic(
+    const torch::Tensor& target_query,
+    const torch::Tensor& target_key,
+    const torch::Tensor& target_value) {
+  CHECK_EQ(target_query.dim(), 4);
+  CHECK_EQ(target_key.dim(), 4);
+  CHECK_EQ(target_value.dim(), 4);
+  CHECK_EQ(target_query.sizes(), target_key.sizes());
+  CHECK_EQ(target_query.sizes(), target_value.sizes());
+
+  const double scale = 1.0 / std::sqrt(static_cast<double>(target_query.size(3)));
+  auto output = target_value.contiguous();
+  auto q_f32 = target_query.to(torch::kFloat32);
+  auto k_f32 = target_key.to(torch::kFloat32);
+  auto lse =
+      (q_f32 * k_f32).sum(-1, true).mul(scale).permute({0, 2, 1, 3}).contiguous();
+  return {output, lse};
 }
 
 void fa_for_crt(const torch::Tensor& query,
@@ -726,30 +812,129 @@ void no_matched(const torch::Tensor& query,
                          torch::Tensor& output) {
   CHECK_EQ(query.size(0), 1);
   const int64_t h = sample_metadata.history;
+  const int64_t c = sample_metadata.context;
+  const int64_t r = sample_metadata.real_time;
+  const int64_t t = sample_metadata.target;
   const int64_t num_heads = query.size(2);
   const int64_t head_dim = query.size(3);
+  CHECK_EQ(query.size(1), h + c + r + t);
+  CHECK_EQ(key.size(1), h + c + r + t);
+  CHECK_EQ(value.size(1), h + c + r + t);
+  CHECK_GT(r, 0);
+  CHECK_GT(t, 0);
   auto stream = c10_npu::getCurrentNPUStream(query.device().index()).stream();
 
   auto out_opts = torch::TensorOptions().dtype(query.scalar_type()).device(query.device());
-  constexpr float kSentinel = -31415.0f;
-  auto hist_out = torch::full({1, h, num_heads, head_dim}, kSentinel, out_opts);
+  auto lse_opts = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+  auto make_out = [&](int64_t seq_len) {
+    return torch::empty({1, seq_len, num_heads, head_dim}, out_opts);
+  };
+  auto make_lse = [&](int64_t seq_len) {
+    return torch::empty({1, num_heads, seq_len, 1}, lse_opts);
+  };
 
-  SegmentAttentionMetadata hist_meta;
-  hist_meta.attn_mask = sample_metadata.compressed_causal_mask;
-  hist_meta.sparse_param.sparse_mode = 2;
-  hist_meta.sparse_param.pre_tokens = kDefaultWindow;
-  hist_meta.sparse_param.next_tokens = kDefaultWindow;
+  // no_matched best path:
+  // 1) Q=R+T, KV=H+C+R, sparse_mode=4 trapezoid;
+  // 2) Q=H, KV=H, causal;
+  // 3) Q=C, KV=H+C, full;
+  // 4) Q=T, KV=T, diagonal analytic;
+  // 5) update target prefix branch and diagonal branch.
+  auto rt_tgt_out = make_out(r + t);
+  auto rt_tgt_lse = make_lse(r + t);
+  SegmentAttentionMetadata rt_tgt_meta;
+  rt_tgt_meta.attn_mask = sample_metadata.compressed_causal_mask;
+  rt_tgt_meta.sparse_param.sparse_mode = 4;
+  rt_tgt_meta.sparse_param.pre_tokens = h + c + r;
+  rt_tgt_meta.sparse_param.next_tokens = t;
+  auto rt_tgt_query = query.slice(1, h + c, h + c + r + t).contiguous();
+  auto hcr_key = key.slice(1, 0, h + c + r).contiguous();
+  auto hcr_value = value.slice(1, 0, h + c + r).contiguous();
+  auto rt_tgt_plan = plan_segment_attention(
+      rt_tgt_query, hcr_key, hcr_value, rt_tgt_meta, rt_tgt_out, rt_tgt_lse);
+  execute_planned_attention(rt_tgt_plan, query.device(), stream);
 
-  auto hist_query = query.slice(1, 0, h).contiguous();
-  auto hist_key = key.slice(1, 0, h).contiguous();
-  auto hist_value = value.slice(1, 0, h).contiguous();
-  AclPlan hist_plan = plan_segment_attention(
-      hist_query, hist_key, hist_value, hist_meta, hist_out, std::nullopt);
-  execute_planned_attention(hist_plan, query.device(), stream);
-  destroy_planned_attention(hist_plan);
-  output.slice(1, 0, h).copy_(hist_out);
+  const int64_t update_b = 1;
+  const int64_t update_s = t;
+  const int64_t update_n = num_heads;
+  const int64_t update_d = head_dim;
+  const int64_t update_bsn = update_b * update_s * update_n;
+  auto f32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+  auto rt_tgt_out_flat_placeholder = torch::empty({update_bsn, update_d}, f32_opts);
+  auto rt_tgt_lse_flat_placeholder = torch::empty({update_bsn}, f32_opts);
+  auto target_out_flat_placeholder = torch::empty({update_bsn, update_d}, f32_opts);
+  auto target_lse_flat_placeholder = torch::empty({update_bsn}, f32_opts);
 
-  fa_for_crt(query, key, value, sample_metadata, output);
+  auto target_update_plan = plan_attention_update_from_prepared_flats(
+      {rt_tgt_out_flat_placeholder, target_out_flat_placeholder},
+      {rt_tgt_lse_flat_placeholder, target_lse_flat_placeholder},
+      update_b,
+      update_s,
+      update_n,
+      update_d,
+      query.scalar_type());
+
+  if (h > 0) {
+    auto hist_out = make_out(h);
+    SegmentAttentionMetadata hist_meta;
+    hist_meta.attn_mask = sample_metadata.compressed_causal_mask;
+    hist_meta.sparse_param.sparse_mode = 2;
+    hist_meta.sparse_param.pre_tokens = kDefaultWindow;
+    hist_meta.sparse_param.next_tokens = kDefaultWindow;
+    auto hist_query = query.slice(1, 0, h).contiguous();
+    auto hist_key = key.slice(1, 0, h).contiguous();
+    auto hist_value = value.slice(1, 0, h).contiguous();
+    auto hist_plan = plan_segment_attention(
+        hist_query, hist_key, hist_value, hist_meta, hist_out, std::nullopt);
+    execute_planned_attention(hist_plan, query.device(), stream);
+    destroy_planned_attention(hist_plan);
+    output.slice(1, 0, h).copy_(hist_out);
+  }
+
+  if (c > 0) {
+    auto ctx_out = make_out(c);
+    SegmentAttentionMetadata ctx_meta;
+    ctx_meta.sparse_param.sparse_mode = 0;
+    ctx_meta.sparse_param.pre_tokens = kDefaultWindow;
+    ctx_meta.sparse_param.next_tokens = kDefaultWindow;
+    auto ctx_query = query.slice(1, h, h + c).contiguous();
+    auto hc_key = key.slice(1, 0, h + c).contiguous();
+    auto hc_value = value.slice(1, 0, h + c).contiguous();
+    auto ctx_plan = plan_segment_attention(
+        ctx_query, hc_key, hc_value, ctx_meta, ctx_out, std::nullopt);
+    execute_planned_attention(ctx_plan, query.device(), stream);
+    destroy_planned_attention(ctx_plan);
+    output.slice(1, h, h + c).copy_(ctx_out);
+  }
+
+  rt_tgt_out_flat_placeholder.view({update_b, update_s, update_n, update_d})
+      .copy_(rt_tgt_out.narrow(1, r, t));
+  rt_tgt_lse_flat_placeholder.view({update_b, update_s, update_n})
+      .copy_(rt_tgt_lse.narrow(2, r, t).permute({0, 2, 1, 3}).squeeze(-1));
+
+  auto target_query = query.slice(1, h + c + r, h + c + r + t).contiguous();
+  auto target_key = key.slice(1, h + c + r, h + c + r + t).contiguous();
+  auto target_value = value.slice(1, h + c + r, h + c + r + t).contiguous();
+  auto [target_out, target_lse] =
+      build_target_diagonal_attn_analytic(target_query, target_key, target_value);
+
+  target_out_flat_placeholder.view({update_b, update_s, update_n, update_d})
+      .copy_(target_out);
+  target_lse_flat_placeholder.view({update_b, update_s, update_n})
+      .copy_(target_lse.permute({0, 2, 1, 3}).squeeze(-1));
+
+  execute_planned_attention_update(target_update_plan, query.device(), stream);
+  auto target_merged =
+      target_update_plan.out_flat
+          .view({target_update_plan.b,
+                 target_update_plan.s,
+                 target_update_plan.n,
+                 target_update_plan.d})
+          .to(target_update_plan.out_scalar_type);
+
+  destroy_planned_attention(rt_tgt_plan);
+  destroy_planned_attention_update(target_update_plan);
+  output.slice(1, h + c, h + c + r).copy_(rt_tgt_out.slice(1, 0, r));
+  output.slice(1, h + c + r, h + c + r + t).copy_(target_merged);
 }
 
 void partial_hist_matched(
@@ -1184,25 +1369,6 @@ void partial_rt_matched(
       value_cache.view({cache_block_count, block_size, num_kv_heads * head_dim});
   auto block_table = sample_metadata.block_table.to(i32_dev_opts.dtype()).contiguous();
 
-  auto rt_query_unmatched = query.slice(1, 0, rt_unmatched).contiguous();
-  auto rt_out_unmatched = torch::empty_like(rt_query_unmatched);
-  auto rt_pa_plan = plan_paged_attention_v3(
-      rt_query_unmatched,
-      key_cache_bnbsh,
-      value_cache_bnbsh,
-      block_table,
-      sample_metadata.compressed_causal_mask,
-      /*sparse_mode=*/3,
-      /*pre_tokens=*/kDefaultWindow,
-      /*next_tokens=*/kDefaultWindow,
-      /*total_kv_len=*/h + c + r,
-      /*block_size=*/block_size,
-      /*num_kv_heads=*/num_kv_heads,
-      rt_out_unmatched);
-  execute_planned_paged_attention(rt_pa_plan, query.device(), stream);
-  destroy_planned_paged_attention(rt_pa_plan);
-  output.slice(1, 0, rt_unmatched).copy_(rt_out_unmatched);
-
   const int64_t local_target_start = rt_unmatched;
   auto target_query = query.slice(1, local_target_start, local_target_start + t).contiguous();
   auto target_key = key.slice(1, local_target_start, local_target_start + t).contiguous();
@@ -1219,40 +1385,37 @@ void partial_rt_matched(
     return torch::full({1, num_heads, seq_len, 1}, kSentinel, lse_opts);
   };
 
-  auto out_prefix = make_out(t);
-  auto lse_prefix = make_lse(t);
-  auto prefix_pa_plan = plan_paged_attention_v3(
-      target_query,
+  auto [target_diag_out, target_diag_lse] =
+      build_target_diagonal_attn_analytic(target_query, target_key, target_value);
+
+  // Combine the old rt_unmatched sparse PA and target-prefix full PA:
+  // Q=R_unmatched+T, KV=H+C+R, sparse_mode=4.
+  auto combined_query = query.contiguous();
+  auto combined_out = make_out(rt_unmatched + t);
+  auto combined_lse = make_lse(rt_unmatched + t);
+  auto combined_pa_plan = plan_paged_attention_v3(
+      combined_query,
       key_cache_bnbsh,
       value_cache_bnbsh,
       block_table,
-      /*attn_mask=*/torch::Tensor(),
-      /*sparse_mode=*/0,
-      /*pre_tokens=*/kDefaultWindow,
-      /*next_tokens=*/kDefaultWindow,
-      /*total_prefix_kv_len=*/h + c + r,
-      block_size,
-      num_kv_heads,
-      out_prefix,
-      lse_prefix);
-  execute_planned_paged_attention(prefix_pa_plan, query.device(), stream);
-  destroy_planned_paged_attention(prefix_pa_plan);
+      sample_metadata.compressed_causal_mask,
+      /*sparse_mode=*/4,
+      /*pre_tokens=*/h + c + r,
+      /*next_tokens=*/t,
+      /*total_kv_len=*/h + c + r,
+      /*block_size=*/block_size,
+      /*num_kv_heads=*/num_kv_heads,
+      combined_out,
+      combined_lse);
+  execute_planned_paged_attention(combined_pa_plan, query.device(), stream);
 
-  auto out_self = make_out(t);
-  auto lse_self = make_lse(t);
-  SegmentAttentionMetadata self_meta;
-  self_meta.attn_mask = create_diagonal_mask(t, target_query.device());
-  self_meta.sparse_param.sparse_mode = 0;
-  self_meta.sparse_param.pre_tokens = 0;
-  self_meta.sparse_param.next_tokens = 0;
-  auto self_plan = plan_segment_attention(
-      target_query, target_key, target_value, self_meta, out_self, lse_self);
-  execute_planned_attention(self_plan, query.device(), stream);
-  destroy_planned_attention(self_plan);
-
+  auto target_prefix_out =
+      combined_out.slice(1, local_target_start, local_target_start + t).contiguous();
+  auto target_prefix_lse =
+      combined_lse.slice(2, local_target_start, local_target_start + t).contiguous();
   auto target_update_plan = plan_attention_update_like_benchmark(
-      {out_prefix.contiguous(), out_self.contiguous()},
-      {lse_prefix.contiguous(), lse_self.contiguous()});
+      {target_prefix_out, target_diag_out.contiguous()},
+      {target_prefix_lse, target_diag_lse.contiguous()});
   execute_planned_attention_update(target_update_plan, query.device(), stream);
   auto target_merged =
       target_update_plan.out_flat
@@ -1261,7 +1424,9 @@ void partial_rt_matched(
                  target_update_plan.n,
                  target_update_plan.d})
           .to(target_update_plan.out_scalar_type);
+  destroy_planned_paged_attention(combined_pa_plan);
   destroy_planned_attention_update(target_update_plan);
+  output.slice(1, 0, rt_unmatched).copy_(combined_out.slice(1, 0, rt_unmatched));
   output.slice(1, local_target_start, local_target_start + t).copy_(target_merged);
 }
 
@@ -1383,58 +1548,58 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> MTGRAttentionImpl::forwa
     CHECK_LT(matched, h + c + r)
         << "matched prefix must be in [0, history+context+realtime)";
 
+    auto write_prefix_cache = [&](const SampleSegmentMetadata& metadata,
+                                  int64_t prefix_cache_len,
+                                  const char* tag) {
+      if (!key_cache.defined() || !value_cache.defined() || prefix_cache_len <= 0) {
+        return;
+      }
+      CHECK_LE(prefix_cache_len, key_i.size(1))
+          << "prefix_cache_len must be <= local kv length, got prefix_cache_len="
+          << prefix_cache_len << ", kv_len=" << key_i.size(1);
+      CHECK_GE(metadata.slot_mapping.size(0), prefix_cache_len)
+          << "slot_mapping is shorter than prefix cache length";
+
+      auto stream = c10_npu::getCurrentNPUStream(query.device().index()).stream();
+      auto i32_dev_opts =
+          torch::TensorOptions().dtype(torch::kInt32).device(query.device());
+      auto key_seq = key_i.select(0, 0).contiguous();
+      auto value_seq = value_i.select(0, 0).contiguous();
+      auto slots_dev_i32 =
+          metadata.slot_mapping
+              .slice(/*dim=*/0, /*start=*/0, /*end=*/prefix_cache_len)
+              .to(i32_dev_opts.dtype())
+              .contiguous();
+      auto prefix_key = key_seq.slice(0, 0, prefix_cache_len).contiguous();
+      auto prefix_value = value_seq.slice(0, 0, prefix_cache_len).contiguous();
+      CHECK(run_scatter_pa_kv_cache(prefix_key,
+                                    prefix_value,
+                                    key_cache,
+                                    value_cache,
+                                    slots_dev_i32,
+                                    stream))
+          << "run_scatter_pa_kv_cache failed in " << tag;
+    };
+
     if (matched == 0) {
       no_matched(query_i, key_i, value_i, sample_metadata, output_i);
-      if (key_cache.defined() && value_cache.defined()) {
-        const int64_t prefix_cache_len = h + c + r;
-        CHECK_GE(prefix_cache_len, 0);
-        CHECK_LE(prefix_cache_len, kv_len)
-            << "prefix_cache_len must be <= kv_len, got prefix_cache_len="
-            << prefix_cache_len << ", kv_len=" << kv_len;
-        if (prefix_cache_len > 0) {
-          CHECK_GE(sample_metadata.slot_mapping.size(0), prefix_cache_len)
-              << "slot_mapping is shorter than history+context+real_time length";
-          auto stream = c10_npu::getCurrentNPUStream(query.device().index()).stream();
-          auto i32_dev_opts =
-              torch::TensorOptions().dtype(torch::kInt32).device(query.device());
-          auto key_seq = key_i.select(0, 0).contiguous();
-          auto value_seq = value_i.select(0, 0).contiguous();
-          auto slots_dev_i32 =
-              sample_metadata.slot_mapping
-                  .slice(/*dim=*/0, /*start=*/0, /*end=*/prefix_cache_len)
-                  .to(i32_dev_opts.dtype())
-                  .contiguous();
-          auto prefix_key = key_seq.slice(0, 0, prefix_cache_len).contiguous();
-          auto prefix_value = value_seq.slice(0, 0, prefix_cache_len).contiguous();
-          CHECK(run_scatter_pa_kv_cache(prefix_key,
-                                        prefix_value,
-                                        key_cache,
-                                        value_cache,
-                                        slots_dev_i32,
-                                        stream))
-              << "run_scatter_pa_kv_cache failed in no_matched prefix writeback";
-        }
-      }
-    } else if (matched < h) {
-      CHECK(key_cache.defined() && value_cache.defined())
-          << "KV cache is required for prefix-cache path";
-      partial_hist_matched(query_i,
-                           key_i,
-                           value_i,
-                           key_cache,
-                           value_cache,
-                           sample_metadata,
-                           output_i);
-    } else if (matched >= h && matched < h + c) {
-      CHECK(key_cache.defined() && value_cache.defined())
-          << "KV cache is required for prefix-cache path";
-      partial_ctx_matched(query_i,
-                          key_i,
-                          value_i,
-                          key_cache,
-                          value_cache,
-                          sample_metadata,
-                          output_i);
+      write_prefix_cache(sample_metadata, h + c + r, "no_matched prefix writeback");
+    } else if (matched < h + c) {
+      LOG(WARNING) << "matched_prefix falls before realtime; fallback to "
+                   << "no_matched path only when full sequence is provided. matched=" << matched
+                   << ", history=" << h
+                   << ", context=" << c
+                   << ", realtime=" << r;
+
+      SampleSegmentMetadata fallback_metadata = sample_metadata;
+      fallback_metadata.matched_prefix = 0;
+      CHECK_EQ(q_len, h + c + r + fallback_metadata.target)
+          << "history/context partial fallback requires the caller to provide the "
+          << "full no-match sequence. Trimmed partial inputs cannot be converted "
+          << "to no_matched inside MTGRAttentionImpl.";
+      no_matched(query_i, key_i, value_i, fallback_metadata, output_i);
+      write_prefix_cache(
+          fallback_metadata, h + c + r, "no_matched fallback prefix writeback");
     } else if (matched >= h + c && matched < h + c + r) {
       CHECK(key_cache.defined() && value_cache.defined())
           << "KV cache is required for prefix-cache path";

@@ -34,6 +34,13 @@ void top_k_top_p(torch::Tensor& logits,
 
 void replace_token(torch::Tensor& dst, torch::Tensor& src);
 
+void mtgr_target_update(const torch::Tensor& target_query,
+                        const torch::Tensor& target_key,
+                        const torch::Tensor& target_value,
+                        const torch::Tensor& prefix_out,
+                        const torch::Tensor& prefix_lse,
+                        torch::Tensor& out);
+
 void beam_search_rec(const torch::Tensor& logprobs,
                      const torch::Tensor& top_tokens,
                      const torch::Tensor& top_logprobs,
