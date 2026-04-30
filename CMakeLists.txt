@@ -267,7 +267,7 @@ find_package(GTest CONFIG REQUIRED)
 find_package(benchmark CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(OpenCV CONFIG REQUIRED)
-find_package(Python COMPONENTS Development REQUIRED)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
 if (USE_CXX11_ABI)
@@ -306,6 +306,38 @@ else()
   
   find_package(Torch REQUIRED PATHS ${LIBTORCH_SOURCE_DIR} NO_DEFAULT_PATH)
   message(STATUS "Downloading and using libtorch 2.1.0 for CPU at ${LIBTORCH_SOURCE_DIR}")
+endif()
+
+set(XLLM_PYTORCH_INSTALL_PATH "$ENV{PYTORCH_INSTALL_PATH}")
+if("${XLLM_PYTORCH_INSTALL_PATH}" STREQUAL "")
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c
+            "import os, torch; print(os.path.dirname(torch.__file__))"
+    OUTPUT_VARIABLE XLLM_PYTORCH_INSTALL_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  if("${XLLM_PYTORCH_INSTALL_PATH}" STREQUAL "")
+    message(FATAL_ERROR "Failed to resolve PYTORCH_INSTALL_PATH from python torch package")
+  endif()
+  set(ENV{PYTORCH_INSTALL_PATH} "${XLLM_PYTORCH_INSTALL_PATH}")
+  message(STATUS "Resolved PYTORCH_INSTALL_PATH to ${XLLM_PYTORCH_INSTALL_PATH}")
+endif()
+
+set(XLLM_PYTHON_INCLUDE_PATH "$ENV{PYTHON_INCLUDE_PATH}")
+if("${XLLM_PYTHON_INCLUDE_PATH}" STREQUAL "")
+  set(XLLM_PYTHON_INCLUDE_PATH "${Python_INCLUDE_DIRS}")
+  set(ENV{PYTHON_INCLUDE_PATH} "${XLLM_PYTHON_INCLUDE_PATH}")
+  message(STATUS "Resolved PYTHON_INCLUDE_PATH to ${XLLM_PYTHON_INCLUDE_PATH}")
+endif()
+
+set(XLLM_PYTHON_LIB_PATH "$ENV{PYTHON_LIB_PATH}")
+if("${XLLM_PYTHON_LIB_PATH}" STREQUAL "")
+  if(DEFINED Python_LIBRARIES AND NOT "${Python_LIBRARIES}" STREQUAL "")
+    list(GET Python_LIBRARIES 0 XLLM_PYTHON_LIB_FILE)
+    get_filename_component(XLLM_PYTHON_LIB_PATH "${XLLM_PYTHON_LIB_FILE}" DIRECTORY)
+    set(ENV{PYTHON_LIB_PATH} "${XLLM_PYTHON_LIB_PATH}")
+    message(STATUS "Resolved PYTHON_LIB_PATH to ${XLLM_PYTHON_LIB_PATH}")
+  endif()
 endif()
 
 if(USE_NPU)

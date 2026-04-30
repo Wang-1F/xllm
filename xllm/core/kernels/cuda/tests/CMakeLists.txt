@@ -1,0 +1,37 @@
+include(cc_test)
+
+cc_test(
+  NAME
+    mtgr_attention_e2e_precision_test
+  SRCS
+    mtgr_attention_e2e_precision_test.cpp
+    mtgr_attenion_test.cpp
+    mtgr_fused_attention_kernel.cu
+    mtgr_full_attention_kernel.cu
+    mtgr_flashinfer_mask_kernel.cu
+  DEPS
+    :cuda_kernels
+    :flags
+    :kv_cache
+    torch
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
+    mtgr_attention_one_vs_multi_stage_perf_test
+  SRCS
+    mtgr_attention_one_vs_multi_stage_perf_test.cpp
+    mtgr_attenion_test.cpp
+    mtgr_fused_attention_kernel.cu
+    mtgr_full_attention_kernel.cu
+    mtgr_flashinfer_mask_kernel.cu
+  DEPS
+    :cuda_kernels
+    :flags
+    :kv_cache
+    torch
+    GTest::gtest_main
+    glog::glog
+)

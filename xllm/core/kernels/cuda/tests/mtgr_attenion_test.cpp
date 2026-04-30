@@ -1,0 +1,1574 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "mtgr_attenion_test.h"
+
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+#include <glog/logging.h>
+#include <torch/cuda.h>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <numeric>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "core/common/global_flags.h"
+#include "core/platform/device.h"
+#include "cuda_ops_api.h"
+#include "mtgr_flashinfer.h"
+#include "utils.h"
+
+namespace xllm::kernel::cuda::test {
+
+void build_mtgr_packed_mask(torch::Tensor packed_mask,
+                            int64_t q_len,
+                            int64_t kv_len,
+                            int64_t history_len,
+                            int64_t context_len,
+                            int64_t realtime_len,
+                            int64_t mask_kind);
+
+void merge_target_diag_attention_cuda(const torch::Tensor& hcr_out_snd,
+                                      const torch::Tensor& hcr_lse_sh1,
+                                      const torch::Tensor& target_query_snd,
+                                      const torch::Tensor& target_key_snd,
+                                      const torch::Tensor& target_value_snd,
+                                      double sm_scale,
+                                      torch::Tensor merged_out_snd);
+
+void mtgr_fused_no_match_attention_cuda(const torch::Tensor& query_snd,
+                                        const torch::Tensor& key_snd,
+                                        const torch::Tensor& value_snd,
+                                        int64_t history_len,
+                                        int64_t context_len,
+                                        int64_t realtime_len,
+                                        int64_t target_len,
+                                        double sm_scale,
+                                        torch::Tensor output_snd,
+                                        torch::Tensor target_hcr_lse_sh1);
+
+void full_attention_cuda(const torch::Tensor& query_snd,
+                         const torch::Tensor& key_snd,
+                         const torch::Tensor& value_snd,
+                         double sm_scale,
+                         torch::Tensor output_snd);
+
+namespace {
+
+struct StageTimeline {
+  const char* name = nullptr;
+  double get_ws_ms = 0.0;
+  double device_ms = 0.0;
+  double host_ms = 0.0;
+  bool has_getws = false;
+  std::chrono::steady_clock::time_point getws_submit{};
+  std::chrono::steady_clock::time_point host_submit{};
+  std::chrono::steady_clock::time_point host_end{};
+  cudaEvent_t ev_start = nullptr;
+  cudaEvent_t ev_end = nullptr;
+};
+
+struct TimelineSummary {
+  double total_ms = 0.0;
+  std::vector<double> stage_device_ms;
+  std::vector<double> stage_host_ms;
+  std::vector<double> stage_getws_ms;
+};
+
+std::vector<StageTimeline> build_no_match_multi_timeline() {
+  return {{"rt_tgt_on_hcr_trapezoid"},
+          {"tgt_diag_update_fused"},
+          {"hist_fa"},
+          {"ctx_on_hc"}};
+}
+
+std::vector<StageTimeline> build_partial_rt_multi_timeline() {
+  return {{"rt_tgt_on_prefix_rt_trapezoid"}, {"tgt_diag_update_fused"}};
+}
+
+std::vector<StageTimeline> build_fused_no_match_timeline() {
+  return {{"mtgr_fused_no_match_attention"}, {"tgt_diag_update_fused"}};
+}
+
+void create_stage_events_if_needed(StageTimeline* stage) {
+  if (stage == nullptr) {
+    return;
+  }
+  CHECK_EQ(cudaEventCreate(&stage->ev_start), cudaSuccess);
+  CHECK_EQ(cudaEventCreate(&stage->ev_end), cudaSuccess);
+}
+
+void destroy_stage_events_if_needed(StageTimeline* stage) {
+  if (stage == nullptr) {
+    return;
+  }
+  if (stage->ev_start != nullptr) {
+    CHECK_EQ(cudaEventDestroy(stage->ev_start), cudaSuccess);
+    stage->ev_start = nullptr;
+  }
+  if (stage->ev_end != nullptr) {
+    CHECK_EQ(cudaEventDestroy(stage->ev_end), cudaSuccess);
+    stage->ev_end = nullptr;
+  }
+}
+
+void prepare_timeline_events(std::vector<StageTimeline>* timeline) {
+  if (timeline == nullptr) {
+    return;
+  }
+  for (auto& stage : *timeline) {
+    stage.get_ws_ms = 0.0;
+    stage.device_ms = 0.0;
+    stage.host_ms = 0.0;
+    stage.has_getws = false;
+    stage.getws_submit = std::chrono::steady_clock::time_point{};
+    stage.host_submit = std::chrono::steady_clock::time_point{};
+    stage.host_end = std::chrono::steady_clock::time_point{};
+    create_stage_events_if_needed(&stage);
+  }
+}
+
+void release_timeline_events(std::vector<StageTimeline>* timeline) {
+  if (timeline == nullptr) {
+    return;
+  }
+  for (auto& stage : *timeline) {
+    destroy_stage_events_if_needed(&stage);
+  }
+}
+
+void record_stage_begin_if_needed(StageTimeline* stage,
+                                  const torch::Device& device) {
+  if (stage == nullptr) {
+    return;
+  }
+  const auto stream = c10::cuda::getCurrentCUDAStream(device.index()).stream();
+  CHECK_EQ(cudaEventRecord(stage->ev_start, stream), cudaSuccess);
+  stage->host_submit = std::chrono::steady_clock::now();
+  stage->host_end = std::chrono::steady_clock::time_point{};
+}
+
+void record_stage_end_if_needed(StageTimeline* stage,
+                                const torch::Device& device) {
+  if (stage == nullptr) {
+    return;
+  }
+  const auto stream = c10::cuda::getCurrentCUDAStream(device.index()).stream();
+  CHECK_EQ(cudaEventRecord(stage->ev_end, stream), cudaSuccess);
+  stage->host_end = std::chrono::steady_clock::now();
+  stage->host_ms = std::chrono::duration<double, std::milli>(stage->host_end -
+                                                             stage->host_submit)
+                       .count();
+}
+
+TimelineSummary collect_timeline_summary(std::vector<StageTimeline>* timeline) {
+  CHECK(timeline != nullptr);
+  CHECK(!timeline->empty());
+  for (const auto& stage : *timeline) {
+    CHECK(stage.ev_end != nullptr);
+    CHECK_EQ(cudaEventSynchronize(stage.ev_end), cudaSuccess);
+  }
+
+  TimelineSummary summary;
+  summary.stage_device_ms.resize(timeline->size(), 0.0);
+  summary.stage_host_ms.resize(timeline->size(), 0.0);
+  summary.stage_getws_ms.resize(timeline->size(), 0.0);
+  for (size_t i = 0; i < timeline->size(); ++i) {
+    float ms = 0.0f;
+    CHECK_EQ(cudaEventElapsedTime(
+                 &ms, (*timeline)[i].ev_start, (*timeline)[i].ev_end),
+             cudaSuccess);
+    (*timeline)[i].device_ms = static_cast<double>(ms);
+    summary.stage_device_ms[i] = (*timeline)[i].device_ms;
+    summary.stage_host_ms[i] = (*timeline)[i].host_ms;
+    summary.stage_getws_ms[i] = (*timeline)[i].get_ws_ms;
+  }
+
+  float total_ms = 0.0f;
+  CHECK_EQ(cudaEventElapsedTime(
+               &total_ms, timeline->front().ev_start, timeline->back().ev_end),
+           cudaSuccess);
+  summary.total_ms = static_cast<double>(total_ms);
+  return summary;
+}
+
+void fill_stage_metrics(const std::vector<StageTimeline>& timeline,
+                        const TimelineSummary& summary,
+                        MTGRAttentionTestMetrics* metrics) {
+  CHECK(metrics != nullptr);
+  metrics->stages.clear();
+  metrics->stages.reserve(timeline.size());
+  for (size_t i = 0; i < timeline.size(); ++i) {
+    metrics->stages.push_back(MTGRStageMetric{
+        .name = timeline[i].name != nullptr ? timeline[i].name : "stage",
+        .workspace_ms = summary.stage_getws_ms[i],
+        .exec_ms = summary.stage_device_ms[i],
+        .host_submit_ms = summary.stage_host_ms[i],
+    });
+  }
+}
+
+struct FlashinferWorkspaceBuffers {
+  torch::Tensor float_workspace;
+  torch::Tensor int_workspace;
+  torch::Tensor page_locked_int_workspace;
+};
+
+void ensure_workspace_buffers(FlashinferWorkspaceBuffers* ws,
+                              const torch::Device& device) {
+  CHECK(ws != nullptr);
+  const bool need_init =
+      !ws->float_workspace.defined() || ws->float_workspace.device() != device;
+  if (!need_init) {
+    return;
+  }
+  ws->float_workspace =
+      torch::empty({FLAGS_flashinfer_workspace_buffer_size},
+                   torch::TensorOptions().dtype(torch::kUInt8).device(device));
+  ws->int_workspace =
+      torch::empty({8 * 1024 * 1024},
+                   torch::TensorOptions().dtype(torch::kUInt8).device(device));
+  ws->page_locked_int_workspace = torch::empty({ws->int_workspace.size(0)},
+                                               torch::TensorOptions()
+                                                   .dtype(torch::kUInt8)
+                                                   .device(torch::kCPU)
+                                                   .pinned_memory(true));
+}
+
+FlashinferWorkspaceBuffers& get_workspace_buffers(const torch::Device& device) {
+  static thread_local FlashinferWorkspaceBuffers ws;
+  ensure_workspace_buffers(&ws, device);
+  return ws;
+}
+
+FlashinferWorkspaceBuffers& get_workspace_buffers_for_slot(
+    const torch::Device& device,
+    int64_t slot) {
+  CHECK_GE(slot, 0);
+  static thread_local std::unordered_map<int64_t, FlashinferWorkspaceBuffers>
+      workspace_slots;
+  const int64_t device_idx = static_cast<int64_t>(device.index());
+  const int64_t key = (device_idx << 16) ^ slot;
+  auto& ws = workspace_slots[key];
+  ensure_workspace_buffers(&ws, device);
+  return ws;
+}
+
+FlashinferWorkspaceBuffers& select_workspace_buffers(
+    const torch::Device& device,
+    FlashinferWorkspaceBuffers* workspace_override) {
+  if (workspace_override != nullptr) {
+    ensure_workspace_buffers(workspace_override, device);
+    return *workspace_override;
+  }
+  return get_workspace_buffers(device);
+}
+
+ffi::Array<int64_t> deep_copy_plan_info(const ffi::Array<int64_t>& src) {
+  if (!src.defined()) {
+    return ffi::Array<int64_t>();
+  }
+  std::vector<int64_t> copied;
+  copied.reserve(src.size());
+  for (const auto& v : src) {
+    copied.push_back(v);
+  }
+  return ffi::Array<int64_t>(copied.begin(), copied.end());
+}
+
+struct FlashinferPlan {
+  std::string uri;
+  std::string backend;
+  ffi::Array<int64_t> plan_info;
+};
+
+torch::Tensor make_seq_indptr_host(int64_t seq_len) {
+  CHECK_GE(seq_len, 0);
+  return torch::tensor(
+      {0, static_cast<int32_t>(seq_len)},
+      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+}
+
+FlashinferPlan build_prefill_plan(
+    const torch::Device& device,
+    torch::ScalarType query_dtype,
+    torch::ScalarType key_dtype,
+    torch::ScalarType output_dtype,
+    int64_t head_dim_qk,
+    int64_t head_dim_vo,
+    int64_t num_qo_heads,
+    int64_t num_kv_heads,
+    const torch::Tensor& q_cu_seq_lens_host,
+    const torch::Tensor& kv_cu_seq_lens_host,
+    bool causal,
+    int64_t window_size_left,
+    bool use_custom_mask,
+    FlashinferWorkspaceBuffers* workspace_override = nullptr) {
+  CHECK_EQ(q_cu_seq_lens_host.device().type(), torch::kCPU);
+  CHECK_EQ(kv_cu_seq_lens_host.device().type(), torch::kCPU);
+  CHECK_EQ(q_cu_seq_lens_host.scalar_type(), torch::kInt32);
+  CHECK_EQ(kv_cu_seq_lens_host.scalar_type(), torch::kInt32);
+
+  auto& ws = select_workspace_buffers(device, workspace_override);
+  bind_tvmffi_stream_to_current_torch_stream(device);
+
+  FlashinferPlan plan;
+  plan.backend = determine_attention_backend(/*pos_encoding_mode=*/0,
+                                             /*use_fp16_qk_reduction=*/false,
+                                             use_custom_mask);
+  plan.uri = get_batch_prefill_uri(plan.backend,
+                                   query_dtype,
+                                   key_dtype,
+                                   output_dtype,
+                                   q_cu_seq_lens_host.scalar_type(),
+                                   head_dim_qk,
+                                   head_dim_vo,
+                                   /*pos_encoding_mode=*/0,
+                                   /*use_sliding_window=*/false,
+                                   /*use_logits_soft_cap=*/false,
+                                   /*use_fp16_qk_reduction=*/false);
+
+  torch::Tensor kv_len_arr_host =
+      kv_cu_seq_lens_host.slice(0, 1) - kv_cu_seq_lens_host.slice(0, 0, -1);
+  const int64_t total_num_rows = q_cu_seq_lens_host[-1].item<int64_t>();
+  const int64_t batch_size = q_cu_seq_lens_host.size(0) - 1;
+
+  auto plan_func = get_function(plan.uri, "plan");
+  ffi::Array<int64_t> plan_result =
+      Device::is_support_sm90a()
+          ? plan_func(to_ffi_tensor(ws.float_workspace),
+                      to_ffi_tensor(ws.int_workspace),
+                      to_ffi_tensor(ws.page_locked_int_workspace),
+                      to_ffi_tensor(q_cu_seq_lens_host),
+                      to_ffi_tensor(kv_cu_seq_lens_host),
+                      to_ffi_tensor(kv_len_arr_host),
+                      total_num_rows,
+                      batch_size,
+                      num_qo_heads,
+                      num_kv_heads,
+                      /*page_size=*/1,
+                      /*enable_cuda_graph=*/false,
+                      head_dim_qk,
+                      head_dim_vo,
+                      causal,
+                      window_size_left)
+                .cast<ffi::Array<int64_t>>()
+          : plan_func(to_ffi_tensor(ws.float_workspace),
+                      to_ffi_tensor(ws.int_workspace),
+                      to_ffi_tensor(ws.page_locked_int_workspace),
+                      to_ffi_tensor(q_cu_seq_lens_host),
+                      to_ffi_tensor(kv_cu_seq_lens_host),
+                      to_ffi_tensor(kv_len_arr_host),
+                      total_num_rows,
+                      batch_size,
+                      num_qo_heads,
+                      num_kv_heads,
+                      /*page_size=*/1,
+                      /*enable_cuda_graph=*/false,
+                      head_dim_qk,
+                      head_dim_vo,
+                      causal,
+                      window_size_left,
+                      /*fixed_split_size=*/-1,
+                      /*disable_split_kv=*/false,
+                      /*num_colocated_ctas=*/0)
+                .cast<ffi::Array<int64_t>>();
+  plan.plan_info = deep_copy_plan_info(plan_result);
+  return plan;
+}
+
+torch::Tensor normalize_lse_shape(const torch::Tensor& raw_lse,
+                                  int64_t seq_len,
+                                  int64_t num_heads) {
+  CHECK(raw_lse.defined());
+  auto lse = raw_lse.contiguous();
+  CHECK_EQ(lse.scalar_type(), torch::kFloat32);
+  if (lse.dim() == 3 && lse.size(0) == seq_len && lse.size(1) == num_heads &&
+      lse.size(2) == 1) {
+    return lse;
+  }
+  if (lse.dim() == 2 && lse.size(0) == num_heads && lse.size(1) == seq_len) {
+    return lse.transpose(0, 1).unsqueeze(-1).contiguous();
+  }
+  if (lse.dim() == 2 && lse.size(0) == seq_len && lse.size(1) == num_heads) {
+    return lse.unsqueeze(-1).contiguous();
+  }
+  if (lse.dim() == 4 && lse.size(0) == 1 && lse.size(3) == 1 &&
+      lse.size(1) == seq_len && lse.size(2) == num_heads) {
+    return lse.squeeze(0).contiguous();
+  }
+  if (lse.dim() == 4 && lse.size(0) == 1 && lse.size(3) == 1 &&
+      lse.size(1) == num_heads && lse.size(2) == seq_len) {
+    return lse.squeeze(0).transpose(0, 1).contiguous();
+  }
+  CHECK(false) << "Unsupported output_lse shape: " << lse.sizes();
+  return torch::Tensor();
+}
+
+torch::Tensor get_cached_mask_indptr(const torch::Device& device,
+                                     int64_t num_bytes) {
+  static thread_local std::unordered_map<int64_t, torch::Tensor> cached_indptr;
+  const int64_t device_idx = static_cast<int64_t>(device.index());
+  const int64_t key = (device_idx << 32) ^ num_bytes;
+  auto it = cached_indptr.find(key);
+  if (it != cached_indptr.end()) {
+    return it->second;
+  }
+  auto indptr =
+      torch::tensor({0, static_cast<int32_t>(num_bytes)},
+                    torch::TensorOptions().dtype(torch::kInt32).device(device))
+          .contiguous();
+  it = cached_indptr.emplace(key, indptr).first;
+  return it->second;
+}
+
+void launch_prefill_with_optional_packed_custom_mask(
+    const FlashinferPlan& plan,
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& q_cu_seq_lens_dev,
+    const torch::Tensor& kv_cu_seq_lens_dev,
+    bool causal,
+    double sm_scale,
+    torch::Tensor& output_snd,
+    std::optional<torch::Tensor>& output_lse,
+    const std::optional<torch::Tensor>& packed_custom_mask,
+    FlashinferWorkspaceBuffers* workspace_override = nullptr) {
+  const auto device = query_snd.device();
+  auto& ws = select_workspace_buffers(device, workspace_override);
+
+  if (plan.backend == "fa2") {
+    std::optional<torch::Tensor> mask_indptr = std::nullopt;
+    if (packed_custom_mask.has_value()) {
+      mask_indptr =
+          get_cached_mask_indptr(device, packed_custom_mask.value().numel());
+    }
+    get_function(plan.uri, "ragged_run")(
+        to_ffi_tensor(ws.float_workspace),
+        to_ffi_tensor(ws.int_workspace),
+        plan.plan_info,
+        to_ffi_tensor(query_snd),
+        to_ffi_tensor(key_snd),
+        to_ffi_tensor(value_snd),
+        to_ffi_tensor(q_cu_seq_lens_dev),
+        to_ffi_tensor(kv_cu_seq_lens_dev),
+        to_ffi_tensor(output_snd),
+        output_lse.has_value() ? to_ffi_tensor(output_lse.value())
+                               : ffi::Optional<ffi::Tensor>(),
+        /*mask_mode_code=*/causal ? 1 : 0,
+        /*kv_layout_code=*/0,
+        /*window_left=*/-1,
+        support_pdl(),
+        packed_custom_mask.has_value()
+            ? to_ffi_tensor(packed_custom_mask.value())
+            : ffi::Optional<ffi::Tensor>(),
+        mask_indptr.has_value() ? to_ffi_tensor(mask_indptr.value())
+                                : ffi::Optional<ffi::Tensor>(),
+        /*maybe_alibi_slopes=*/ffi::Optional<ffi::Tensor>(),
+        /*maybe_prefix_len_ptr=*/ffi::Optional<ffi::Tensor>(),
+        /*maybe_token_pos_in_items_ptr=*/ffi::Optional<ffi::Tensor>(),
+        /*maybe_max_item_len_ptr=*/ffi::Optional<ffi::Tensor>(),
+        /*logits_soft_cap=*/0.0,
+        sm_scale,
+        /*rope_rcp_scale=*/1.0,
+        /*rope_rcp_theta=*/1.0 / 10000.0,
+        /*token_pos_in_items_len=*/0);
+    return;
+  }
+
+  CHECK(!packed_custom_mask.has_value())
+      << "Custom mask path currently requires fa2 backend";
+  torch::Tensor v_scale = torch::Tensor();
+  auto [scale_v_tensor, scale_v_scalar] = split_scale_param(v_scale);
+  get_function(plan.uri, "ragged_run")(
+      to_ffi_tensor(ws.float_workspace),
+      to_ffi_tensor(ws.int_workspace),
+      plan.plan_info,
+      to_ffi_tensor(query_snd),
+      to_ffi_tensor(key_snd),
+      to_ffi_tensor(value_snd),
+      to_ffi_tensor(q_cu_seq_lens_dev),
+      to_ffi_tensor(kv_cu_seq_lens_dev),
+      to_ffi_tensor(output_snd),
+      output_lse.has_value() ? to_ffi_tensor(output_lse.value())
+                             : ffi::Optional<ffi::Tensor>(),
+      /*mask_mode_code=*/causal ? 1 : 0,
+      /*kv_layout_code=*/0,
+      /*window_left=*/-1,
+      support_pdl(),
+      /*maybe_prefix_len_ptr=*/ffi::Optional<ffi::Tensor>(),
+      /*maybe_token_pos_in_items_ptr=*/ffi::Optional<ffi::Tensor>(),
+      /*maybe_max_item_len_ptr=*/ffi::Optional<ffi::Tensor>(),
+      scale_v_tensor.defined() ? to_ffi_tensor(scale_v_tensor)
+                               : ffi::Optional<ffi::Tensor>(),
+      /*logits_soft_cap=*/0.0,
+      sm_scale,
+      scale_v_scalar,
+      /*token_pos_in_items_len=*/0);
+}
+
+struct AttentionRunResult {
+  torch::Tensor out_snd;
+  torch::Tensor lse_sh1;
+  double get_ws_ms = 0.0;
+};
+
+enum class PreparedSegmentBackend {
+  kFlashinfer,
+  kCudaFullAttention,
+};
+
+struct PreparedFaSegment {
+  PreparedSegmentBackend backend = PreparedSegmentBackend::kFlashinfer;
+  FlashinferPlan plan;
+  FlashinferWorkspaceBuffers* workspace = nullptr;
+  torch::Tensor query_snd;
+  torch::Tensor key_snd;
+  torch::Tensor value_snd;
+  torch::Tensor q_cu_dev;
+  torch::Tensor kv_cu_dev;
+  torch::Tensor out_snd;
+  std::optional<torch::Tensor> output_lse = std::nullopt;
+  bool causal = false;
+  int64_t q_len = 0;
+  int64_t num_heads = 0;
+  double get_ws_ms = 0.0;
+  std::optional<torch::Tensor> packed_custom_mask = std::nullopt;
+};
+
+bool should_use_cuda_full_attention(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    bool causal,
+    bool need_lse,
+    const std::optional<torch::Tensor>& packed_custom_mask) {
+  if (!env_flag_enabled("XLLM_MTGR_USE_CUDA_FULL_ATTN", false)) {
+    return false;
+  }
+  if (causal || need_lse || packed_custom_mask.has_value()) {
+    return false;
+  }
+  if (!query_snd.is_cuda() || !key_snd.is_cuda()) {
+    return false;
+  }
+  if (query_snd.scalar_type() != torch::kFloat16) {
+    return false;
+  }
+  if (query_snd.size(1) != key_snd.size(1)) {
+    return false;
+  }
+  constexpr int64_t kSmallQHeadDim = 128;
+  constexpr int64_t kSmallQChunkSize = 64;
+  constexpr int64_t kSmallQMaxChunks = 128;
+  return query_snd.size(0) > 0 && query_snd.size(0) <= 8 &&
+         query_snd.size(2) == kSmallQHeadDim &&
+         key_snd.size(0) <= kSmallQChunkSize * kSmallQMaxChunks;
+}
+
+PreparedFaSegment prepare_fa_segment(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    bool causal,
+    bool need_lse,
+    StageTimeline* stage_timeline = nullptr,
+    const std::optional<torch::Tensor>& packed_custom_mask = std::nullopt,
+    const std::optional<torch::Tensor>& output_snd_override = std::nullopt,
+    FlashinferWorkspaceBuffers* workspace_override = nullptr) {
+  CHECK_EQ(query_snd.dim(), 3);
+  CHECK_EQ(key_snd.dim(), 3);
+  CHECK_EQ(value_snd.dim(), 3);
+  CHECK_EQ(query_snd.size(2), key_snd.size(2));
+  CHECK_EQ(key_snd.sizes(), value_snd.sizes());
+  CHECK_GT(query_snd.size(0), 0);
+  CHECK_GT(key_snd.size(0), 0);
+
+  const auto device = query_snd.device();
+  const int64_t q_len = query_snd.size(0);
+  const int64_t kv_len = key_snd.size(0);
+  const int64_t num_heads = query_snd.size(1);
+  const int64_t num_kv_heads = key_snd.size(1);
+  const int64_t head_dim = query_snd.size(2);
+
+  auto q_cu_host = make_seq_indptr_host(q_len);
+  auto kv_cu_host = make_seq_indptr_host(kv_len);
+  auto q_cu_dev = q_cu_host.to(device);
+  auto kv_cu_dev = kv_cu_host.to(device);
+
+  PreparedFaSegment prepared;
+  prepared.workspace = workspace_override;
+  prepared.query_snd = query_snd;
+  prepared.key_snd = key_snd;
+  prepared.value_snd = value_snd;
+  prepared.q_cu_dev = q_cu_dev;
+  prepared.kv_cu_dev = kv_cu_dev;
+  prepared.causal = causal;
+  prepared.q_len = q_len;
+  prepared.num_heads = num_heads;
+  prepared.packed_custom_mask = packed_custom_mask;
+  prepared.backend =
+      should_use_cuda_full_attention(
+          query_snd, key_snd, causal, need_lse, packed_custom_mask)
+          ? PreparedSegmentBackend::kCudaFullAttention
+          : PreparedSegmentBackend::kFlashinfer;
+
+  if (prepared.backend == PreparedSegmentBackend::kFlashinfer) {
+    auto t0 = std::chrono::steady_clock::now();
+    if (stage_timeline != nullptr) {
+      stage_timeline->has_getws = true;
+      stage_timeline->getws_submit = t0;
+    }
+    prepared.plan =
+        build_prefill_plan(device,
+                           query_snd.scalar_type(),
+                           key_snd.scalar_type(),
+                           query_snd.scalar_type(),
+                           head_dim,
+                           head_dim,
+                           num_heads,
+                           num_kv_heads,
+                           q_cu_host,
+                           kv_cu_host,
+                           causal,
+                           /*window_size_left=*/-1,
+                           /*use_custom_mask=*/packed_custom_mask.has_value(),
+                           workspace_override);
+    prepared.get_ws_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+    if (stage_timeline != nullptr) {
+      stage_timeline->get_ws_ms = prepared.get_ws_ms;
+    }
+  }
+
+  if (output_snd_override.has_value()) {
+    prepared.out_snd = output_snd_override.value();
+    CHECK_EQ(prepared.out_snd.sizes(), query_snd.sizes());
+  } else {
+    prepared.out_snd =
+        torch::empty({q_len, num_heads, head_dim}, query_snd.options());
+  }
+  if (need_lse) {
+    prepared.output_lse = torch::empty(
+        {q_len, num_heads, 1},
+        torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  }
+  return prepared;
+}
+
+AttentionRunResult launch_prepared_fa_segment(
+    PreparedFaSegment* prepared,
+    double sm_scale,
+    StageTimeline* stage_timeline = nullptr) {
+  CHECK(prepared != nullptr);
+  const auto device = prepared->query_snd.device();
+  if (stage_timeline != nullptr) {
+    record_stage_begin_if_needed(stage_timeline, device);
+  }
+
+  if (prepared->backend == PreparedSegmentBackend::kCudaFullAttention) {
+    full_attention_cuda(prepared->query_snd,
+                        prepared->key_snd,
+                        prepared->value_snd,
+                        sm_scale,
+                        prepared->out_snd);
+  } else if (prepared->packed_custom_mask.has_value()) {
+    launch_prefill_with_optional_packed_custom_mask(
+        prepared->plan,
+        prepared->query_snd,
+        prepared->key_snd,
+        prepared->value_snd,
+        prepared->q_cu_dev,
+        prepared->kv_cu_dev,
+        prepared->causal,
+        sm_scale,
+        prepared->out_snd,
+        prepared->output_lse,
+        prepared->packed_custom_mask,
+        prepared->workspace);
+  } else if (prepared->causal) {
+    auto& ws = select_workspace_buffers(device, prepared->workspace);
+    batch_prefill(prepared->plan.uri,
+                  prepared->plan.plan_info,
+                  ws.float_workspace,
+                  ws.int_workspace,
+                  ws.page_locked_int_workspace,
+                  prepared->query_snd,
+                  prepared->key_snd,
+                  prepared->value_snd,
+                  prepared->q_cu_dev,
+                  prepared->kv_cu_dev,
+                  /*window_left=*/-1,
+                  sm_scale,
+                  prepared->out_snd,
+                  prepared->output_lse);
+  } else {
+    auto& ws = select_workspace_buffers(device, prepared->workspace);
+    batch_prefill_non_causal(prepared->plan.uri,
+                             prepared->plan.plan_info,
+                             ws.float_workspace,
+                             ws.int_workspace,
+                             ws.page_locked_int_workspace,
+                             prepared->query_snd,
+                             prepared->key_snd,
+                             prepared->value_snd,
+                             prepared->q_cu_dev,
+                             prepared->kv_cu_dev,
+                             /*window_left=*/-1,
+                             sm_scale,
+                             prepared->out_snd,
+                             prepared->output_lse);
+  }
+
+  if (stage_timeline != nullptr) {
+    record_stage_end_if_needed(stage_timeline, device);
+  }
+
+  AttentionRunResult result;
+  result.out_snd = prepared->out_snd;
+  result.get_ws_ms = prepared->get_ws_ms;
+  if (prepared->output_lse.has_value()) {
+    result.lse_sh1 = normalize_lse_shape(
+        prepared->output_lse.value(), prepared->q_len, prepared->num_heads);
+  }
+  return result;
+}
+
+AttentionRunResult run_fa_segment(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    double sm_scale,
+    bool causal,
+    bool need_lse,
+    StageTimeline* stage_timeline = nullptr,
+    const std::optional<torch::Tensor>& packed_custom_mask = std::nullopt,
+    const std::optional<torch::Tensor>& output_snd_override = std::nullopt,
+    FlashinferWorkspaceBuffers* workspace_override = nullptr) {
+  auto prepared = prepare_fa_segment(query_snd,
+                                     key_snd,
+                                     value_snd,
+                                     causal,
+                                     need_lse,
+                                     stage_timeline,
+                                     packed_custom_mask,
+                                     output_snd_override,
+                                     workspace_override);
+  return launch_prepared_fa_segment(&prepared, sm_scale, stage_timeline);
+}
+
+int64_t packed_mask_num_bytes(int64_t q_len, int64_t kv_len) {
+  CHECK_GT(q_len, 0);
+  CHECK_GT(kv_len, 0);
+  return (q_len * kv_len + 7) / 8;
+}
+
+torch::Tensor reserve_reusable_packed_mask_buffer(const torch::Device& device,
+                                                  int64_t mask_kind,
+                                                  int64_t num_bytes) {
+  static thread_local std::unordered_map<int64_t, torch::Tensor>
+      reusable_buffers;
+  CHECK_GE(mask_kind, 0);
+  CHECK_LE(mask_kind, 2);
+  CHECK_GT(num_bytes, 0);
+  const int64_t device_idx = static_cast<int64_t>(device.index());
+  const int64_t key = (device_idx << 8) ^ mask_kind;
+  auto it = reusable_buffers.find(key);
+  if (it == reusable_buffers.end() || !it->second.defined() ||
+      it->second.numel() < num_bytes || it->second.device() != device) {
+    auto buffer = torch::empty(
+        {num_bytes},
+        torch::TensorOptions().dtype(torch::kUInt8).device(device));
+    it = reusable_buffers.insert_or_assign(key, buffer).first;
+  }
+  return it->second.slice(0, 0, num_bytes);
+}
+
+torch::Tensor build_one_stage_packed_mask_reusing_buffer(
+    const torch::Device& device,
+    int64_t history_len,
+    int64_t context_len,
+    int64_t realtime_len,
+    int64_t target_len) {
+  const int64_t total_len =
+      history_len + context_len + realtime_len + target_len;
+  auto packed = reserve_reusable_packed_mask_buffer(
+      device, /*mask_kind=*/0, packed_mask_num_bytes(total_len, total_len));
+  build_mtgr_packed_mask(packed,
+                         total_len,
+                         total_len,
+                         history_len,
+                         context_len,
+                         realtime_len,
+                         /*mask_kind=*/0);
+  return packed;
+}
+
+torch::Tensor build_rt_tgt_trapezoid_packed_mask_reusing_buffer(
+    const torch::Device& device,
+    int64_t prefix_len,
+    int64_t realtime_len,
+    int64_t target_len) {
+  const int64_t q_len = realtime_len + target_len;
+  const int64_t kv_len = prefix_len + realtime_len;
+  auto packed = reserve_reusable_packed_mask_buffer(
+      device, /*mask_kind=*/1, packed_mask_num_bytes(q_len, kv_len));
+  build_mtgr_packed_mask(packed,
+                         q_len,
+                         kv_len,
+                         prefix_len,
+                         /*context_len=*/0,
+                         realtime_len,
+                         /*mask_kind=*/1);
+  return packed;
+}
+
+torch::Tensor build_partial_rt_one_stage_packed_mask_reusing_buffer(
+    const torch::Device& device,
+    int64_t matched_prefix_len,
+    int64_t realtime_unmatched_len,
+    int64_t target_len) {
+  const int64_t q_len = realtime_unmatched_len + target_len;
+  const int64_t kv_len =
+      matched_prefix_len + realtime_unmatched_len + target_len;
+  auto packed = reserve_reusable_packed_mask_buffer(
+      device, /*mask_kind=*/2, packed_mask_num_bytes(q_len, kv_len));
+  build_mtgr_packed_mask(packed,
+                         q_len,
+                         kv_len,
+                         matched_prefix_len,
+                         /*context_len=*/0,
+                         realtime_unmatched_len,
+                         /*mask_kind=*/2);
+  return packed;
+}
+
+void merge_target_diag_attention_into(const torch::Tensor& hcr_out_snd,
+                                      const torch::Tensor& hcr_lse_sh1,
+                                      const torch::Tensor& target_query_snd,
+                                      const torch::Tensor& target_key_snd,
+                                      const torch::Tensor& target_value_snd,
+                                      double sm_scale,
+                                      torch::Tensor merged_out_snd) {
+  merge_target_diag_attention_cuda(hcr_out_snd,
+                                   hcr_lse_sh1,
+                                   target_query_snd,
+                                   target_key_snd,
+                                   target_value_snd,
+                                   sm_scale,
+                                   merged_out_snd);
+}
+
+torch::Tensor gather_cached_prefix(const torch::Tensor& cache,
+                                   const torch::Tensor& block_table_row,
+                                   int64_t block_size,
+                                   int64_t prefix_len) {
+  CHECK_GT(prefix_len, 0);
+  CHECK_EQ(cache.dim(), 4);
+  const auto device = cache.device();
+  auto token_idx = torch::arange(
+      prefix_len, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto logical_blocks = torch::div(token_idx, block_size, "trunc");
+  auto offsets = token_idx - logical_blocks * block_size;
+  auto physical_blocks = block_table_row.to(torch::kInt64)
+                             .contiguous()
+                             .index_select(0, logical_blocks);
+  auto slots = physical_blocks * block_size + offsets;
+  auto flat =
+      cache.view({cache.size(0) * block_size, cache.size(2), cache.size(3)});
+  return flat.index_select(0, slots).contiguous();
+}
+
+std::vector<int32_t> make_block_table_host(int64_t block_count) {
+  std::vector<int32_t> table(static_cast<size_t>(block_count));
+  for (int64_t i = 0; i < block_count; ++i) {
+    table[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+  return table;
+}
+
+std::vector<int64_t> build_slot_mapping_host(
+    const std::vector<int32_t>& block_table,
+    int64_t block_size,
+    int64_t start_token_idx,
+    int64_t token_count) {
+  std::vector<int64_t> slots;
+  slots.reserve(static_cast<size_t>(token_count));
+  for (int64_t token_idx = start_token_idx;
+       token_idx < start_token_idx + token_count;
+       ++token_idx) {
+    const int64_t logical_block = token_idx / block_size;
+    const int64_t offset = token_idx % block_size;
+    const int64_t physical_block =
+        block_table.at(static_cast<size_t>(logical_block));
+    slots.push_back(physical_block * block_size + offset);
+  }
+  return slots;
+}
+
+torch::Tensor run_one_stage_custom_mask_snd(const torch::Tensor& query_snd,
+                                            const torch::Tensor& key_snd,
+                                            const torch::Tensor& value_snd,
+                                            const torch::Tensor& packed_mask,
+                                            double sm_scale,
+                                            MTGRAttentionTestMetrics* metrics) {
+  StageTimeline stage;
+  stage.name = "one_stage";
+  create_stage_events_if_needed(&stage);
+  auto result = run_fa_segment(query_snd,
+                               key_snd,
+                               value_snd,
+                               sm_scale,
+                               /*causal=*/false,
+                               /*need_lse=*/false,
+                               &stage,
+                               packed_mask);
+  CHECK_EQ(cudaEventSynchronize(stage.ev_end), cudaSuccess);
+  float fia_ms = 0.0f;
+  CHECK_EQ(cudaEventElapsedTime(&fia_ms, stage.ev_start, stage.ev_end),
+           cudaSuccess);
+  if (metrics != nullptr) {
+    metrics->workspace_ms = result.get_ws_ms;
+    metrics->fia_ms = static_cast<double>(fia_ms);
+    metrics->device_total_ms = metrics->mask_build_ms + metrics->fia_ms;
+    metrics->stages = {MTGRStageMetric{
+        .name = "one_stage",
+        .workspace_ms = result.get_ws_ms,
+        .exec_ms = metrics->fia_ms,
+        .host_submit_ms = stage.host_ms,
+    }};
+  }
+  destroy_stage_events_if_needed(&stage);
+  return result.out_snd;
+}
+
+torch::Tensor run_one_stage_no_match(const torch::Tensor& query_snd,
+                                     const torch::Tensor& key_snd,
+                                     const torch::Tensor& value_snd,
+                                     int64_t history_len,
+                                     int64_t context_len,
+                                     int64_t realtime_len,
+                                     int64_t target_len,
+                                     double sm_scale,
+                                     MTGRAttentionTestMetrics* metrics) {
+  const auto device = query_snd.device();
+  CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  auto t0 = std::chrono::steady_clock::now();
+  auto packed_mask = build_one_stage_packed_mask_reusing_buffer(
+      device, history_len, context_len, realtime_len, target_len);
+  CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  if (metrics != nullptr) {
+    metrics->mask_build_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+    metrics->h2d_ms = 0.0;
+  }
+  return run_one_stage_custom_mask_snd(
+      query_snd, key_snd, value_snd, packed_mask, sm_scale, metrics);
+}
+
+torch::Tensor run_one_stage_partial_rt(const torch::Tensor& query_snd,
+                                       const torch::Tensor& key_snd,
+                                       const torch::Tensor& value_snd,
+                                       const torch::Tensor& key_cache,
+                                       const torch::Tensor& value_cache,
+                                       const torch::Tensor& block_table_row,
+                                       int64_t block_size,
+                                       int64_t matched_prefix_len,
+                                       int64_t realtime_unmatched_len,
+                                       int64_t target_len,
+                                       double sm_scale,
+                                       MTGRAttentionTestMetrics* metrics) {
+  CHECK_EQ(query_snd.size(0), realtime_unmatched_len + target_len);
+  auto prefix_key = gather_cached_prefix(
+      key_cache, block_table_row, block_size, matched_prefix_len);
+  auto prefix_value = gather_cached_prefix(
+      value_cache, block_table_row, block_size, matched_prefix_len);
+  auto full_key = torch::cat({prefix_key, key_snd}, 0).contiguous();
+  auto full_value = torch::cat({prefix_value, value_snd}, 0).contiguous();
+
+  const auto device = query_snd.device();
+  CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  auto t0 = std::chrono::steady_clock::now();
+  auto packed_mask = build_partial_rt_one_stage_packed_mask_reusing_buffer(
+      device, matched_prefix_len, realtime_unmatched_len, target_len);
+  CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  if (metrics != nullptr) {
+    metrics->mask_build_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+    metrics->h2d_ms = 0.0;
+  }
+  return run_one_stage_custom_mask_snd(
+      query_snd, full_key, full_value, packed_mask, sm_scale, metrics);
+}
+
+torch::Tensor run_multi_no_match_preplanned(const torch::Tensor& query,
+                                            const torch::Tensor& key,
+                                            const torch::Tensor& value,
+                                            int64_t history_len,
+                                            int64_t context_len,
+                                            int64_t realtime_len,
+                                            int64_t target_len,
+                                            double sm_scale,
+                                            MTGRAttentionTestMetrics* metrics) {
+  auto timeline = build_no_match_multi_timeline();
+  prepare_timeline_events(&timeline);
+  auto wall_start = std::chrono::steady_clock::now();
+
+  constexpr size_t kRtTgtIdx = 0;
+  constexpr size_t kFusedUpdateIdx = 1;
+  constexpr size_t kHistIdx = 2;
+  constexpr size_t kCtxIdx = 3;
+  constexpr int64_t kRtTgtWorkspaceSlot = 1;
+  constexpr int64_t kHistWorkspaceSlot = 2;
+  constexpr int64_t kCtxWorkspaceSlot = 3;
+
+  auto output = torch::empty_like(query);
+  auto& rt_tgt_ws =
+      get_workspace_buffers_for_slot(query.device(), kRtTgtWorkspaceSlot);
+  auto& hist_ws =
+      get_workspace_buffers_for_slot(query.device(), kHistWorkspaceSlot);
+  auto& ctx_ws =
+      get_workspace_buffers_for_slot(query.device(), kCtxWorkspaceSlot);
+  auto rt_tgt_mask = build_rt_tgt_trapezoid_packed_mask_reusing_buffer(
+      query.device(), history_len + context_len, realtime_len, target_len);
+
+  auto rt_tgt_output =
+      output.narrow(0, history_len + context_len, realtime_len + target_len);
+  auto rt_tgt_prepared = prepare_fa_segment(
+      query.narrow(0, history_len + context_len, realtime_len + target_len),
+      key.narrow(0, 0, history_len + context_len + realtime_len),
+      value.narrow(0, 0, history_len + context_len + realtime_len),
+      /*causal=*/false,
+      /*need_lse=*/true,
+      &timeline[kRtTgtIdx],
+      rt_tgt_mask,
+      rt_tgt_output,
+      &rt_tgt_ws);
+
+  auto hist_prepared = prepare_fa_segment(query.narrow(0, 0, history_len),
+                                          key.narrow(0, 0, history_len),
+                                          value.narrow(0, 0, history_len),
+                                          /*causal=*/true,
+                                          /*need_lse=*/false,
+                                          &timeline[kHistIdx],
+                                          std::nullopt,
+                                          output.narrow(0, 0, history_len),
+                                          &hist_ws);
+
+  auto ctx_prepared =
+      prepare_fa_segment(query.narrow(0, history_len, context_len),
+                         key.narrow(0, 0, history_len + context_len),
+                         value.narrow(0, 0, history_len + context_len),
+                         /*causal=*/false,
+                         /*need_lse=*/false,
+                         &timeline[kCtxIdx],
+                         std::nullopt,
+                         output.narrow(0, history_len, context_len),
+                         &ctx_ws);
+
+  auto rt_tgt = launch_prepared_fa_segment(
+      &rt_tgt_prepared, sm_scale, &timeline[kRtTgtIdx]);
+
+  record_stage_begin_if_needed(&timeline[kFusedUpdateIdx], query.device());
+  auto target_query =
+      query.narrow(0, history_len + context_len + realtime_len, target_len);
+  auto target_key =
+      key.narrow(0, history_len + context_len + realtime_len, target_len);
+  auto target_value =
+      value.narrow(0, history_len + context_len + realtime_len, target_len);
+  auto target_output =
+      output.narrow(0, history_len + context_len + realtime_len, target_len);
+  merge_target_diag_attention_into(
+      rt_tgt.out_snd.narrow(0, realtime_len, target_len),
+      rt_tgt.lse_sh1.narrow(0, realtime_len, target_len),
+      target_query,
+      target_key,
+      target_value,
+      sm_scale,
+      target_output);
+  record_stage_end_if_needed(&timeline[kFusedUpdateIdx], query.device());
+
+  (void)launch_prepared_fa_segment(
+      &hist_prepared, sm_scale, &timeline[kHistIdx]);
+  (void)launch_prepared_fa_segment(&ctx_prepared, sm_scale, &timeline[kCtxIdx]);
+
+  auto summary = collect_timeline_summary(&timeline);
+  auto wall_end = std::chrono::steady_clock::now();
+  if (metrics != nullptr) {
+    metrics->device_total_ms = summary.total_ms;
+    metrics->wall_total_ms =
+        std::chrono::duration<double, std::milli>(wall_end - wall_start)
+            .count();
+    metrics->workspace_ms = 0.0;
+    for (double v : summary.stage_getws_ms) {
+      metrics->workspace_ms += v;
+    }
+    fill_stage_metrics(timeline, summary, metrics);
+  }
+  release_timeline_events(&timeline);
+  return output;
+}
+
+torch::Tensor run_multi_partial_rt(const torch::Tensor& query,
+                                   const torch::Tensor& key,
+                                   const torch::Tensor& value,
+                                   const torch::Tensor& key_cache,
+                                   const torch::Tensor& value_cache,
+                                   const torch::Tensor& block_table_row,
+                                   int64_t block_size,
+                                   int64_t matched_prefix_len,
+                                   int64_t realtime_unmatched_len,
+                                   int64_t target_len,
+                                   double sm_scale,
+                                   MTGRAttentionTestMetrics* metrics) {
+  CHECK_EQ(query.size(0), realtime_unmatched_len + target_len);
+  auto timeline = build_partial_rt_multi_timeline();
+  prepare_timeline_events(&timeline);
+  auto wall_start = std::chrono::steady_clock::now();
+
+  constexpr size_t kRtTgtIdx = 0;
+  constexpr size_t kFusedUpdateIdx = 1;
+  constexpr int64_t kRtTgtWorkspaceSlot = 4;
+  auto& rt_tgt_ws =
+      get_workspace_buffers_for_slot(query.device(), kRtTgtWorkspaceSlot);
+
+  auto prefix_key = gather_cached_prefix(
+      key_cache, block_table_row, block_size, matched_prefix_len);
+  auto prefix_value = gather_cached_prefix(
+      value_cache, block_table_row, block_size, matched_prefix_len);
+  auto rt_key = key.narrow(0, 0, realtime_unmatched_len);
+  auto rt_value = value.narrow(0, 0, realtime_unmatched_len);
+  auto hcr_key = torch::cat({prefix_key, rt_key}, 0).contiguous();
+  auto hcr_value = torch::cat({prefix_value, rt_value}, 0).contiguous();
+  auto rt_tgt_mask = build_rt_tgt_trapezoid_packed_mask_reusing_buffer(
+      query.device(), matched_prefix_len, realtime_unmatched_len, target_len);
+
+  auto output = torch::empty_like(query);
+  auto rt_tgt_prepared = prepare_fa_segment(query,
+                                            hcr_key,
+                                            hcr_value,
+                                            /*causal=*/false,
+                                            /*need_lse=*/true,
+                                            &timeline[kRtTgtIdx],
+                                            rt_tgt_mask,
+                                            output,
+                                            &rt_tgt_ws);
+  auto rt_tgt = launch_prepared_fa_segment(
+      &rt_tgt_prepared, sm_scale, &timeline[kRtTgtIdx]);
+
+  record_stage_begin_if_needed(&timeline[kFusedUpdateIdx], query.device());
+  auto target_query = query.narrow(0, realtime_unmatched_len, target_len);
+  auto target_key = key.narrow(0, realtime_unmatched_len, target_len);
+  auto target_value = value.narrow(0, realtime_unmatched_len, target_len);
+  auto target_output = output.narrow(0, realtime_unmatched_len, target_len);
+  merge_target_diag_attention_into(
+      rt_tgt.out_snd.narrow(0, realtime_unmatched_len, target_len),
+      rt_tgt.lse_sh1.narrow(0, realtime_unmatched_len, target_len),
+      target_query,
+      target_key,
+      target_value,
+      sm_scale,
+      target_output);
+  record_stage_end_if_needed(&timeline[kFusedUpdateIdx], query.device());
+
+  auto summary = collect_timeline_summary(&timeline);
+  auto wall_end = std::chrono::steady_clock::now();
+  if (metrics != nullptr) {
+    metrics->device_total_ms = summary.total_ms;
+    metrics->wall_total_ms =
+        std::chrono::duration<double, std::milli>(wall_end - wall_start)
+            .count();
+    metrics->workspace_ms = 0.0;
+    for (double v : summary.stage_getws_ms) {
+      metrics->workspace_ms += v;
+    }
+    fill_stage_metrics(timeline, summary, metrics);
+  }
+  release_timeline_events(&timeline);
+  return output;
+}
+
+torch::Tensor run_fused_no_match(const torch::Tensor& query,
+                                 const torch::Tensor& key,
+                                 const torch::Tensor& value,
+                                 int64_t history_len,
+                                 int64_t context_len,
+                                 int64_t realtime_len,
+                                 int64_t target_len,
+                                 double sm_scale,
+                                 MTGRAttentionTestMetrics* metrics) {
+  auto timeline = build_fused_no_match_timeline();
+  prepare_timeline_events(&timeline);
+  auto wall_start = std::chrono::steady_clock::now();
+
+  constexpr size_t kFusedIdx = 0;
+  constexpr size_t kFusedUpdateIdx = 1;
+  auto output = torch::empty_like(query);
+  auto target_hcr_lse = torch::empty(
+      {target_len, query.size(1), 1},
+      torch::TensorOptions().dtype(torch::kFloat32).device(query.device()));
+
+  record_stage_begin_if_needed(&timeline[kFusedIdx], query.device());
+  mtgr_fused_no_match_attention_cuda(query,
+                                     key,
+                                     value,
+                                     history_len,
+                                     context_len,
+                                     realtime_len,
+                                     target_len,
+                                     sm_scale,
+                                     output,
+                                     target_hcr_lse);
+  record_stage_end_if_needed(&timeline[kFusedIdx], query.device());
+
+  record_stage_begin_if_needed(&timeline[kFusedUpdateIdx], query.device());
+  auto target_begin = history_len + context_len + realtime_len;
+  auto target_query = query.narrow(0, target_begin, target_len);
+  auto target_key = key.narrow(0, target_begin, target_len);
+  auto target_value = value.narrow(0, target_begin, target_len);
+  auto target_output = output.narrow(0, target_begin, target_len);
+  merge_target_diag_attention_into(output.narrow(0, target_begin, target_len),
+                                   target_hcr_lse,
+                                   target_query,
+                                   target_key,
+                                   target_value,
+                                   sm_scale,
+                                   target_output);
+  record_stage_end_if_needed(&timeline[kFusedUpdateIdx], query.device());
+
+  auto summary = collect_timeline_summary(&timeline);
+  auto wall_end = std::chrono::steady_clock::now();
+  if (metrics != nullptr) {
+    metrics->device_total_ms = summary.total_ms;
+    metrics->wall_total_ms =
+        std::chrono::duration<double, std::milli>(wall_end - wall_start)
+            .count();
+    metrics->workspace_ms = 0.0;
+    fill_stage_metrics(timeline, summary, metrics);
+  }
+  release_timeline_events(&timeline);
+  return output;
+}
+
+}  // namespace
+
+MTGRAttentionImplTest::MTGRAttentionImplTest(int64_t num_heads,
+                                             int64_t head_size,
+                                             float scale,
+                                             int64_t num_kv_heads,
+                                             MTGRAttentionTestBackend backend)
+    : num_heads_(num_heads),
+      head_size_(head_size),
+      scale_(scale),
+      num_kv_heads_(num_kv_heads),
+      backend_(backend) {}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>>
+MTGRAttentionImplTest::forward(
+    const xllm::layer::AttentionMetadata& attn_metadata,
+    torch::Tensor& query,
+    torch::Tensor& key,
+    torch::Tensor& value,
+    xllm::KVCache& kv_cache) {
+  CHECK_EQ(query.dim(), 2);
+  CHECK_EQ(key.dim(), 2);
+  CHECK_EQ(value.dim(), 2);
+  CHECK_EQ(query.size(1), num_heads_ * head_size_);
+  CHECK_EQ(key.size(1), num_kv_heads_ * head_size_);
+  CHECK_EQ(value.size(1), num_kv_heads_ * head_size_);
+  CHECK_GT(scale_, 0.0f);
+
+  last_metrics_ = MTGRAttentionTestMetrics{};
+  std::optional<torch::Tensor> output_lse = std::nullopt;
+  if (attn_metadata.is_dummy) {
+    return {torch::empty_like(query), output_lse};
+  }
+
+  const auto& q_seq_lens = attn_metadata.q_seq_lens;
+  const auto& kv_seq_lens = attn_metadata.kv_seq_lens;
+  const auto& history_lens = attn_metadata.genrec_history_lens;
+  const auto& context_lens = attn_metadata.genrec_context_lens;
+  const auto& realtime_lens = attn_metadata.genrec_real_time_lens;
+  const auto& target_lens = attn_metadata.genrec_target_lens;
+  const auto& matched_prefix_lens = attn_metadata.genrec_matched_prefix_lens;
+  CHECK(q_seq_lens.defined());
+  CHECK(kv_seq_lens.defined());
+  CHECK(history_lens.defined());
+  CHECK(context_lens.defined());
+  CHECK(realtime_lens.defined());
+  CHECK(target_lens.defined());
+  CHECK(matched_prefix_lens.defined());
+  CHECK_EQ(q_seq_lens.size(0), 1)
+      << "MTGRAttentionImplTest currently models the single-side B=1 path";
+
+  const int64_t q_len = q_seq_lens[0].item<int64_t>();
+  const int64_t kv_len = kv_seq_lens[0].item<int64_t>();
+  CHECK_EQ(query.size(0), q_len);
+  CHECK_EQ(key.size(0), kv_len);
+  CHECK_EQ(value.size(0), kv_len);
+
+  const int64_t h = history_lens[0].item<int64_t>();
+  const int64_t c = context_lens[0].item<int64_t>();
+  const int64_t r = realtime_lens[0].item<int64_t>();
+  const int64_t t = target_lens[0].item<int64_t>();
+  const int64_t matched = matched_prefix_lens[0].item<int64_t>();
+  CHECK_GE(matched, 0);
+  CHECK_LT(matched, h + c + r);
+
+  auto query_snd = query.view({q_len, num_heads_, head_size_}).contiguous();
+  auto key_snd = key.view({kv_len, num_kv_heads_, head_size_}).contiguous();
+  auto value_snd = value.view({kv_len, num_kv_heads_, head_size_}).contiguous();
+  torch::Tensor output_snd;
+
+  auto wall_start = std::chrono::steady_clock::now();
+  if (matched == 0) {
+    CHECK_EQ(q_len, h + c + r + t);
+    if (backend_ == MTGRAttentionTestBackend::kOneStage) {
+      output_snd = run_one_stage_no_match(
+          query_snd, key_snd, value_snd, h, c, r, t, scale_, &last_metrics_);
+    } else if (backend_ == MTGRAttentionTestBackend::kFusedNoMatch) {
+      output_snd = run_fused_no_match(
+          query_snd, key_snd, value_snd, h, c, r, t, scale_, &last_metrics_);
+    } else {
+      output_snd = run_multi_no_match_preplanned(
+          query_snd, key_snd, value_snd, h, c, r, t, scale_, &last_metrics_);
+    }
+  } else {
+    CHECK_GE(matched, h + c)
+        << "GPU test infra keeps only no_match and partial_real_time_match";
+    const int64_t realtime_matched = matched - h - c;
+    const int64_t realtime_unmatched = r - realtime_matched;
+    CHECK_GT(realtime_unmatched, 0);
+    CHECK_EQ(q_len, realtime_unmatched + t);
+    CHECK(attn_metadata.block_table.defined());
+    CHECK_EQ(attn_metadata.block_table.dim(), 2);
+    CHECK_GE(attn_metadata.block_table.size(0), 1);
+    CHECK(!kv_cache.empty());
+    if (backend_ == MTGRAttentionTestBackend::kFusedNoMatch) {
+      CHECK(false) << "MTGR fused no-match kernel currently supports only "
+                      "matched_prefix == 0";
+    }
+    const int64_t block_size = static_cast<int64_t>(FLAGS_block_size);
+    auto key_cache = kv_cache.get_k_cache();
+    auto value_cache = kv_cache.get_v_cache();
+    auto block_table_row = attn_metadata.block_table.select(0, 0).contiguous();
+    if (backend_ == MTGRAttentionTestBackend::kOneStage) {
+      output_snd = run_one_stage_partial_rt(query_snd,
+                                            key_snd,
+                                            value_snd,
+                                            key_cache,
+                                            value_cache,
+                                            block_table_row,
+                                            block_size,
+                                            matched,
+                                            realtime_unmatched,
+                                            t,
+                                            scale_,
+                                            &last_metrics_);
+    } else {
+      output_snd = run_multi_partial_rt(query_snd,
+                                        key_snd,
+                                        value_snd,
+                                        key_cache,
+                                        value_cache,
+                                        block_table_row,
+                                        block_size,
+                                        matched,
+                                        realtime_unmatched,
+                                        t,
+                                        scale_,
+                                        &last_metrics_);
+    }
+  }
+  auto wall_end = std::chrono::steady_clock::now();
+  if (last_metrics_.wall_total_ms == 0.0) {
+    last_metrics_.wall_total_ms =
+        std::chrono::duration<double, std::milli>(wall_end - wall_start)
+            .count();
+  }
+  return {output_snd.view({q_len, num_heads_ * head_size_}).contiguous(),
+          output_lse};
+}
+
+xllm::layer::AttentionMetadata make_mtgr_attention_metadata(
+    const MTGRAttentionTestShape& shape,
+    const torch::Device& device,
+    int64_t block_size) {
+  CHECK_GT(block_size, 0);
+  CHECK_GE(shape.matched_prefix, 0);
+  CHECK_LT(shape.matched_prefix,
+           shape.history + shape.context + shape.realtime);
+  const int64_t block_count = (shape.total_len() + block_size - 1) / block_size;
+  const auto block_table_host = make_block_table_host(block_count);
+  const auto slot_mapping_host = build_slot_mapping_host(
+      block_table_host, block_size, shape.matched_prefix, shape.local_len());
+
+  xllm::layer::AttentionMetadata metadata;
+  auto len_opts =
+      torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+  metadata.is_dummy = false;
+  metadata.is_prefill = true;
+  metadata.is_chunked_prefill = false;
+  metadata.q_seq_lens = torch::tensor({shape.local_len()}, len_opts);
+  metadata.kv_seq_lens = torch::tensor({shape.local_len()}, len_opts);
+  metadata.genrec_history_lens = torch::tensor({shape.history}, len_opts);
+  metadata.genrec_context_lens = torch::tensor({shape.context}, len_opts);
+  metadata.genrec_real_time_lens = torch::tensor({shape.realtime}, len_opts);
+  metadata.genrec_target_lens = torch::tensor({shape.target}, len_opts);
+  metadata.genrec_matched_prefix_lens =
+      torch::tensor({shape.matched_prefix}, len_opts);
+  metadata.block_table =
+      torch::tensor(block_table_host,
+                    torch::TensorOptions().dtype(torch::kInt32).device(device))
+          .view({1, block_count})
+          .contiguous();
+  metadata.slot_mapping =
+      torch::tensor(slot_mapping_host,
+                    torch::TensorOptions().dtype(torch::kInt64).device(device))
+          .contiguous();
+  return metadata;
+}
+
+xllm::KVCache make_mtgr_kv_cache(const MTGRAttentionTestShape& shape,
+                                 const torch::Device& device,
+                                 torch::ScalarType dtype,
+                                 int64_t block_size) {
+  const int64_t block_count =
+      (shape.total_len() + block_size - 1) / block_size + 4;
+  auto opts = torch::TensorOptions().dtype(dtype).device(device);
+  auto key_cache = torch::zeros(
+      {block_count, block_size, shape.kv_heads, shape.head_dim}, opts);
+  auto value_cache = torch::zeros(
+      {block_count, block_size, shape.kv_heads, shape.head_dim}, opts);
+  return xllm::KVCache(key_cache, value_cache);
+}
+
+void prefill_mtgr_matched_prefix_cache(const torch::Tensor& full_key_bsnd,
+                                       const torch::Tensor& full_value_bsnd,
+                                       const MTGRAttentionTestShape& shape,
+                                       int64_t block_size,
+                                       xllm::KVCache& kv_cache) {
+  if (shape.matched_prefix <= 0) {
+    return;
+  }
+  CHECK_EQ(full_key_bsnd.dim(), 4);
+  CHECK_EQ(full_value_bsnd.dim(), 4);
+  CHECK_EQ(full_key_bsnd.size(0), 1);
+  CHECK_EQ(full_value_bsnd.sizes(), full_key_bsnd.sizes());
+  auto key_cache = kv_cache.get_k_cache();
+  auto value_cache = kv_cache.get_v_cache();
+  const auto block_table =
+      make_block_table_host((shape.total_len() + block_size - 1) / block_size);
+  const auto slots_host =
+      build_slot_mapping_host(block_table, block_size, 0, shape.matched_prefix);
+  auto slots = torch::tensor(slots_host,
+                             torch::TensorOptions()
+                                 .dtype(torch::kInt64)
+                                 .device(full_key_bsnd.device()));
+  auto key_flat = key_cache.view(
+      {key_cache.size(0) * block_size, key_cache.size(2), key_cache.size(3)});
+  auto value_flat = value_cache.view({value_cache.size(0) * block_size,
+                                      value_cache.size(2),
+                                      value_cache.size(3)});
+  key_flat.index_copy_(
+      0, slots, full_key_bsnd.select(0, 0).narrow(0, 0, shape.matched_prefix));
+  value_flat.index_copy_(
+      0,
+      slots,
+      full_value_bsnd.select(0, 0).narrow(0, 0, shape.matched_prefix));
+}
+
+std::vector<MTGRAttentionTestShape> build_mtgr_sweep_shapes(
+    bool full_sweep,
+    bool partial_match) {
+  const std::vector<int64_t> heads_all =
+      full_sweep ? std::vector<int64_t>{4, 8, 16} : std::vector<int64_t>{8};
+  const std::vector<int64_t> head_dims_all =
+      full_sweep ? std::vector<int64_t>{32, 64, 128}
+                 : std::vector<int64_t>{128};
+  const std::vector<int64_t> histories_all =
+      full_sweep ? std::vector<int64_t>{1024, 2048, 4096}
+                 : std::vector<int64_t>{2048};
+  const std::vector<int64_t> realtime_all =
+      full_sweep ? std::vector<int64_t>{128, 256, 512}
+                 : std::vector<int64_t>{512};
+  const std::vector<int64_t> targets_all =
+      full_sweep ? std::vector<int64_t>{800, 1600, 2400}
+                 : std::vector<int64_t>{1600};
+
+  std::vector<MTGRAttentionTestShape> cases;
+  for (int64_t heads : heads_all) {
+    for (int64_t head_dim : head_dims_all) {
+      for (int64_t history : histories_all) {
+        for (int64_t realtime : realtime_all) {
+          for (int64_t target : targets_all) {
+            MTGRAttentionTestShape shape;
+            shape.heads = heads;
+            shape.kv_heads = heads;
+            shape.head_dim = head_dim;
+            shape.history = history;
+            shape.context = 8;
+            shape.realtime = realtime;
+            shape.target = target;
+            shape.matched_prefix =
+                partial_match ? history + shape.context + (realtime * 4) / 5
+                              : 0;
+            cases.push_back(shape);
+          }
+        }
+      }
+    }
+  }
+  return cases;
+}
+
+int env_int(const char* name, int default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr) {
+    return default_value;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0') {
+    return default_value;
+  }
+  return static_cast<int>(parsed);
+}
+
+bool env_flag_enabled(const char* name, bool default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr) {
+    return default_value;
+  }
+  std::string v(value);
+  std::transform(v.begin(), v.end(), v.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return (v == "1" || v == "true" || v == "yes" || v == "on");
+}
+
+}  // namespace xllm::kernel::cuda::test
