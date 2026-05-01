@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <torch/cuda.h>
@@ -22,12 +24,28 @@ limitations under the License.
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <random>
+#include <sstream>
 #include <string>
+#include <unordered_set>
 
 #include "core/common/global_flags.h"
 #include "mtgr_attenion_test.h"
 
 namespace xllm::kernel::cuda::test {
+
+void mtgr_fused_no_match_attention_cuda(const torch::Tensor& query_snd,
+                                        const torch::Tensor& key_snd,
+                                        const torch::Tensor& value_snd,
+                                        int64_t history_len,
+                                        int64_t context_len,
+                                        int64_t realtime_len,
+                                        int64_t target_len,
+                                        double sm_scale,
+                                        torch::Tensor output_snd,
+                                        torch::Tensor target_hcr_lse_sh1);
+
 namespace {
 
 constexpr int64_t kBlockSize = 128;
@@ -190,6 +208,163 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
     return avg;
   }
 
+  MTGRAttentionTestMetrics run_shape_fused_only(
+      const MTGRAttentionTestShape& shape,
+      int warmup,
+      int repeat) {
+    auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+    const int64_t total = shape.total_len();
+    const int64_t local = shape.local_len();
+    const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
+
+    auto full_query =
+        torch::randn({1, total, shape.heads, shape.head_dim}, opts) * 0.05;
+    auto full_key =
+        torch::randn({1, total, shape.kv_heads, shape.head_dim}, opts) * 0.05;
+    auto full_value =
+        torch::randn({1, total, shape.kv_heads, shape.head_dim}, opts) * 0.05;
+
+    auto query = full_query.select(0, 0)
+                     .narrow(0, shape.matched_prefix, local)
+                     .contiguous()
+                     .view({local, shape.heads * shape.head_dim});
+    auto key = full_key.select(0, 0)
+                   .narrow(0, shape.matched_prefix, local)
+                   .contiguous()
+                   .view({local, shape.kv_heads * shape.head_dim});
+    auto value = full_value.select(0, 0)
+                     .narrow(0, shape.matched_prefix, local)
+                     .contiguous()
+                     .view({local, shape.kv_heads * shape.head_dim});
+
+    auto metadata = make_mtgr_attention_metadata(shape, device_, kBlockSize);
+    auto kv_cache =
+        make_mtgr_kv_cache(shape, device_, torch::kFloat16, kBlockSize);
+
+    MTGRAttentionImplTest fused(shape.heads,
+                                shape.head_dim,
+                                scale,
+                                shape.kv_heads,
+                                MTGRAttentionTestBackend::kFusedNoMatch);
+
+    for (int i = 0; i < warmup; ++i) {
+      (void)std::get<0>(fused.forward(metadata, query, key, value, kv_cache));
+    }
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    MTGRAttentionTestMetrics avg;
+    for (int i = 0; i < repeat; ++i) {
+      auto output =
+          std::get<0>(fused.forward(metadata, query, key, value, kv_cache));
+      CHECK(torch::isfinite(output).all().item<bool>());
+      const auto metrics = fused.last_metrics();
+
+      avg.workspace_ms += metrics.workspace_ms;
+      avg.device_total_ms += metrics.device_total_ms;
+      avg.wall_total_ms += metrics.wall_total_ms;
+      if (avg.stages.empty()) {
+        avg.stages = metrics.stages;
+      } else {
+        for (size_t s = 0; s < avg.stages.size(); ++s) {
+          avg.stages[s].workspace_ms += metrics.stages[s].workspace_ms;
+          avg.stages[s].exec_ms += metrics.stages[s].exec_ms;
+          avg.stages[s].host_submit_ms += metrics.stages[s].host_submit_ms;
+        }
+      }
+    }
+
+    const double inv = 1.0 / static_cast<double>(repeat);
+    avg.workspace_ms *= inv;
+    avg.device_total_ms *= inv;
+    avg.wall_total_ms *= inv;
+    for (auto& stage : avg.stages) {
+      stage.workspace_ms *= inv;
+      stage.exec_ms *= inv;
+      stage.host_submit_ms *= inv;
+    }
+    return avg;
+  }
+
+  MTGRAttentionTestMetrics run_shape_fused_main_kernel_only(
+      const MTGRAttentionTestShape& shape,
+      int warmup,
+      int repeat) {
+    auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+    const int64_t total = shape.total_len();
+    const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
+
+    auto query_snd =
+        (torch::randn({total, shape.heads, shape.head_dim}, opts) * 0.05)
+            .contiguous();
+    auto key_snd =
+        (torch::randn({total, shape.kv_heads, shape.head_dim}, opts) * 0.05)
+            .contiguous();
+    auto value_snd =
+        (torch::randn({total, shape.kv_heads, shape.head_dim}, opts) * 0.05)
+            .contiguous();
+    auto output_snd = torch::empty_like(query_snd);
+    auto target_hcr_lse = torch::empty(
+        {shape.target, shape.heads, 1},
+        torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+
+    c10::cuda::CUDAGuard guard(device_);
+    cudaEvent_t ev_start = nullptr;
+    cudaEvent_t ev_end = nullptr;
+    CHECK_EQ(cudaEventCreate(&ev_start), cudaSuccess);
+    CHECK_EQ(cudaEventCreate(&ev_end), cudaSuccess);
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    for (int i = 0; i < warmup; ++i) {
+      mtgr_fused_no_match_attention_cuda(query_snd,
+                                         key_snd,
+                                         value_snd,
+                                         shape.history,
+                                         shape.context,
+                                         shape.realtime,
+                                         shape.target,
+                                         scale,
+                                         output_snd,
+                                         target_hcr_lse);
+    }
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    MTGRAttentionTestMetrics avg;
+    avg.stages = {MTGRStageMetric{.name = "mtgr_fused_no_match_attention"}};
+    for (int i = 0; i < repeat; ++i) {
+      const auto wall_start = std::chrono::steady_clock::now();
+      CHECK_EQ(cudaEventRecord(ev_start, stream), cudaSuccess);
+      mtgr_fused_no_match_attention_cuda(query_snd,
+                                         key_snd,
+                                         value_snd,
+                                         shape.history,
+                                         shape.context,
+                                         shape.realtime,
+                                         shape.target,
+                                         scale,
+                                         output_snd,
+                                         target_hcr_lse);
+      CHECK_EQ(cudaEventRecord(ev_end, stream), cudaSuccess);
+      CHECK_EQ(cudaEventSynchronize(ev_end), cudaSuccess);
+      float ms = 0.0f;
+      CHECK_EQ(cudaEventElapsedTime(&ms, ev_start, ev_end), cudaSuccess);
+      avg.device_total_ms += static_cast<double>(ms);
+      avg.stages[0].exec_ms += static_cast<double>(ms);
+      avg.wall_total_ms += std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - wall_start)
+                               .count();
+      CHECK(torch::isfinite(output_snd).all().item<bool>());
+      CHECK(torch::isfinite(target_hcr_lse).all().item<bool>());
+    }
+
+    const double inv = 1.0 / static_cast<double>(repeat);
+    avg.device_total_ms *= inv;
+    avg.wall_total_ms *= inv;
+    avg.stages[0].exec_ms *= inv;
+    CHECK_EQ(cudaEventDestroy(ev_start), cudaSuccess);
+    CHECK_EQ(cudaEventDestroy(ev_end), cudaSuccess);
+    return avg;
+  }
+
   torch::Device device_ = torch::Device(torch::kCPU);
 };
 
@@ -222,6 +397,35 @@ std::string csv_path_from_env(const char* env_name, const char* default_name) {
   return std::string(
              "/export/home/wangyifan/Code/xllm/xllm/core/kernels/cuda/tests/") +
          default_name;
+}
+
+int64_t sample_non_aligned_len(std::mt19937_64* rng, int64_t lo, int64_t hi) {
+  CHECK(rng != nullptr);
+  CHECK_LE(lo, hi);
+  std::uniform_int_distribution<int64_t> dist(lo, hi);
+  for (int attempt = 0; attempt < 1024; ++attempt) {
+    const int64_t v = dist(*rng);
+    if ((v % 32) != 0 && (v % 64) != 0) {
+      return v;
+    }
+  }
+  int64_t v = dist(*rng);
+  if ((v % 32) != 0 && (v % 64) != 0) {
+    return v;
+  }
+  if (v < hi) {
+    ++v;
+  } else if (v > lo) {
+    --v;
+  }
+  return v;
+}
+
+MTGRAttentionTestShape make_no_match_counterpart(
+    const MTGRAttentionTestShape& shape) {
+  auto no_match = shape;
+  no_match.matched_prefix = 0;
+  return no_match;
 }
 
 }  // namespace
@@ -261,9 +465,28 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, NoMatchSweepCsv) {
       repeat,
       csv_path.c_str());
   int64_t idx = 0;
+  int64_t skipped = 0;
   for (const auto& shape : cases) {
     ++idx;
-    const auto avg = run_shape(shape, warmup, repeat);
+    AvgMetrics avg;
+    try {
+      avg = run_shape(shape, warmup, repeat);
+    } catch (const std::exception& e) {
+      ++skipped;
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][NoMatch %lld/%zu] skipped: heads=%lld "
+                   "head_dim=%lld history=%lld realtime=%lld target=%lld "
+                   "reason=%s\n",
+                   static_cast<long long>(idx),
+                   cases.size(),
+                   static_cast<long long>(shape.heads),
+                   static_cast<long long>(shape.head_dim),
+                   static_cast<long long>(shape.history),
+                   static_cast<long long>(shape.realtime),
+                   static_cast<long long>(shape.target),
+                   e.what());
+      continue;
+    }
     const double speedup_dev =
         avg.one.device_total_ms / avg.multi.device_total_ms;
     const double speedup_wall = avg.one.wall_total_ms / avg.multi.wall_total_ms;
@@ -313,6 +536,10 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, NoMatchSweepCsv) {
                  cases.size(),
                  row);
   }
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][NoMatch] completed=%zu skipped=%lld\n",
+               cases.size() - static_cast<size_t>(skipped),
+               static_cast<long long>(skipped));
   std::fflush(stderr);
 }
 
@@ -351,9 +578,28 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, PartialRealTimeMatchSweepCsv) {
       repeat,
       csv_path.c_str());
   int64_t idx = 0;
+  int64_t skipped = 0;
   for (const auto& shape : cases) {
     ++idx;
-    const auto avg = run_shape(shape, warmup, repeat);
+    AvgMetrics avg;
+    try {
+      avg = run_shape(shape, warmup, repeat);
+    } catch (const std::exception& e) {
+      ++skipped;
+      std::fprintf(
+          stderr,
+          "[MTGR][CUDA][Perf][PartialRT %lld/%zu] skipped: heads=%lld "
+          "head_dim=%lld history=%lld realtime=%lld target=%lld reason=%s\n",
+          static_cast<long long>(idx),
+          cases.size(),
+          static_cast<long long>(shape.heads),
+          static_cast<long long>(shape.head_dim),
+          static_cast<long long>(shape.history),
+          static_cast<long long>(shape.realtime),
+          static_cast<long long>(shape.target),
+          e.what());
+      continue;
+    }
     const double speedup_dev =
         avg.one.device_total_ms / avg.multi.device_total_ms;
     const double speedup_wall = avg.one.wall_total_ms / avg.multi.wall_total_ms;
@@ -399,6 +645,1025 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, PartialRealTimeMatchSweepCsv) {
                  cases.size(),
                  row);
   }
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][PartialRT] completed=%zu skipped=%lld\n",
+               cases.size() - static_cast<size_t>(skipped),
+               static_cast<long long>(skipped));
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest, FusedNoMatchSweepCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const bool full_sweep =
+      env_flag_enabled("XLLM_MTGR_ATTENTION_FULL_SWEEP", true);
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 5));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 20));
+  const std::string csv_path =
+      csv_path_from_env("XLLM_MTGR_ATTENTION_FUSED_NO_MATCH_CSV",
+                        "mtgr_attention_fused_no_match.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+
+  csv << "common,,,,,,,one_stage,,,,,,fused,,,,,,speedup,,delta_ms,precision,"
+         "\n";
+  csv << "mask_build_mode,heads,head_dim,history,real_time,target,"
+         "mask_build_ms,mask_build_plus_device_ms,h2d_ms,workspace_ms,fia_ms,"
+         "device_total_ms,wall_total_ms,"
+         "mtgr_fused_no_match_attention.workspace_ms,"
+         "mtgr_fused_no_match_attention.exec_ms,"
+         "tgt_diag_update_fused.workspace_ms,tgt_diag_update_fused.exec_ms,"
+         "device_total_ms,wall_total_ms,"
+         "one_mask_build_plus_device_ms/fused_device_total_ms,"
+         "one_wall_total_ms/fused_wall_total_ms,"
+         "one_mask_build_plus_device_ms-fused_device_total_ms,"
+         "one_wall_total_ms-fused_wall_total_ms,diff_max_abs,diff_mean_abs\n";
+
+  const auto cases =
+      build_mtgr_sweep_shapes(full_sweep, /*partial_match=*/false);
+  std::fprintf(
+      stderr,
+      "[MTGR][CUDA][Perf][FusedNoMatch] cases=%zu warmup=%d repeat=%d csv=%s\n",
+      cases.size(),
+      warmup,
+      repeat,
+      csv_path.c_str());
+  int64_t idx = 0;
+  int64_t skipped = 0;
+  for (const auto& shape : cases) {
+    ++idx;
+    CompareMetrics avg;
+    try {
+      avg = run_shape_vs_backend(
+          shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+    } catch (const std::exception& e) {
+      ++skipped;
+      std::fprintf(
+          stderr,
+          "[MTGR][CUDA][Perf][FusedNoMatch %lld/%zu] skipped: heads=%lld "
+          "head_dim=%lld history=%lld realtime=%lld target=%lld reason=%s\n",
+          static_cast<long long>(idx),
+          cases.size(),
+          static_cast<long long>(shape.heads),
+          static_cast<long long>(shape.head_dim),
+          static_cast<long long>(shape.history),
+          static_cast<long long>(shape.realtime),
+          static_cast<long long>(shape.target),
+          e.what());
+      continue;
+    }
+    const double base_mask_build_plus_device_ms =
+        avg.base.mask_build_ms + avg.base.device_total_ms;
+    const double speedup_dev =
+        base_mask_build_plus_device_ms / avg.candidate.device_total_ms;
+    const double speedup_wall =
+        avg.base.wall_total_ms / avg.candidate.wall_total_ms;
+    const double delta_dev =
+        base_mask_build_plus_device_ms - avg.candidate.device_total_ms;
+    const double delta_wall =
+        avg.base.wall_total_ms - avg.candidate.wall_total_ms;
+
+    char row[2048];
+    std::snprintf(
+        row,
+        sizeof(row),
+        "device,%lld,%lld,%lld,%lld,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6e,%.6e",
+        static_cast<long long>(shape.heads),
+        static_cast<long long>(shape.head_dim),
+        static_cast<long long>(shape.history),
+        static_cast<long long>(shape.realtime),
+        static_cast<long long>(shape.target),
+        avg.base.mask_build_ms,
+        base_mask_build_plus_device_ms,
+        avg.base.h2d_ms,
+        avg.base.workspace_ms,
+        avg.base.fia_ms,
+        avg.base.device_total_ms,
+        avg.base.wall_total_ms,
+        stage_workspace(avg.candidate, "mtgr_fused_no_match_attention"),
+        stage_exec(avg.candidate, "mtgr_fused_no_match_attention"),
+        stage_workspace(avg.candidate, "tgt_diag_update_fused"),
+        stage_exec(avg.candidate, "tgt_diag_update_fused"),
+        avg.candidate.device_total_ms,
+        avg.candidate.wall_total_ms,
+        speedup_dev,
+        speedup_wall,
+        delta_dev,
+        delta_wall,
+        avg.diff_max_abs,
+        avg.diff_mean_abs);
+    csv << row << "\n";
+    csv.flush();
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][FusedNoMatch %lld/%zu] %s\n",
+                 static_cast<long long>(idx),
+                 cases.size(),
+                 row);
+  }
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][FusedNoMatch] completed=%zu skipped=%lld\n",
+               cases.size() - static_cast<size_t>(skipped),
+               static_cast<long long>(skipped));
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       FusedPartialRealTimeMatchSweepCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const bool full_sweep =
+      env_flag_enabled("XLLM_MTGR_ATTENTION_FULL_SWEEP", true);
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 5));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 20));
+  const std::string csv_path =
+      csv_path_from_env("XLLM_MTGR_ATTENTION_FUSED_PARTIAL_MATCH_CSV",
+                        "mtgr_attention_fused_partial_match.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+
+  csv << "common,,,,,,,,one_stage,,,,,,,partial_fused,,,,,,,no_match_fused,,"
+         "speedup,,,,delta_ms,,,,precision,\n";
+  csv << "mask_build_mode,heads,head_dim,history,real_time,realtime_matched,"
+         "target,mask_build_ms,mask_build_plus_device_ms,h2d_ms,workspace_ms,"
+         "fia_ms,device_total_ms,wall_total_ms,scatter_kv_cache.workspace_ms,"
+         "scatter_kv_cache.exec_ms,mtgr_fused_partial_rt_attention."
+         "workspace_ms,mtgr_fused_partial_rt_attention.exec_ms,"
+         "tgt_diag_update_fused.workspace_ms,tgt_diag_update_fused.exec_ms,"
+         "device_total_ms,wall_total_ms,no_match_device_total_ms,"
+         "no_match_wall_total_ms,"
+         "one_mask_build_plus_device_ms/partial_fused_device_total_ms,"
+         "one_wall_total_ms/partial_fused_wall_total_ms,"
+         "no_match_fused_device_total_ms/partial_fused_device_total_ms,"
+         "no_match_fused_wall_total_ms/partial_fused_wall_total_ms,"
+         "one_mask_build_plus_device_ms-partial_fused_device_total_ms,"
+         "one_wall_total_ms-partial_fused_wall_total_ms,"
+         "no_match_fused_device_total_ms-partial_fused_device_total_ms,"
+         "no_match_fused_wall_total_ms-partial_fused_wall_total_ms,"
+         "diff_max_abs,diff_mean_abs\n";
+
+  const auto cases =
+      build_mtgr_sweep_shapes(full_sweep, /*partial_match=*/true);
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][FusedPartialRT] cases=%zu warmup=%d "
+               "repeat=%d csv=%s\n",
+               cases.size(),
+               warmup,
+               repeat,
+               csv_path.c_str());
+  int64_t idx = 0;
+  int64_t skipped = 0;
+  for (const auto& shape : cases) {
+    ++idx;
+    CompareMetrics avg;
+    MTGRAttentionTestMetrics no_match_fused;
+    try {
+      avg = run_shape_vs_backend(
+          shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+      no_match_fused = run_shape_fused_only(
+          make_no_match_counterpart(shape), warmup, repeat);
+    } catch (const std::exception& e) {
+      ++skipped;
+      std::fprintf(
+          stderr,
+          "[MTGR][CUDA][Perf][FusedPartialRT %lld/%zu] skipped: heads=%lld "
+          "head_dim=%lld history=%lld realtime=%lld target=%lld reason=%s\n",
+          static_cast<long long>(idx),
+          cases.size(),
+          static_cast<long long>(shape.heads),
+          static_cast<long long>(shape.head_dim),
+          static_cast<long long>(shape.history),
+          static_cast<long long>(shape.realtime),
+          static_cast<long long>(shape.target),
+          e.what());
+      continue;
+    }
+    const double base_mask_build_plus_device_ms =
+        avg.base.mask_build_ms + avg.base.device_total_ms;
+    const double speedup_dev =
+        base_mask_build_plus_device_ms / avg.candidate.device_total_ms;
+    const double speedup_wall =
+        avg.base.wall_total_ms / avg.candidate.wall_total_ms;
+    const double partial_vs_no_match_speedup_dev =
+        no_match_fused.device_total_ms / avg.candidate.device_total_ms;
+    const double partial_vs_no_match_speedup_wall =
+        no_match_fused.wall_total_ms / avg.candidate.wall_total_ms;
+    const double delta_dev =
+        base_mask_build_plus_device_ms - avg.candidate.device_total_ms;
+    const double delta_wall =
+        avg.base.wall_total_ms - avg.candidate.wall_total_ms;
+    const double partial_vs_no_match_delta_dev =
+        no_match_fused.device_total_ms - avg.candidate.device_total_ms;
+    const double partial_vs_no_match_delta_wall =
+        no_match_fused.wall_total_ms - avg.candidate.wall_total_ms;
+
+    std::ostringstream row;
+    row << std::fixed << std::setprecision(6) << "device," << shape.heads << ","
+        << shape.head_dim << "," << shape.history << "," << shape.realtime
+        << "," << shape.realtime_matched() << "," << shape.target << ","
+        << avg.base.mask_build_ms << "," << base_mask_build_plus_device_ms
+        << "," << avg.base.h2d_ms << "," << avg.base.workspace_ms << ","
+        << avg.base.fia_ms << "," << avg.base.device_total_ms << ","
+        << avg.base.wall_total_ms << ","
+        << stage_workspace(avg.candidate, "scatter_kv_cache") << ","
+        << stage_exec(avg.candidate, "scatter_kv_cache") << ","
+        << stage_workspace(avg.candidate, "mtgr_fused_partial_rt_attention")
+        << "," << stage_exec(avg.candidate, "mtgr_fused_partial_rt_attention")
+        << "," << stage_workspace(avg.candidate, "tgt_diag_update_fused") << ","
+        << stage_exec(avg.candidate, "tgt_diag_update_fused") << ","
+        << avg.candidate.device_total_ms << "," << avg.candidate.wall_total_ms
+        << "," << no_match_fused.device_total_ms << ","
+        << no_match_fused.wall_total_ms << "," << speedup_dev << ","
+        << speedup_wall << "," << partial_vs_no_match_speedup_dev << ","
+        << partial_vs_no_match_speedup_wall << "," << delta_dev << ","
+        << delta_wall << "," << partial_vs_no_match_delta_dev << ","
+        << partial_vs_no_match_delta_wall << "," << avg.diff_max_abs << ","
+        << avg.diff_mean_abs;
+    csv << row.str() << "\n";
+    csv.flush();
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][FusedPartialRT %lld/%zu] %s\n",
+                 static_cast<long long>(idx),
+                 cases.size(),
+                 row.str().c_str());
+  }
+  std::fprintf(
+      stderr,
+      "[MTGR][CUDA][Perf][FusedPartialRT] completed=%zu skipped=%lld\n",
+      cases.size() - static_cast<size_t>(skipped),
+      static_cast<long long>(skipped));
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest, FusedNoMatchOddLengthRandomCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 2));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 5));
+  const int case_count =
+      std::max(1, env_int("XLLM_MTGR_ATTENTION_ODD_RANDOM_CASES", 50));
+  const int seed = env_int("XLLM_MTGR_ATTENTION_ODD_RANDOM_SEED", 20260430);
+  const std::string csv_path =
+      csv_path_from_env("XLLM_MTGR_ATTENTION_FUSED_ODD_RANDOM_CSV",
+                        "mtgr_attention_fused_odd_random.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+
+  csv << "common,,,,,,fused,,,,,,,,,\n";
+  csv << "shape_id,heads,head_dim,history,real_time,target,"
+         "device_total_ms,wall_total_ms,"
+         "mtgr_fused_no_match_attention.workspace_ms,"
+         "mtgr_fused_no_match_attention.exec_ms,"
+         "mtgr_fused_no_match_attention.host_ms,"
+         "tgt_diag_update_fused.workspace_ms,"
+         "tgt_diag_update_fused.exec_ms,"
+         "tgt_diag_update_fused.host_ms\n";
+
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  const std::vector<int64_t> heads_all = {4, 8, 12};
+  const std::vector<int64_t> head_dims_all = {64, 128};
+  std::uniform_int_distribution<int> heads_dist(
+      0, static_cast<int>(heads_all.size() - 1));
+  std::uniform_int_distribution<int> head_dim_dist(
+      0, static_cast<int>(head_dims_all.size() - 1));
+
+  std::vector<MTGRAttentionTestShape> cases;
+  cases.reserve(static_cast<size_t>(case_count));
+  std::unordered_set<std::string> seen;
+  for (int attempt = 0;
+       attempt < case_count * 32 && static_cast<int>(cases.size()) < case_count;
+       ++attempt) {
+    MTGRAttentionTestShape shape;
+    shape.heads = heads_all[heads_dist(rng)];
+    shape.kv_heads = shape.heads;
+    shape.head_dim = head_dims_all[head_dim_dist(rng)];
+    shape.history = sample_non_aligned_len(&rng, 1350, 4096);
+    shape.context = 8;
+    shape.realtime = sample_non_aligned_len(&rng, 100, 600);
+    shape.target = sample_non_aligned_len(&rng, 800, 2400);
+    shape.matched_prefix = 0;
+    const std::string key =
+        std::to_string(shape.heads) + "_" + std::to_string(shape.head_dim) +
+        "_" + std::to_string(shape.history) + "_" +
+        std::to_string(shape.realtime) + "_" + std::to_string(shape.target);
+    if (seen.insert(key).second) {
+      cases.push_back(shape);
+    }
+  }
+  CHECK_EQ(static_cast<int>(cases.size()), case_count)
+      << "failed to generate enough unique odd-length random cases";
+
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][FusedOddRandom] cases=%zu warmup=%d "
+               "repeat=%d seed=%d csv=%s\n",
+               cases.size(),
+               warmup,
+               repeat,
+               seed,
+               csv_path.c_str());
+
+  int64_t idx = 0;
+  int64_t skipped = 0;
+  double total_device_ms = 0.0;
+  double total_wall_ms = 0.0;
+  double total_main_exec_ms = 0.0;
+  double total_update_exec_ms = 0.0;
+  double max_device_ms = 0.0;
+  double min_device_ms = std::numeric_limits<double>::infinity();
+  for (const auto& shape : cases) {
+    ++idx;
+    try {
+      const auto metrics = run_shape_fused_only(shape, warmup, repeat);
+      const double main_ws =
+          stage_workspace(metrics, "mtgr_fused_no_match_attention");
+      const double main_exec =
+          stage_exec(metrics, "mtgr_fused_no_match_attention");
+      const double update_ws =
+          stage_workspace(metrics, "tgt_diag_update_fused");
+      const double update_exec = stage_exec(metrics, "tgt_diag_update_fused");
+      const auto* main_stage =
+          find_stage(metrics, "mtgr_fused_no_match_attention");
+      const auto* update_stage = find_stage(metrics, "tgt_diag_update_fused");
+      const double main_host =
+          main_stage != nullptr ? main_stage->host_submit_ms : 0.0;
+      const double update_host =
+          update_stage != nullptr ? update_stage->host_submit_ms : 0.0;
+
+      total_device_ms += metrics.device_total_ms;
+      total_wall_ms += metrics.wall_total_ms;
+      total_main_exec_ms += main_exec;
+      total_update_exec_ms += update_exec;
+      max_device_ms = std::max(max_device_ms, metrics.device_total_ms);
+      min_device_ms = std::min(min_device_ms, metrics.device_total_ms);
+
+      char row[1024];
+      std::snprintf(row,
+                    sizeof(row),
+                    "%lld,%lld,%lld,%lld,%lld,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,"
+                    "%.6f,%.6f,%.6f",
+                    static_cast<long long>(idx),
+                    static_cast<long long>(shape.heads),
+                    static_cast<long long>(shape.head_dim),
+                    static_cast<long long>(shape.history),
+                    static_cast<long long>(shape.realtime),
+                    static_cast<long long>(shape.target),
+                    metrics.device_total_ms,
+                    metrics.wall_total_ms,
+                    main_ws,
+                    main_exec,
+                    main_host,
+                    update_ws,
+                    update_exec,
+                    update_host);
+      csv << row << "\n";
+      csv.flush();
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][FusedOddRandom %lld/%zu] %s\n",
+                   static_cast<long long>(idx),
+                   cases.size(),
+                   row);
+    } catch (const std::exception& e) {
+      ++skipped;
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][FusedOddRandom %lld/%zu] skipped: "
+                   "heads=%lld head_dim=%lld history=%lld realtime=%lld "
+                   "target=%lld reason=%s\n",
+                   static_cast<long long>(idx),
+                   cases.size(),
+                   static_cast<long long>(shape.heads),
+                   static_cast<long long>(shape.head_dim),
+                   static_cast<long long>(shape.history),
+                   static_cast<long long>(shape.realtime),
+                   static_cast<long long>(shape.target),
+                   e.what());
+    }
+  }
+
+  const int64_t completed = static_cast<int64_t>(cases.size()) - skipped;
+  if (completed > 0) {
+    const double inv = 1.0 / static_cast<double>(completed);
+    std::fprintf(
+        stderr,
+        "[MTGR][CUDA][Perf][FusedOddRandom] completed=%lld skipped=%lld "
+        "avg_device_total_ms=%.6f avg_wall_total_ms=%.6f "
+        "avg_main_exec_ms=%.6f avg_update_exec_ms=%.6f "
+        "min_device_total_ms=%.6f max_device_total_ms=%.6f\n",
+        static_cast<long long>(completed),
+        static_cast<long long>(skipped),
+        total_device_ms * inv,
+        total_wall_ms * inv,
+        total_main_exec_ms * inv,
+        total_update_exec_ms * inv,
+        min_device_ms,
+        max_device_ms);
+  } else {
+    std::fprintf(
+        stderr,
+        "[MTGR][CUDA][Perf][FusedOddRandom] completed=0 skipped=%lld\n",
+        static_cast<long long>(skipped));
+  }
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       FusedMainKernelOddLengthRandomCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 2));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 5));
+  const int case_count =
+      std::max(1, env_int("XLLM_MTGR_ATTENTION_ODD_RANDOM_CASES", 50));
+  const int seed = env_int("XLLM_MTGR_ATTENTION_ODD_RANDOM_SEED", 20260430);
+  const std::string csv_path =
+      csv_path_from_env("XLLM_MTGR_ATTENTION_FUSED_MAIN_ODD_RANDOM_CSV",
+                        "mtgr_attention_fused_main_odd_random.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+
+  csv << "shape_id,heads,head_dim,history,real_time,target,"
+         "device_total_ms,wall_total_ms,mtgr_fused_no_match_attention.exec_"
+         "ms\n";
+
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  const std::vector<int64_t> heads_all = {4, 8, 12};
+  const std::vector<int64_t> head_dims_all = {64, 128};
+  std::uniform_int_distribution<int> heads_dist(
+      0, static_cast<int>(heads_all.size() - 1));
+  std::uniform_int_distribution<int> head_dim_dist(
+      0, static_cast<int>(head_dims_all.size() - 1));
+
+  std::vector<MTGRAttentionTestShape> cases;
+  cases.reserve(static_cast<size_t>(case_count));
+  std::unordered_set<std::string> seen;
+  for (int attempt = 0;
+       attempt < case_count * 32 && static_cast<int>(cases.size()) < case_count;
+       ++attempt) {
+    MTGRAttentionTestShape shape;
+    shape.heads = heads_all[heads_dist(rng)];
+    shape.kv_heads = shape.heads;
+    shape.head_dim = head_dims_all[head_dim_dist(rng)];
+    shape.history = sample_non_aligned_len(&rng, 1350, 4096);
+    shape.context = 8;
+    shape.realtime = sample_non_aligned_len(&rng, 100, 600);
+    shape.target = sample_non_aligned_len(&rng, 800, 2400);
+    shape.matched_prefix = 0;
+    const std::string key =
+        std::to_string(shape.heads) + "_" + std::to_string(shape.head_dim) +
+        "_" + std::to_string(shape.history) + "_" +
+        std::to_string(shape.realtime) + "_" + std::to_string(shape.target);
+    if (seen.insert(key).second) {
+      cases.push_back(shape);
+    }
+  }
+  CHECK_EQ(static_cast<int>(cases.size()), case_count)
+      << "failed to generate enough unique odd-length random cases";
+
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][FusedMainOddRandom] cases=%zu warmup=%d "
+               "repeat=%d seed=%d csv=%s\n",
+               cases.size(),
+               warmup,
+               repeat,
+               seed,
+               csv_path.c_str());
+
+  int64_t idx = 0;
+  int64_t skipped = 0;
+  double total_device_ms = 0.0;
+  double total_wall_ms = 0.0;
+  double max_device_ms = 0.0;
+  double min_device_ms = std::numeric_limits<double>::infinity();
+  for (const auto& shape : cases) {
+    ++idx;
+    try {
+      const auto metrics =
+          run_shape_fused_main_kernel_only(shape, warmup, repeat);
+      total_device_ms += metrics.device_total_ms;
+      total_wall_ms += metrics.wall_total_ms;
+      max_device_ms = std::max(max_device_ms, metrics.device_total_ms);
+      min_device_ms = std::min(min_device_ms, metrics.device_total_ms);
+
+      char row[512];
+      std::snprintf(row,
+                    sizeof(row),
+                    "%lld,%lld,%lld,%lld,%lld,%lld,%.6f,%.6f,%.6f",
+                    static_cast<long long>(idx),
+                    static_cast<long long>(shape.heads),
+                    static_cast<long long>(shape.head_dim),
+                    static_cast<long long>(shape.history),
+                    static_cast<long long>(shape.realtime),
+                    static_cast<long long>(shape.target),
+                    metrics.device_total_ms,
+                    metrics.wall_total_ms,
+                    stage_exec(metrics, "mtgr_fused_no_match_attention"));
+      csv << row << "\n";
+      csv.flush();
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][FusedMainOddRandom %lld/%zu] %s\n",
+                   static_cast<long long>(idx),
+                   cases.size(),
+                   row);
+    } catch (const std::exception& e) {
+      ++skipped;
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][FusedMainOddRandom %lld/%zu] skipped: "
+                   "heads=%lld head_dim=%lld history=%lld realtime=%lld "
+                   "target=%lld reason=%s\n",
+                   static_cast<long long>(idx),
+                   cases.size(),
+                   static_cast<long long>(shape.heads),
+                   static_cast<long long>(shape.head_dim),
+                   static_cast<long long>(shape.history),
+                   static_cast<long long>(shape.realtime),
+                   static_cast<long long>(shape.target),
+                   e.what());
+    }
+  }
+
+  const int64_t completed = static_cast<int64_t>(cases.size()) - skipped;
+  if (completed > 0) {
+    const double inv = 1.0 / static_cast<double>(completed);
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][FusedMainOddRandom] completed=%lld "
+                 "skipped=%lld avg_device_total_ms=%.6f avg_wall_total_ms=%.6f "
+                 "min_device_total_ms=%.6f max_device_total_ms=%.6f\n",
+                 static_cast<long long>(completed),
+                 static_cast<long long>(skipped),
+                 total_device_ms * inv,
+                 total_wall_ms * inv,
+                 min_device_ms,
+                 max_device_ms);
+  } else {
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][FusedMainOddRandom] completed=0 "
+                 "skipped=%lld\n",
+                 static_cast<long long>(skipped));
+  }
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       FusedPartialRealTimeMatchOddLengthRandomCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 2));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 5));
+  const int case_count =
+      std::max(1, env_int("XLLM_MTGR_ATTENTION_ODD_RANDOM_CASES", 50));
+  const int seed = env_int("XLLM_MTGR_ATTENTION_ODD_RANDOM_SEED", 20260501);
+  const std::string csv_path =
+      csv_path_from_env("XLLM_MTGR_ATTENTION_FUSED_PARTIAL_ODD_RANDOM_CSV",
+                        "mtgr_attention_fused_partial_odd_random.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+
+  csv << "common,,,,,,,,one_stage,,,,,,,partial_fused,,,,,,,no_match_fused,,"
+         "speedup,,,,delta_ms,,,,precision,\n";
+  csv << "shape_id,heads,head_dim,history,real_time,realtime_matched,target,"
+         "mask_build_ms,mask_build_plus_device_ms,h2d_ms,workspace_ms,"
+         "fia_ms,device_total_ms,wall_total_ms,scatter_kv_cache.workspace_ms,"
+         "scatter_kv_cache.exec_ms,mtgr_fused_partial_rt_attention."
+         "workspace_ms,mtgr_fused_partial_rt_attention.exec_ms,"
+         "tgt_diag_update_fused.workspace_ms,tgt_diag_update_fused.exec_ms,"
+         "device_total_ms,wall_total_ms,no_match_device_total_ms,"
+         "no_match_wall_total_ms,"
+         "one_mask_build_plus_device_ms/partial_fused_device_total_ms,"
+         "one_wall_total_ms/partial_fused_wall_total_ms,"
+         "no_match_fused_device_total_ms/partial_fused_device_total_ms,"
+         "no_match_fused_wall_total_ms/partial_fused_wall_total_ms,"
+         "one_mask_build_plus_device_ms-partial_fused_device_total_ms,"
+         "one_wall_total_ms-partial_fused_wall_total_ms,"
+         "no_match_fused_device_total_ms-partial_fused_device_total_ms,"
+         "no_match_fused_wall_total_ms-partial_fused_wall_total_ms,"
+         "diff_max_abs,diff_mean_abs\n";
+
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  const std::vector<int64_t> heads_all = {4, 8, 12};
+  const std::vector<int64_t> head_dims_all = {64, 128};
+  std::uniform_int_distribution<int> heads_dist(
+      0, static_cast<int>(heads_all.size() - 1));
+  std::uniform_int_distribution<int> head_dim_dist(
+      0, static_cast<int>(head_dims_all.size() - 1));
+
+  std::vector<MTGRAttentionTestShape> cases;
+  cases.reserve(static_cast<size_t>(case_count));
+  std::unordered_set<std::string> seen;
+  for (int attempt = 0;
+       attempt < case_count * 32 && static_cast<int>(cases.size()) < case_count;
+       ++attempt) {
+    MTGRAttentionTestShape shape;
+    shape.heads = heads_all[heads_dist(rng)];
+    shape.kv_heads = shape.heads;
+    shape.head_dim = head_dims_all[head_dim_dist(rng)];
+    shape.history = sample_non_aligned_len(&rng, 1350, 4096);
+    shape.context = 8;
+    shape.realtime = sample_non_aligned_len(&rng, 100, 600);
+    shape.target = sample_non_aligned_len(&rng, 800, 2400);
+    shape.matched_prefix =
+        shape.history + shape.context + (shape.realtime * 4) / 5;
+    const std::string key =
+        std::to_string(shape.heads) + "_" + std::to_string(shape.head_dim) +
+        "_" + std::to_string(shape.history) + "_" +
+        std::to_string(shape.realtime) + "_" + std::to_string(shape.target);
+    if (seen.insert(key).second) {
+      cases.push_back(shape);
+    }
+  }
+  CHECK_EQ(static_cast<int>(cases.size()), case_count)
+      << "failed to generate enough unique odd-length random cases";
+
+  std::fprintf(
+      stderr,
+      "[MTGR][CUDA][Perf][FusedPartialRTOddRandom] cases=%zu warmup=%d "
+      "repeat=%d seed=%d csv=%s\n",
+      cases.size(),
+      warmup,
+      repeat,
+      seed,
+      csv_path.c_str());
+
+  int64_t idx = 0;
+  int64_t skipped = 0;
+  double total_base_mask_plus_device_ms = 0.0;
+  double total_fused_device_ms = 0.0;
+  double total_speedup_dev = 0.0;
+  double min_speedup_dev = std::numeric_limits<double>::infinity();
+  double max_speedup_dev = 0.0;
+  int64_t regressions = 0;
+  double total_no_match_fused_device_ms = 0.0;
+  double total_partial_vs_no_match_speedup_dev = 0.0;
+  double min_partial_vs_no_match_speedup_dev =
+      std::numeric_limits<double>::infinity();
+  double max_partial_vs_no_match_speedup_dev = 0.0;
+  int64_t partial_slower_than_no_match = 0;
+  for (const auto& shape : cases) {
+    ++idx;
+    try {
+      const auto avg = run_shape_vs_backend(
+          shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+      const auto no_match_fused = run_shape_fused_only(
+          make_no_match_counterpart(shape), warmup, repeat);
+      const double base_mask_build_plus_device_ms =
+          avg.base.mask_build_ms + avg.base.device_total_ms;
+      const double speedup_dev =
+          base_mask_build_plus_device_ms / avg.candidate.device_total_ms;
+      const double speedup_wall =
+          avg.base.wall_total_ms / avg.candidate.wall_total_ms;
+      const double partial_vs_no_match_speedup_dev =
+          no_match_fused.device_total_ms / avg.candidate.device_total_ms;
+      const double partial_vs_no_match_speedup_wall =
+          no_match_fused.wall_total_ms / avg.candidate.wall_total_ms;
+      const double delta_dev =
+          base_mask_build_plus_device_ms - avg.candidate.device_total_ms;
+      const double delta_wall =
+          avg.base.wall_total_ms - avg.candidate.wall_total_ms;
+      const double partial_vs_no_match_delta_dev =
+          no_match_fused.device_total_ms - avg.candidate.device_total_ms;
+      const double partial_vs_no_match_delta_wall =
+          no_match_fused.wall_total_ms - avg.candidate.wall_total_ms;
+      if (speedup_dev < 1.0) {
+        ++regressions;
+      }
+      if (partial_vs_no_match_speedup_dev < 1.0) {
+        ++partial_slower_than_no_match;
+      }
+      total_base_mask_plus_device_ms += base_mask_build_plus_device_ms;
+      total_fused_device_ms += avg.candidate.device_total_ms;
+      total_speedup_dev += speedup_dev;
+      min_speedup_dev = std::min(min_speedup_dev, speedup_dev);
+      max_speedup_dev = std::max(max_speedup_dev, speedup_dev);
+      total_no_match_fused_device_ms += no_match_fused.device_total_ms;
+      total_partial_vs_no_match_speedup_dev += partial_vs_no_match_speedup_dev;
+      min_partial_vs_no_match_speedup_dev = std::min(
+          min_partial_vs_no_match_speedup_dev, partial_vs_no_match_speedup_dev);
+      max_partial_vs_no_match_speedup_dev = std::max(
+          max_partial_vs_no_match_speedup_dev, partial_vs_no_match_speedup_dev);
+
+      std::ostringstream row;
+      row << std::fixed << std::setprecision(6) << idx << "," << shape.heads
+          << "," << shape.head_dim << "," << shape.history << ","
+          << shape.realtime << "," << shape.realtime_matched() << ","
+          << shape.target << "," << avg.base.mask_build_ms << ","
+          << base_mask_build_plus_device_ms << "," << avg.base.h2d_ms << ","
+          << avg.base.workspace_ms << "," << avg.base.fia_ms << ","
+          << avg.base.device_total_ms << "," << avg.base.wall_total_ms << ","
+          << stage_workspace(avg.candidate, "scatter_kv_cache") << ","
+          << stage_exec(avg.candidate, "scatter_kv_cache") << ","
+          << stage_workspace(avg.candidate, "mtgr_fused_partial_rt_attention")
+          << "," << stage_exec(avg.candidate, "mtgr_fused_partial_rt_attention")
+          << "," << stage_workspace(avg.candidate, "tgt_diag_update_fused")
+          << "," << stage_exec(avg.candidate, "tgt_diag_update_fused") << ","
+          << avg.candidate.device_total_ms << "," << avg.candidate.wall_total_ms
+          << "," << no_match_fused.device_total_ms << ","
+          << no_match_fused.wall_total_ms << "," << speedup_dev << ","
+          << speedup_wall << "," << partial_vs_no_match_speedup_dev << ","
+          << partial_vs_no_match_speedup_wall << "," << delta_dev << ","
+          << delta_wall << "," << partial_vs_no_match_delta_dev << ","
+          << partial_vs_no_match_delta_wall << "," << avg.diff_max_abs << ","
+          << avg.diff_mean_abs;
+      csv << row.str() << "\n";
+      csv.flush();
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][FusedPartialRTOddRandom %lld/%zu] %s\n",
+                   static_cast<long long>(idx),
+                   cases.size(),
+                   row.str().c_str());
+    } catch (const std::exception& e) {
+      ++skipped;
+      std::fprintf(
+          stderr,
+          "[MTGR][CUDA][Perf][FusedPartialRTOddRandom %lld/%zu] skipped: "
+          "heads=%lld head_dim=%lld history=%lld realtime=%lld target=%lld "
+          "reason=%s\n",
+          static_cast<long long>(idx),
+          cases.size(),
+          static_cast<long long>(shape.heads),
+          static_cast<long long>(shape.head_dim),
+          static_cast<long long>(shape.history),
+          static_cast<long long>(shape.realtime),
+          static_cast<long long>(shape.target),
+          e.what());
+    }
+  }
+
+  const int64_t completed = static_cast<int64_t>(cases.size()) - skipped;
+  if (completed > 0) {
+    const double inv = 1.0 / static_cast<double>(completed);
+    std::fprintf(
+        stderr,
+        "[MTGR][CUDA][Perf][FusedPartialRTOddRandom] completed=%lld "
+        "skipped=%lld regressions=%lld partial_slower_than_no_match=%lld "
+        "avg_base_mask_plus_device_ms=%.6f avg_fused_device_ms=%.6f "
+        "avg_no_match_fused_device_ms=%.6f avg_speedup_dev=%.6f "
+        "min_speedup_dev=%.6f max_speedup_dev=%.6f "
+        "avg_partial_vs_no_match_speedup_dev=%.6f "
+        "min_partial_vs_no_match_speedup_dev=%.6f "
+        "max_partial_vs_no_match_speedup_dev=%.6f\n",
+        static_cast<long long>(completed),
+        static_cast<long long>(skipped),
+        static_cast<long long>(regressions),
+        static_cast<long long>(partial_slower_than_no_match),
+        total_base_mask_plus_device_ms * inv,
+        total_fused_device_ms * inv,
+        total_no_match_fused_device_ms * inv,
+        total_speedup_dev * inv,
+        min_speedup_dev,
+        max_speedup_dev,
+        total_partial_vs_no_match_speedup_dev * inv,
+        min_partial_vs_no_match_speedup_dev,
+        max_partial_vs_no_match_speedup_dev);
+  } else {
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][FusedPartialRTOddRandom] completed=0 "
+                 "skipped=%lld\n",
+                 static_cast<long long>(skipped));
+  }
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       NoMatchAndPartialRealTimeMatchOddLengthRandomCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 2));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 5));
+  const int case_count =
+      std::max(1, env_int("XLLM_MTGR_ATTENTION_ODD_RANDOM_CASES", 1000));
+  const int seed = env_int("XLLM_MTGR_ATTENTION_ODD_RANDOM_SEED", 20260501);
+  const std::string csv_path =
+      csv_path_from_env("XLLM_MTGR_ATTENTION_NO_MATCH_PARTIAL_ODD_RANDOM_CSV",
+                        "mtgr_attention_no_match_partial_odd_random.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+
+  csv << "common,,,,,,,full_base,,,no_match_fused,,,,partial_fused,,,,"
+         "partial_vs_no_match,,,precision,,\n";
+  csv << "shape_id,heads,head_dim,history,real_time,realtime_matched,target,"
+         "base_mask_build_ms,base_fia_ms,base_total_ms,"
+         "no_match_fused_device_total_ms,no_match_speedup_dev,"
+         "no_match_delta_dev,partial_fused_device_total_ms,"
+         "partial_speedup_dev,partial_delta_dev,"
+         "partial_vs_no_match_speedup_dev,partial_vs_no_match_delta_dev,"
+         "no_match_diff_max_abs,no_match_diff_mean_abs,"
+         "partial_diff_max_abs,partial_diff_mean_abs\n";
+
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  const std::vector<int64_t> heads_all = {4, 8, 12};
+  const std::vector<int64_t> head_dims_all = {64, 128};
+  std::uniform_int_distribution<int> heads_dist(
+      0, static_cast<int>(heads_all.size() - 1));
+  std::uniform_int_distribution<int> head_dim_dist(
+      0, static_cast<int>(head_dims_all.size() - 1));
+
+  std::vector<MTGRAttentionTestShape> partial_cases;
+  partial_cases.reserve(static_cast<size_t>(case_count));
+  std::unordered_set<std::string> seen;
+  for (int attempt = 0; attempt < case_count * 32 &&
+                        static_cast<int>(partial_cases.size()) < case_count;
+       ++attempt) {
+    MTGRAttentionTestShape shape;
+    shape.heads = heads_all[heads_dist(rng)];
+    shape.kv_heads = shape.heads;
+    shape.head_dim = head_dims_all[head_dim_dist(rng)];
+    shape.history = sample_non_aligned_len(&rng, 1350, 4096);
+    shape.context = 8;
+    shape.realtime = sample_non_aligned_len(&rng, 100, 600);
+    shape.target = sample_non_aligned_len(&rng, 800, 2400);
+    shape.matched_prefix =
+        shape.history + shape.context + (shape.realtime * 4) / 5;
+    const std::string key =
+        std::to_string(shape.heads) + "_" + std::to_string(shape.head_dim) +
+        "_" + std::to_string(shape.history) + "_" +
+        std::to_string(shape.realtime) + "_" + std::to_string(shape.target);
+    if (seen.insert(key).second) {
+      partial_cases.push_back(shape);
+    }
+  }
+  CHECK_EQ(static_cast<int>(partial_cases.size()), case_count)
+      << "failed to generate enough unique odd-length random cases";
+
+  std::fprintf(
+      stderr,
+      "[MTGR][CUDA][Perf][NoMatchPartialOddRandom] cases=%zu warmup=%d "
+      "repeat=%d seed=%d csv=%s\n",
+      partial_cases.size(),
+      warmup,
+      repeat,
+      seed,
+      csv_path.c_str());
+
+  int64_t idx = 0;
+  int64_t skipped = 0;
+  int64_t no_match_regressions = 0;
+  int64_t partial_regressions = 0;
+  int64_t partial_slower_than_no_match = 0;
+  double total_no_match_speedup_dev = 0.0;
+  double total_partial_speedup_dev = 0.0;
+  double total_partial_vs_no_match_speedup_dev = 0.0;
+  double min_no_match_speedup_dev = std::numeric_limits<double>::infinity();
+  double min_partial_speedup_dev = std::numeric_limits<double>::infinity();
+  double min_partial_vs_no_match_speedup_dev =
+      std::numeric_limits<double>::infinity();
+  double max_no_match_speedup_dev = 0.0;
+  double max_partial_speedup_dev = 0.0;
+  double max_partial_vs_no_match_speedup_dev = 0.0;
+  for (const auto& partial_shape : partial_cases) {
+    ++idx;
+    try {
+      const auto no_match_shape = make_no_match_counterpart(partial_shape);
+      const auto no_match =
+          run_shape_vs_backend(no_match_shape,
+                               warmup,
+                               repeat,
+                               MTGRAttentionTestBackend::kFusedNoMatch);
+      const auto partial =
+          run_shape_vs_backend(partial_shape,
+                               warmup,
+                               repeat,
+                               MTGRAttentionTestBackend::kFusedNoMatch);
+
+      const double full_base_total_ms = no_match.base.device_total_ms;
+      const double no_match_speedup_dev =
+          full_base_total_ms / no_match.candidate.device_total_ms;
+      const double no_match_delta_dev =
+          full_base_total_ms - no_match.candidate.device_total_ms;
+      const double partial_speedup_dev =
+          full_base_total_ms / partial.candidate.device_total_ms;
+      const double partial_delta_dev =
+          full_base_total_ms - partial.candidate.device_total_ms;
+
+      const double partial_vs_no_match_speedup_dev =
+          no_match.candidate.device_total_ms /
+          partial.candidate.device_total_ms;
+      const double partial_vs_no_match_delta_dev =
+          no_match.candidate.device_total_ms -
+          partial.candidate.device_total_ms;
+
+      if (no_match_speedup_dev < 1.0) {
+        ++no_match_regressions;
+      }
+      if (partial_speedup_dev < 1.0) {
+        ++partial_regressions;
+      }
+      if (partial_vs_no_match_speedup_dev < 1.0) {
+        ++partial_slower_than_no_match;
+      }
+
+      total_no_match_speedup_dev += no_match_speedup_dev;
+      total_partial_speedup_dev += partial_speedup_dev;
+      total_partial_vs_no_match_speedup_dev += partial_vs_no_match_speedup_dev;
+      min_no_match_speedup_dev =
+          std::min(min_no_match_speedup_dev, no_match_speedup_dev);
+      min_partial_speedup_dev =
+          std::min(min_partial_speedup_dev, partial_speedup_dev);
+      min_partial_vs_no_match_speedup_dev = std::min(
+          min_partial_vs_no_match_speedup_dev, partial_vs_no_match_speedup_dev);
+      max_no_match_speedup_dev =
+          std::max(max_no_match_speedup_dev, no_match_speedup_dev);
+      max_partial_speedup_dev =
+          std::max(max_partial_speedup_dev, partial_speedup_dev);
+      max_partial_vs_no_match_speedup_dev = std::max(
+          max_partial_vs_no_match_speedup_dev, partial_vs_no_match_speedup_dev);
+
+      std::ostringstream row;
+      row << std::fixed << std::setprecision(6) << idx << ","
+          << partial_shape.heads << "," << partial_shape.head_dim << ","
+          << partial_shape.history << "," << partial_shape.realtime << ","
+          << partial_shape.realtime_matched() << "," << partial_shape.target
+          << "," << no_match.base.mask_build_ms << "," << no_match.base.fia_ms
+          << "," << full_base_total_ms << ","
+          << no_match.candidate.device_total_ms << "," << no_match_speedup_dev
+          << "," << no_match_delta_dev << ","
+          << partial.candidate.device_total_ms << "," << partial_speedup_dev
+          << "," << partial_delta_dev << "," << partial_vs_no_match_speedup_dev
+          << "," << partial_vs_no_match_delta_dev << ","
+          << no_match.diff_max_abs << "," << no_match.diff_mean_abs << ","
+          << partial.diff_max_abs << "," << partial.diff_mean_abs;
+      csv << row.str() << "\n";
+      csv.flush();
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][NoMatchPartialOddRandom %lld/%zu] %s\n",
+                   static_cast<long long>(idx),
+                   partial_cases.size(),
+                   row.str().c_str());
+    } catch (const std::exception& e) {
+      ++skipped;
+      std::fprintf(
+          stderr,
+          "[MTGR][CUDA][Perf][NoMatchPartialOddRandom %lld/%zu] skipped: "
+          "heads=%lld head_dim=%lld history=%lld realtime=%lld target=%lld "
+          "reason=%s\n",
+          static_cast<long long>(idx),
+          partial_cases.size(),
+          static_cast<long long>(partial_shape.heads),
+          static_cast<long long>(partial_shape.head_dim),
+          static_cast<long long>(partial_shape.history),
+          static_cast<long long>(partial_shape.realtime),
+          static_cast<long long>(partial_shape.target),
+          e.what());
+    }
+  }
+
+  const int64_t completed =
+      static_cast<int64_t>(partial_cases.size()) - skipped;
+  if (completed > 0) {
+    const double inv = 1.0 / static_cast<double>(completed);
+    std::fprintf(
+        stderr,
+        "[MTGR][CUDA][Perf][NoMatchPartialOddRandom] completed=%lld "
+        "skipped=%lld no_match_regressions=%lld partial_regressions=%lld "
+        "partial_slower_than_no_match=%lld avg_no_match_speedup_dev=%.6f "
+        "min_no_match_speedup_dev=%.6f max_no_match_speedup_dev=%.6f "
+        "avg_partial_speedup_dev=%.6f min_partial_speedup_dev=%.6f "
+        "max_partial_speedup_dev=%.6f "
+        "avg_partial_vs_no_match_speedup_dev=%.6f "
+        "min_partial_vs_no_match_speedup_dev=%.6f "
+        "max_partial_vs_no_match_speedup_dev=%.6f\n",
+        static_cast<long long>(completed),
+        static_cast<long long>(skipped),
+        static_cast<long long>(no_match_regressions),
+        static_cast<long long>(partial_regressions),
+        static_cast<long long>(partial_slower_than_no_match),
+        total_no_match_speedup_dev * inv,
+        min_no_match_speedup_dev,
+        max_no_match_speedup_dev,
+        total_partial_speedup_dev * inv,
+        min_partial_speedup_dev,
+        max_partial_speedup_dev,
+        total_partial_vs_no_match_speedup_dev * inv,
+        min_partial_vs_no_match_speedup_dev,
+        max_partial_vs_no_match_speedup_dev);
+  } else {
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][NoMatchPartialOddRandom] completed=0 "
+                 "skipped=%lld\n",
+                 static_cast<long long>(skipped));
+  }
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest, FusedMainKernelExactShapeOnce) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 0));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 1));
+
+  MTGRAttentionTestShape shape;
+  shape.heads = env_int("XLLM_MTGR_ATTENTION_HEADS", 4);
+  shape.kv_heads = shape.heads;
+  shape.head_dim = env_int("XLLM_MTGR_ATTENTION_HEAD_DIM", 128);
+  shape.history = env_int("XLLM_MTGR_ATTENTION_HISTORY", 1377);
+  shape.context = env_int("XLLM_MTGR_ATTENTION_CONTEXT", 8);
+  shape.realtime = env_int("XLLM_MTGR_ATTENTION_REALTIME", 134);
+  shape.target = env_int("XLLM_MTGR_ATTENTION_TARGET", 1093);
+  shape.matched_prefix = 0;
+
+  const auto metrics = run_shape_fused_main_kernel_only(shape, warmup, repeat);
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][FusedMainExactShape] heads=%lld "
+               "head_dim=%lld history=%lld context=%lld realtime=%lld "
+               "target=%lld device_total_ms=%.6f wall_total_ms=%.6f\n",
+               static_cast<long long>(shape.heads),
+               static_cast<long long>(shape.head_dim),
+               static_cast<long long>(shape.history),
+               static_cast<long long>(shape.context),
+               static_cast<long long>(shape.realtime),
+               static_cast<long long>(shape.target),
+               metrics.device_total_ms,
+               metrics.wall_total_ms);
   std::fflush(stderr);
 }
 
@@ -419,16 +1684,20 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, OneVsFusedNoMatchHotShape) {
 
   const auto avg = run_shape_vs_backend(
       shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+  const double base_mask_build_plus_device_ms =
+      avg.base.mask_build_ms + avg.base.device_total_ms;
   const double speedup_dev =
-      avg.base.device_total_ms / avg.candidate.device_total_ms;
+      base_mask_build_plus_device_ms / avg.candidate.device_total_ms;
   const double delta_dev =
-      avg.base.device_total_ms - avg.candidate.device_total_ms;
+      base_mask_build_plus_device_ms - avg.candidate.device_total_ms;
+  EXPECT_GT(speedup_dev, 1.0);
 
   std::fprintf(
       stderr,
       "[MTGR][CUDA][Perf][OneVsFusedHotShape] "
       "heads=%lld head_dim=%lld history=%lld realtime=%lld target=%lld "
-      "base_mask_build_ms=%.6f base_device_total_ms=%.6f "
+      "base_mask_build_ms=%.6f base_mask_build_plus_device_ms=%.6f "
+      "base_device_total_ms=%.6f "
       "fused_device_total_ms=%.6f fused_wall_total_ms=%.6f "
       "speedup=%.6f delta_ms=%.6f diff_max_abs=%.6e diff_mean_abs=%.6e\n",
       static_cast<long long>(shape.heads),
@@ -437,6 +1706,7 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, OneVsFusedNoMatchHotShape) {
       static_cast<long long>(shape.realtime),
       static_cast<long long>(shape.target),
       avg.base.mask_build_ms,
+      base_mask_build_plus_device_ms,
       avg.base.device_total_ms,
       avg.candidate.device_total_ms,
       avg.candidate.wall_total_ms,
@@ -447,6 +1717,137 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, OneVsFusedNoMatchHotShape) {
   for (const auto& stage : avg.candidate.stages) {
     std::fprintf(stderr,
                  "[MTGR][CUDA][Perf][OneVsFusedHotShape][Stage] %s "
+                 "workspace_ms=%.6f exec_ms=%.6f host_ms=%.6f\n",
+                 stage.name.c_str(),
+                 stage.workspace_ms,
+                 stage.exec_ms,
+                 stage.host_submit_ms);
+  }
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest, OneVsFusedNoMatchHd64HotShape) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 5));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 20));
+
+  MTGRAttentionTestShape shape;
+  shape.heads = 8;
+  shape.kv_heads = 8;
+  shape.head_dim = 64;
+  shape.history = 2048;
+  shape.context = 8;
+  shape.realtime = 512;
+  shape.target = 1600;
+  shape.matched_prefix = 0;
+
+  const auto avg = run_shape_vs_backend(
+      shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+  const double base_mask_build_plus_device_ms =
+      avg.base.mask_build_ms + avg.base.device_total_ms;
+  const double speedup_dev =
+      base_mask_build_plus_device_ms / avg.candidate.device_total_ms;
+  const double delta_dev =
+      base_mask_build_plus_device_ms - avg.candidate.device_total_ms;
+  EXPECT_GT(speedup_dev, 1.0);
+
+  std::fprintf(
+      stderr,
+      "[MTGR][CUDA][Perf][OneVsFusedHd64HotShape] "
+      "heads=%lld head_dim=%lld history=%lld realtime=%lld target=%lld "
+      "base_mask_build_ms=%.6f base_mask_build_plus_device_ms=%.6f "
+      "base_device_total_ms=%.6f "
+      "fused_device_total_ms=%.6f fused_wall_total_ms=%.6f "
+      "speedup=%.6f delta_ms=%.6f diff_max_abs=%.6e diff_mean_abs=%.6e\n",
+      static_cast<long long>(shape.heads),
+      static_cast<long long>(shape.head_dim),
+      static_cast<long long>(shape.history),
+      static_cast<long long>(shape.realtime),
+      static_cast<long long>(shape.target),
+      avg.base.mask_build_ms,
+      base_mask_build_plus_device_ms,
+      avg.base.device_total_ms,
+      avg.candidate.device_total_ms,
+      avg.candidate.wall_total_ms,
+      speedup_dev,
+      delta_dev,
+      avg.diff_max_abs,
+      avg.diff_mean_abs);
+  for (const auto& stage : avg.candidate.stages) {
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][OneVsFusedHd64HotShape][Stage] %s "
+                 "workspace_ms=%.6f exec_ms=%.6f host_ms=%.6f\n",
+                 stage.name.c_str(),
+                 stage.workspace_ms,
+                 stage.exec_ms,
+                 stage.host_submit_ms);
+  }
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       OneVsFusedPartialRealTimeHotShape) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 5));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 20));
+
+  MTGRAttentionTestShape shape;
+  shape.heads = 8;
+  shape.kv_heads = 8;
+  shape.head_dim = 128;
+  shape.history = 2048;
+  shape.context = 8;
+  shape.realtime = 512;
+  shape.target = 1600;
+  shape.matched_prefix = shape.history + shape.context + 409;
+
+  const auto avg = run_shape_vs_backend(
+      shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+  const auto no_match_fused =
+      run_shape_fused_only(make_no_match_counterpart(shape), warmup, repeat);
+  const double base_mask_build_plus_device_ms =
+      avg.base.mask_build_ms + avg.base.device_total_ms;
+  const double speedup_dev =
+      base_mask_build_plus_device_ms / avg.candidate.device_total_ms;
+  const double partial_vs_no_match_speedup_dev =
+      no_match_fused.device_total_ms / avg.candidate.device_total_ms;
+  const double delta_dev =
+      base_mask_build_plus_device_ms - avg.candidate.device_total_ms;
+  const double partial_vs_no_match_delta_dev =
+      no_match_fused.device_total_ms - avg.candidate.device_total_ms;
+
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][OneVsFusedPartialRTHotShape] "
+               "heads=%lld head_dim=%lld history=%lld realtime=%lld "
+               "realtime_matched=%lld target=%lld "
+               "base_mask_build_ms=%.6f base_mask_build_plus_device_ms=%.6f "
+               "base_device_total_ms=%.6f fused_device_total_ms=%.6f "
+               "fused_wall_total_ms=%.6f speedup=%.6f delta_ms=%.6f "
+               "no_match_fused_device_total_ms=%.6f "
+               "partial_vs_no_match_speedup=%.6f "
+               "partial_vs_no_match_delta_ms=%.6f "
+               "diff_max_abs=%.6e diff_mean_abs=%.6e\n",
+               static_cast<long long>(shape.heads),
+               static_cast<long long>(shape.head_dim),
+               static_cast<long long>(shape.history),
+               static_cast<long long>(shape.realtime),
+               static_cast<long long>(shape.realtime_matched()),
+               static_cast<long long>(shape.target),
+               avg.base.mask_build_ms,
+               base_mask_build_plus_device_ms,
+               avg.base.device_total_ms,
+               avg.candidate.device_total_ms,
+               avg.candidate.wall_total_ms,
+               speedup_dev,
+               delta_dev,
+               no_match_fused.device_total_ms,
+               partial_vs_no_match_speedup_dev,
+               partial_vs_no_match_delta_dev,
+               avg.diff_max_abs,
+               avg.diff_mean_abs);
+  for (const auto& stage : avg.candidate.stages) {
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][OneVsFusedPartialRTHotShape][Stage] %s "
                  "workspace_ms=%.6f exec_ms=%.6f host_ms=%.6f\n",
                  stage.name.c_str(),
                  stage.workspace_ms,

@@ -172,4 +172,20 @@ TEST_F(MTGRAttentionE2EPrecisionTest, FusedNoMatchHotShapeAlignsWithOneStage) {
                       MTGRAttentionTestBackend::kFusedNoMatch);
 }
 
+TEST_F(MTGRAttentionE2EPrecisionTest,
+       FusedPartialRealTimeMatchHotShapeAlignsWithOneStage) {
+  MTGRAttentionTestShape shape;
+  shape.heads = 8;
+  shape.kv_heads = 8;
+  shape.head_dim = 128;
+  shape.history = 2048;
+  shape.context = 8;
+  shape.realtime = 512;
+  shape.target = 1600;
+  shape.matched_prefix = shape.history + shape.context + 409;
+  run_case_vs_backend("fused_partial_real_time_match_hot_shape",
+                      shape,
+                      MTGRAttentionTestBackend::kFusedNoMatch);
+}
+
 }  // namespace xllm::kernel::cuda::test

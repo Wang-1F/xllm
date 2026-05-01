@@ -28,6 +28,7 @@ limitations under the License.
 #include <cstdlib>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -67,6 +68,20 @@ void mtgr_fused_no_match_attention_cuda(const torch::Tensor& query_snd,
                                         double sm_scale,
                                         torch::Tensor output_snd,
                                         torch::Tensor target_hcr_lse_sh1);
+
+void mtgr_fused_partial_rt_attention_cuda(const torch::Tensor& query_snd,
+                                          const torch::Tensor& rt_key_snd,
+                                          const torch::Tensor& rt_value_snd,
+                                          const torch::Tensor& key_cache,
+                                          const torch::Tensor& value_cache,
+                                          const torch::Tensor& block_table_row,
+                                          int64_t block_size,
+                                          int64_t matched_prefix_len,
+                                          int64_t realtime_unmatched_len,
+                                          int64_t target_len,
+                                          double sm_scale,
+                                          torch::Tensor output_snd,
+                                          torch::Tensor target_hcr_lse_sh1);
 
 void full_attention_cuda(const torch::Tensor& query_snd,
                          const torch::Tensor& key_snd,
@@ -109,6 +124,10 @@ std::vector<StageTimeline> build_partial_rt_multi_timeline() {
 
 std::vector<StageTimeline> build_fused_no_match_timeline() {
   return {{"mtgr_fused_no_match_attention"}, {"tgt_diag_update_fused"}};
+}
+
+std::vector<StageTimeline> build_fused_partial_rt_timeline() {
+  return {{"mtgr_fused_partial_rt_attention"}, {"tgt_diag_update_fused"}};
 }
 
 void create_stage_events_if_needed(StageTimeline* stage) {
@@ -901,6 +920,27 @@ torch::Tensor gather_cached_prefix(const torch::Tensor& cache,
   return flat.index_select(0, slots).contiguous();
 }
 
+void scatter_to_cache(const torch::Tensor& key_snd,
+                      const torch::Tensor& value_snd,
+                      torch::Tensor& key_cache,
+                      torch::Tensor& value_cache,
+                      const torch::Tensor& slot_mapping_i32) {
+  if (key_snd.numel() == 0) {
+    return;
+  }
+  CHECK_EQ(key_snd.dim(), 3);
+  CHECK_EQ(value_snd.dim(), 3);
+  CHECK_EQ(key_snd.sizes(), value_snd.sizes());
+  CHECK_EQ(slot_mapping_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(slot_mapping_i32.dim(), 1);
+  CHECK_EQ(slot_mapping_i32.size(0), key_snd.size(0));
+  reshape_paged_cache(slot_mapping_i32.contiguous(),
+                      key_snd.contiguous(),
+                      value_snd.contiguous(),
+                      key_cache,
+                      value_cache);
+}
+
 std::vector<int32_t> make_block_table_host(int64_t block_count) {
   std::vector<int32_t> table(static_cast<size_t>(block_count));
   for (int64_t i = 0; i < block_count; ++i) {
@@ -1274,6 +1314,90 @@ torch::Tensor run_fused_no_match(const torch::Tensor& query,
   return output;
 }
 
+torch::Tensor run_fused_partial_rt(const torch::Tensor& query,
+                                   const torch::Tensor& key,
+                                   const torch::Tensor& value,
+                                   torch::Tensor& key_cache,
+                                   torch::Tensor& value_cache,
+                                   const torch::Tensor& block_table_row,
+                                   const torch::Tensor& slot_mapping,
+                                   int64_t block_size,
+                                   int64_t matched_prefix_len,
+                                   int64_t realtime_unmatched_len,
+                                   int64_t target_len,
+                                   double sm_scale,
+                                   MTGRAttentionTestMetrics* metrics) {
+  CHECK_EQ(query.dim(), 3);
+  CHECK_EQ(key.dim(), 3);
+  CHECK_EQ(value.dim(), 3);
+  CHECK_EQ(query.size(0), realtime_unmatched_len + target_len);
+  CHECK_EQ(key.sizes(), value.sizes());
+  CHECK_EQ(query.sizes(), key.sizes());
+  CHECK_EQ(block_table_row.dim(), 1);
+  CHECK_EQ(slot_mapping.dim(), 1);
+  CHECK_GE(slot_mapping.size(0), query.size(0));
+
+  auto rt_key = key.narrow(0, 0, realtime_unmatched_len).contiguous();
+  auto rt_value = value.narrow(0, 0, realtime_unmatched_len).contiguous();
+
+  auto timeline = build_fused_partial_rt_timeline();
+  prepare_timeline_events(&timeline);
+  auto wall_start = std::chrono::steady_clock::now();
+
+  constexpr size_t kFusedIdx = 0;
+  constexpr size_t kFusedUpdateIdx = 1;
+
+  auto output = torch::empty_like(query);
+  auto target_hcr_lse = torch::empty(
+      {target_len, query.size(1), 1},
+      torch::TensorOptions().dtype(torch::kFloat32).device(query.device()));
+  (void)slot_mapping;
+
+  record_stage_begin_if_needed(&timeline[kFusedIdx], query.device());
+  mtgr_fused_partial_rt_attention_cuda(query,
+                                       rt_key,
+                                       rt_value,
+                                       key_cache,
+                                       value_cache,
+                                       block_table_row,
+                                       block_size,
+                                       matched_prefix_len,
+                                       realtime_unmatched_len,
+                                       target_len,
+                                       sm_scale,
+                                       output,
+                                       target_hcr_lse);
+  record_stage_end_if_needed(&timeline[kFusedIdx], query.device());
+
+  record_stage_begin_if_needed(&timeline[kFusedUpdateIdx], query.device());
+  auto target_query = query.narrow(0, realtime_unmatched_len, target_len);
+  auto target_key = key.narrow(0, realtime_unmatched_len, target_len);
+  auto target_value = value.narrow(0, realtime_unmatched_len, target_len);
+  auto target_output = output.narrow(0, realtime_unmatched_len, target_len);
+  merge_target_diag_attention_into(
+      output.narrow(0, realtime_unmatched_len, target_len),
+      target_hcr_lse,
+      target_query,
+      target_key,
+      target_value,
+      sm_scale,
+      target_output);
+  record_stage_end_if_needed(&timeline[kFusedUpdateIdx], query.device());
+
+  auto summary = collect_timeline_summary(&timeline);
+  auto wall_end = std::chrono::steady_clock::now();
+  if (metrics != nullptr) {
+    metrics->device_total_ms = summary.total_ms;
+    metrics->wall_total_ms =
+        std::chrono::duration<double, std::milli>(wall_end - wall_start)
+            .count();
+    metrics->workspace_ms = 0.0;
+    fill_stage_metrics(timeline, summary, metrics);
+  }
+  release_timeline_events(&timeline);
+  return output;
+}
+
 }  // namespace
 
 MTGRAttentionImplTest::MTGRAttentionImplTest(int64_t num_heads,
@@ -1365,17 +1489,15 @@ MTGRAttentionImplTest::forward(
     CHECK_GT(realtime_unmatched, 0);
     CHECK_EQ(q_len, realtime_unmatched + t);
     CHECK(attn_metadata.block_table.defined());
+    CHECK(attn_metadata.slot_mapping.defined());
     CHECK_EQ(attn_metadata.block_table.dim(), 2);
     CHECK_GE(attn_metadata.block_table.size(0), 1);
     CHECK(!kv_cache.empty());
-    if (backend_ == MTGRAttentionTestBackend::kFusedNoMatch) {
-      CHECK(false) << "MTGR fused no-match kernel currently supports only "
-                      "matched_prefix == 0";
-    }
     const int64_t block_size = static_cast<int64_t>(FLAGS_block_size);
     auto key_cache = kv_cache.get_k_cache();
     auto value_cache = kv_cache.get_v_cache();
     auto block_table_row = attn_metadata.block_table.select(0, 0).contiguous();
+    auto slot_mapping = attn_metadata.slot_mapping.contiguous();
     if (backend_ == MTGRAttentionTestBackend::kOneStage) {
       output_snd = run_one_stage_partial_rt(query_snd,
                                             key_snd,
@@ -1389,6 +1511,20 @@ MTGRAttentionImplTest::forward(
                                             t,
                                             scale_,
                                             &last_metrics_);
+    } else if (backend_ == MTGRAttentionTestBackend::kFusedNoMatch) {
+      output_snd = run_fused_partial_rt(query_snd,
+                                        key_snd,
+                                        value_snd,
+                                        key_cache,
+                                        value_cache,
+                                        block_table_row,
+                                        slot_mapping,
+                                        block_size,
+                                        matched,
+                                        realtime_unmatched,
+                                        t,
+                                        scale_,
+                                        &last_metrics_);
     } else {
       output_snd = run_multi_partial_rt(query_snd,
                                         key_snd,
@@ -1505,20 +1641,67 @@ void prefill_mtgr_matched_prefix_cache(const torch::Tensor& full_key_bsnd,
 std::vector<MTGRAttentionTestShape> build_mtgr_sweep_shapes(
     bool full_sweep,
     bool partial_match) {
-  const std::vector<int64_t> heads_all =
-      full_sweep ? std::vector<int64_t>{4, 8, 16} : std::vector<int64_t>{8};
-  const std::vector<int64_t> head_dims_all =
+  const std::vector<int64_t> default_heads_all =
+      full_sweep ? std::vector<int64_t>{4, 8, 12} : std::vector<int64_t>{8};
+  const std::vector<int64_t> default_head_dims_all =
       full_sweep ? std::vector<int64_t>{32, 64, 128}
                  : std::vector<int64_t>{128};
-  const std::vector<int64_t> histories_all =
+  const std::vector<int64_t> default_histories_all =
       full_sweep ? std::vector<int64_t>{1024, 2048, 4096}
                  : std::vector<int64_t>{2048};
-  const std::vector<int64_t> realtime_all =
+  const std::vector<int64_t> default_realtime_all =
       full_sweep ? std::vector<int64_t>{128, 256, 512}
                  : std::vector<int64_t>{512};
-  const std::vector<int64_t> targets_all =
+  const std::vector<int64_t> default_targets_all =
       full_sweep ? std::vector<int64_t>{800, 1600, 2400}
                  : std::vector<int64_t>{1600};
+
+  const auto parse_env_int_list =
+      [](const char* name) -> std::optional<std::vector<int64_t>> {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+      return std::nullopt;
+    }
+    std::vector<int64_t> parsed;
+    std::string token;
+    std::stringstream ss(value);
+    while (std::getline(ss, token, ',')) {
+      token.erase(
+          std::remove_if(token.begin(),
+                         token.end(),
+                         [](unsigned char ch) { return std::isspace(ch); }),
+          token.end());
+      if (token.empty()) {
+        continue;
+      }
+      char* end = nullptr;
+      const long long v = std::strtoll(token.c_str(), &end, 10);
+      if (end == token.c_str() || *end != '\0') {
+        return std::nullopt;
+      }
+      parsed.push_back(static_cast<int64_t>(v));
+    }
+    if (parsed.empty()) {
+      return std::nullopt;
+    }
+    return parsed;
+  };
+
+  const std::vector<int64_t> heads_all =
+      parse_env_int_list("XLLM_MTGR_ATTENTION_SWEEP_HEADS")
+          .value_or(default_heads_all);
+  const std::vector<int64_t> head_dims_all =
+      parse_env_int_list("XLLM_MTGR_ATTENTION_SWEEP_HEAD_DIMS")
+          .value_or(default_head_dims_all);
+  const std::vector<int64_t> histories_all =
+      parse_env_int_list("XLLM_MTGR_ATTENTION_SWEEP_HISTORIES")
+          .value_or(default_histories_all);
+  const std::vector<int64_t> realtime_all =
+      parse_env_int_list("XLLM_MTGR_ATTENTION_SWEEP_REALTIME")
+          .value_or(default_realtime_all);
+  const std::vector<int64_t> targets_all =
+      parse_env_int_list("XLLM_MTGR_ATTENTION_SWEEP_TARGETS")
+          .value_or(default_targets_all);
 
   std::vector<MTGRAttentionTestShape> cases;
   for (int64_t heads : heads_all) {

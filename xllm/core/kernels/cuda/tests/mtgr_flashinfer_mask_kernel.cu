@@ -16,6 +16,7 @@ limitations under the License.
 #include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
@@ -209,6 +210,71 @@ __global__ void merge_target_diag_attention_warp_kernel(
   }
 }
 
+template <int kHeadDim, int kWarpsPerBlock>
+__global__ void merge_target_diag_attention_warp_half2_kernel(
+    const half* __restrict__ hcr_out,
+    const float* __restrict__ hcr_lse,
+    const half* __restrict__ target_query,
+    const half* __restrict__ target_key,
+    const half* __restrict__ target_value,
+    half* __restrict__ merged_out,
+    int64_t target_len,
+    int64_t num_heads,
+    float sm_scale_log2e) {
+  static_assert(kHeadDim == 64 || kHeadDim == 128);
+  constexpr int kHalf2PerRow = kHeadDim / 2;
+
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int64_t row =
+      (static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock) + warp_id;
+  const int64_t num_rows = target_len * num_heads;
+  if (row >= num_rows) {
+    return;
+  }
+
+  const int64_t base = row * kHeadDim;
+  const half2* hcr_out_h2 = reinterpret_cast<const half2*>(hcr_out + base);
+  const half2* target_query_h2 =
+      reinterpret_cast<const half2*>(target_query + base);
+  const half2* target_key_h2 =
+      reinterpret_cast<const half2*>(target_key + base);
+  const half2* target_value_h2 =
+      reinterpret_cast<const half2*>(target_value + base);
+  half2* merged_out_h2 = reinterpret_cast<half2*>(merged_out + base);
+
+  float dot = 0.0f;
+  for (int idx = lane; idx < kHalf2PerRow; idx += 32) {
+    const float2 q = __half22float2(target_query_h2[idx]);
+    const float2 k = __half22float2(target_key_h2[idx]);
+    dot += q.x * k.x + q.y * k.y;
+  }
+  dot = warp_reduce_sum(dot);
+
+  float hcr_weight = 0.0f;
+  float diag_weight = 0.0f;
+  if (lane == 0) {
+    const float diag_lse = dot * sm_scale_log2e;
+    const float hcr_lse_v = hcr_lse[row];
+    const float m = fmaxf(hcr_lse_v, diag_lse);
+    const float wh = exp2f(hcr_lse_v - m);
+    const float wd = exp2f(diag_lse - m);
+    const float inv_denom = 1.0f / (wh + wd);
+    hcr_weight = wh * inv_denom;
+    diag_weight = wd * inv_denom;
+  }
+  hcr_weight = __shfl_sync(0xffffffff, hcr_weight, 0);
+  diag_weight = __shfl_sync(0xffffffff, diag_weight, 0);
+
+  for (int idx = lane; idx < kHalf2PerRow; idx += 32) {
+    const float2 h = __half22float2(hcr_out_h2[idx]);
+    const float2 v = __half22float2(target_value_h2[idx]);
+    merged_out_h2[idx] =
+        __float22half2_rn(make_float2(hcr_weight * h.x + diag_weight * v.x,
+                                      hcr_weight * h.y + diag_weight * v.y));
+  }
+}
+
 }  // namespace
 
 namespace xllm::kernel::cuda::test {
@@ -371,21 +437,51 @@ void merge_target_diag_attention_cuda(const torch::Tensor& hcr_out_snd,
   constexpr double kLog2E = 1.4426950408889634;
   const float sm_scale_log2e = static_cast<float>(sm_scale * kLog2E);
 
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      hcr_out_snd.scalar_type(), "merge_target_diag_attention_cuda", [&] {
-        merge_target_diag_attention_warp_kernel<scalar_t, kWarpsPerBlock>
-            <<<blocks, threads, 0, stream>>>(
-                hcr_out_snd.data_ptr<scalar_t>(),
-                hcr_lse_sh1.data_ptr<float>(),
-                target_query_snd.data_ptr<scalar_t>(),
-                target_key_snd.data_ptr<scalar_t>(),
-                target_value_snd.data_ptr<scalar_t>(),
-                merged_out_snd.data_ptr<scalar_t>(),
-                target_len,
-                num_heads,
-                head_dim,
-                sm_scale_log2e);
-      });
+  if (hcr_out_snd.scalar_type() == torch::kFloat16 && head_dim == 64) {
+    merge_target_diag_attention_warp_half2_kernel<64, kWarpsPerBlock>
+        <<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const half*>(hcr_out_snd.data_ptr<at::Half>()),
+            hcr_lse_sh1.data_ptr<float>(),
+            reinterpret_cast<const half*>(
+                target_query_snd.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(target_key_snd.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(
+                target_value_snd.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(merged_out_snd.data_ptr<at::Half>()),
+            target_len,
+            num_heads,
+            sm_scale_log2e);
+  } else if (hcr_out_snd.scalar_type() == torch::kFloat16 && head_dim == 128) {
+    merge_target_diag_attention_warp_half2_kernel<128, kWarpsPerBlock>
+        <<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const half*>(hcr_out_snd.data_ptr<at::Half>()),
+            hcr_lse_sh1.data_ptr<float>(),
+            reinterpret_cast<const half*>(
+                target_query_snd.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(target_key_snd.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(
+                target_value_snd.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(merged_out_snd.data_ptr<at::Half>()),
+            target_len,
+            num_heads,
+            sm_scale_log2e);
+  } else {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        hcr_out_snd.scalar_type(), "merge_target_diag_attention_cuda", [&] {
+          merge_target_diag_attention_warp_kernel<scalar_t, kWarpsPerBlock>
+              <<<blocks, threads, 0, stream>>>(
+                  hcr_out_snd.data_ptr<scalar_t>(),
+                  hcr_lse_sh1.data_ptr<float>(),
+                  target_query_snd.data_ptr<scalar_t>(),
+                  target_key_snd.data_ptr<scalar_t>(),
+                  target_value_snd.data_ptr<scalar_t>(),
+                  merged_out_snd.data_ptr<scalar_t>(),
+                  target_len,
+                  num_heads,
+                  head_dim,
+                  sm_scale_log2e);
+        });
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
