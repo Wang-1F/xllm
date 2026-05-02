@@ -25,15 +25,23 @@ limitations under the License.
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <limits>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "core/common/global_flags.h"
+#include "layers/cuda/mtgr_attention.h"
 #include "mtgr_attenion_test.h"
 
 namespace xllm::kernel::cuda::test {
+
+using LayerMTGRAttentionBackend = xllm::layer::MTGRAttentionBackend;
+using LayerMTGRAttentionImpl = xllm::layer::MTGRAttentionImpl;
+using LayerMTGRAttentionMetrics = xllm::layer::MTGRAttentionMetrics;
 
 void mtgr_fused_no_match_attention_cuda(const torch::Tensor& query_snd,
                                         const torch::Tensor& key_snd,
@@ -51,15 +59,15 @@ namespace {
 constexpr int64_t kBlockSize = 128;
 
 struct AvgMetrics {
-  MTGRAttentionTestMetrics one;
-  MTGRAttentionTestMetrics multi;
+  LayerMTGRAttentionMetrics one;
+  LayerMTGRAttentionMetrics multi;
   double diff_max_abs = 0.0;
   double diff_mean_abs = 0.0;
 };
 
 struct CompareMetrics {
-  MTGRAttentionTestMetrics base;
-  MTGRAttentionTestMetrics candidate;
+  LayerMTGRAttentionMetrics base;
+  LayerMTGRAttentionMetrics candidate;
   double diff_max_abs = 0.0;
   double diff_mean_abs = 0.0;
 };
@@ -82,7 +90,7 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
                        int warmup,
                        int repeat) {
     const auto cmp = run_shape_vs_backend(
-        shape, warmup, repeat, MTGRAttentionTestBackend::kMultiStage);
+        shape, warmup, repeat, LayerMTGRAttentionBackend::kMultiStage);
     AvgMetrics avg;
     avg.one = cmp.base;
     avg.multi = cmp.candidate;
@@ -95,7 +103,7 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
       const MTGRAttentionTestShape& shape,
       int warmup,
       int repeat,
-      MTGRAttentionTestBackend candidate_backend) {
+      LayerMTGRAttentionBackend candidate_backend) {
     auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
     const int64_t total = shape.total_len();
     const int64_t local = shape.local_len();
@@ -131,12 +139,12 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
     prefill_mtgr_matched_prefix_cache(
         full_key, full_value, shape, kBlockSize, multi_cache);
 
-    MTGRAttentionImplTest one_stage(shape.heads,
-                                    shape.head_dim,
-                                    scale,
-                                    shape.kv_heads,
-                                    MTGRAttentionTestBackend::kOneStage);
-    MTGRAttentionImplTest multi_stage(
+    LayerMTGRAttentionImpl one_stage(shape.heads,
+                                     shape.head_dim,
+                                     scale,
+                                     shape.kv_heads,
+                                     LayerMTGRAttentionBackend::kOneStage);
+    LayerMTGRAttentionImpl multi_stage(
         shape.heads, shape.head_dim, scale, shape.kv_heads, candidate_backend);
 
     for (int i = 0; i < warmup; ++i) {
@@ -208,7 +216,7 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
     return avg;
   }
 
-  MTGRAttentionTestMetrics run_shape_fused_only(
+  LayerMTGRAttentionMetrics run_shape_fused_only(
       const MTGRAttentionTestShape& shape,
       int warmup,
       int repeat) {
@@ -241,18 +249,18 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
     auto kv_cache =
         make_mtgr_kv_cache(shape, device_, torch::kFloat16, kBlockSize);
 
-    MTGRAttentionImplTest fused(shape.heads,
-                                shape.head_dim,
-                                scale,
-                                shape.kv_heads,
-                                MTGRAttentionTestBackend::kFusedNoMatch);
+    LayerMTGRAttentionImpl fused(shape.heads,
+                                 shape.head_dim,
+                                 scale,
+                                 shape.kv_heads,
+                                 LayerMTGRAttentionBackend::kFused);
 
     for (int i = 0; i < warmup; ++i) {
       (void)std::get<0>(fused.forward(metadata, query, key, value, kv_cache));
     }
     CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-    MTGRAttentionTestMetrics avg;
+    LayerMTGRAttentionMetrics avg;
     for (int i = 0; i < repeat; ++i) {
       auto output =
           std::get<0>(fused.forward(metadata, query, key, value, kv_cache));
@@ -285,7 +293,7 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
     return avg;
   }
 
-  MTGRAttentionTestMetrics run_shape_fused_main_kernel_only(
+  LayerMTGRAttentionMetrics run_shape_fused_main_kernel_only(
       const MTGRAttentionTestShape& shape,
       int warmup,
       int repeat) {
@@ -328,8 +336,9 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
     }
     CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-    MTGRAttentionTestMetrics avg;
-    avg.stages = {MTGRStageMetric{.name = "mtgr_fused_no_match_attention"}};
+    LayerMTGRAttentionMetrics avg;
+    avg.stages = {
+        xllm::layer::MTGRStageMetric{.name = "mtgr_fused_no_match_attention"}};
     for (int i = 0; i < repeat; ++i) {
       const auto wall_start = std::chrono::steady_clock::now();
       CHECK_EQ(cudaEventRecord(ev_start, stream), cudaSuccess);
@@ -368,8 +377,9 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
   torch::Device device_ = torch::Device(torch::kCPU);
 };
 
-const MTGRStageMetric* find_stage(const MTGRAttentionTestMetrics& metrics,
-                                  const char* name) {
+const xllm::layer::MTGRStageMetric* find_stage(
+    const LayerMTGRAttentionMetrics& metrics,
+    const char* name) {
   for (const auto& stage : metrics.stages) {
     if (stage.name == name) {
       return &stage;
@@ -378,13 +388,13 @@ const MTGRStageMetric* find_stage(const MTGRAttentionTestMetrics& metrics,
   return nullptr;
 }
 
-double stage_workspace(const MTGRAttentionTestMetrics& metrics,
+double stage_workspace(const LayerMTGRAttentionMetrics& metrics,
                        const char* name) {
   const auto* stage = find_stage(metrics, name);
   return stage != nullptr ? stage->workspace_ms : 0.0;
 }
 
-double stage_exec(const MTGRAttentionTestMetrics& metrics, const char* name) {
+double stage_exec(const LayerMTGRAttentionMetrics& metrics, const char* name) {
   const auto* stage = find_stage(metrics, name);
   return stage != nullptr ? stage->exec_ms : 0.0;
 }
@@ -694,7 +704,7 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, FusedNoMatchSweepCsv) {
     CompareMetrics avg;
     try {
       avg = run_shape_vs_backend(
-          shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+          shape, warmup, repeat, LayerMTGRAttentionBackend::kFused);
     } catch (const std::exception& e) {
       ++skipped;
       std::fprintf(
@@ -814,10 +824,10 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
   for (const auto& shape : cases) {
     ++idx;
     CompareMetrics avg;
-    MTGRAttentionTestMetrics no_match_fused;
+    LayerMTGRAttentionMetrics no_match_fused;
     try {
       avg = run_shape_vs_backend(
-          shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+          shape, warmup, repeat, LayerMTGRAttentionBackend::kFused);
       no_match_fused = run_shape_fused_only(
           make_no_match_counterpart(shape), warmup, repeat);
     } catch (const std::exception& e) {
@@ -1295,7 +1305,7 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
     ++idx;
     try {
       const auto avg = run_shape_vs_backend(
-          shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+          shape, warmup, repeat, LayerMTGRAttentionBackend::kFused);
       const auto no_match_fused = run_shape_fused_only(
           make_no_match_counterpart(shape), warmup, repeat);
       const double base_mask_build_plus_device_ms =
@@ -1505,16 +1515,10 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
     ++idx;
     try {
       const auto no_match_shape = make_no_match_counterpart(partial_shape);
-      const auto no_match =
-          run_shape_vs_backend(no_match_shape,
-                               warmup,
-                               repeat,
-                               MTGRAttentionTestBackend::kFusedNoMatch);
-      const auto partial =
-          run_shape_vs_backend(partial_shape,
-                               warmup,
-                               repeat,
-                               MTGRAttentionTestBackend::kFusedNoMatch);
+      const auto no_match = run_shape_vs_backend(
+          no_match_shape, warmup, repeat, LayerMTGRAttentionBackend::kFused);
+      const auto partial = run_shape_vs_backend(
+          partial_shape, warmup, repeat, LayerMTGRAttentionBackend::kFused);
 
       const double full_base_total_ms = no_match.base.device_total_ms;
       const double no_match_speedup_dev =
@@ -1683,7 +1687,7 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, OneVsFusedNoMatchHotShape) {
   shape.matched_prefix = 0;
 
   const auto avg = run_shape_vs_backend(
-      shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+      shape, warmup, repeat, LayerMTGRAttentionBackend::kFused);
   const double base_mask_build_plus_device_ms =
       avg.base.mask_build_ms + avg.base.device_total_ms;
   const double speedup_dev =
@@ -1742,7 +1746,7 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, OneVsFusedNoMatchHd64HotShape) {
   shape.matched_prefix = 0;
 
   const auto avg = run_shape_vs_backend(
-      shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+      shape, warmup, repeat, LayerMTGRAttentionBackend::kFused);
   const double base_mask_build_plus_device_ms =
       avg.base.mask_build_ms + avg.base.device_total_ms;
   const double speedup_dev =
@@ -1802,7 +1806,7 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
   shape.matched_prefix = shape.history + shape.context + 409;
 
   const auto avg = run_shape_vs_backend(
-      shape, warmup, repeat, MTGRAttentionTestBackend::kFusedNoMatch);
+      shape, warmup, repeat, LayerMTGRAttentionBackend::kFused);
   const auto no_match_fused =
       run_shape_fused_only(make_no_match_counterpart(shape), warmup, repeat);
   const double base_mask_build_plus_device_ms =
@@ -1853,6 +1857,330 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
                  stage.workspace_ms,
                  stage.exec_ms,
                  stage.host_submit_ms);
+  }
+  std::fflush(stderr);
+}
+
+namespace {
+
+struct MultiBatchProbeSequence {
+  MTGRAttentionTestShape shape;
+  torch::Tensor query;
+  torch::Tensor key;
+  torch::Tensor value;
+  xllm::layer::AttentionMetadata metadata;
+  xllm::KVCache one_cache;
+  xllm::KVCache fused_cache;
+  std::unique_ptr<LayerMTGRAttentionImpl> one_stage;
+  std::unique_ptr<LayerMTGRAttentionImpl> fused;
+};
+
+struct MultiBatchProbeMetrics {
+  double base_device_total_ms = 0.0;
+  double base_wall_total_ms = 0.0;
+  double fused_device_total_ms = 0.0;
+  double fused_wall_total_ms = 0.0;
+  double diff_max_abs = 0.0;
+  double diff_mean_abs = 0.0;
+};
+
+std::vector<int> parse_env_int_list_or_default(const char* name,
+                                               std::vector<int> defaults) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return defaults;
+  }
+  std::vector<int> parsed;
+  std::string token;
+  std::stringstream ss(value);
+  while (std::getline(ss, token, ',')) {
+    token.erase(
+        std::remove_if(token.begin(),
+                       token.end(),
+                       [](unsigned char ch) { return std::isspace(ch); }),
+        token.end());
+    if (token.empty()) {
+      continue;
+    }
+    char* end = nullptr;
+    const long v = std::strtol(token.c_str(), &end, 10);
+    if (end == token.c_str() || *end != '\0' || v <= 0) {
+      return defaults;
+    }
+    parsed.push_back(static_cast<int>(v));
+  }
+  return parsed.empty() ? defaults : parsed;
+}
+
+MTGRAttentionTestShape sample_probe_shape(std::mt19937_64* rng,
+                                          bool partial_match) {
+  CHECK(rng != nullptr);
+  const std::vector<int64_t> heads_all = {4, 8, 12};
+  const std::vector<int64_t> head_dims_all = {64, 128};
+  std::uniform_int_distribution<int> heads_dist(
+      0, static_cast<int>(heads_all.size() - 1));
+  std::uniform_int_distribution<int> head_dim_dist(
+      0, static_cast<int>(head_dims_all.size() - 1));
+
+  MTGRAttentionTestShape shape;
+  shape.heads = heads_all[heads_dist(*rng)];
+  shape.kv_heads = shape.heads;
+  shape.head_dim = head_dims_all[head_dim_dist(*rng)];
+  shape.history = sample_non_aligned_len(rng, 1350, 4096);
+  shape.context = 8;
+  shape.realtime = sample_non_aligned_len(rng, 100, 600);
+  shape.target = sample_non_aligned_len(rng, 800, 2400);
+  shape.matched_prefix =
+      partial_match ? shape.history + shape.context + (shape.realtime * 4) / 5
+                    : 0;
+  return shape;
+}
+
+MultiBatchProbeSequence make_probe_sequence(const MTGRAttentionTestShape& shape,
+                                            const torch::Device& device) {
+  auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device);
+  const int64_t total = shape.total_len();
+  const int64_t local = shape.local_len();
+  const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
+
+  auto full_query =
+      torch::randn({1, total, shape.heads, shape.head_dim}, opts) * 0.05;
+  auto full_key =
+      torch::randn({1, total, shape.kv_heads, shape.head_dim}, opts) * 0.05;
+  auto full_value =
+      torch::randn({1, total, shape.kv_heads, shape.head_dim}, opts) * 0.05;
+
+  MultiBatchProbeSequence seq;
+  seq.shape = shape;
+  seq.query = full_query.select(0, 0)
+                  .narrow(0, shape.matched_prefix, local)
+                  .contiguous()
+                  .view({local, shape.heads * shape.head_dim});
+  seq.key = full_key.select(0, 0)
+                .narrow(0, shape.matched_prefix, local)
+                .contiguous()
+                .view({local, shape.kv_heads * shape.head_dim});
+  seq.value = full_value.select(0, 0)
+                  .narrow(0, shape.matched_prefix, local)
+                  .contiguous()
+                  .view({local, shape.kv_heads * shape.head_dim});
+  seq.metadata = make_mtgr_attention_metadata(shape, device, kBlockSize);
+  seq.one_cache =
+      make_mtgr_kv_cache(shape, device, torch::kFloat16, kBlockSize);
+  seq.fused_cache =
+      make_mtgr_kv_cache(shape, device, torch::kFloat16, kBlockSize);
+  prefill_mtgr_matched_prefix_cache(
+      full_key, full_value, shape, kBlockSize, seq.one_cache);
+  prefill_mtgr_matched_prefix_cache(
+      full_key, full_value, shape, kBlockSize, seq.fused_cache);
+  seq.one_stage = std::make_unique<LayerMTGRAttentionImpl>(
+      shape.heads,
+      shape.head_dim,
+      scale,
+      shape.kv_heads,
+      LayerMTGRAttentionBackend::kOneStage);
+  seq.fused = std::make_unique<LayerMTGRAttentionImpl>(
+      shape.heads,
+      shape.head_dim,
+      scale,
+      shape.kv_heads,
+      LayerMTGRAttentionBackend::kFused);
+  return seq;
+}
+
+MultiBatchProbeMetrics run_wrapper_loop_batch(
+    std::vector<MultiBatchProbeSequence>* batch,
+    int warmup,
+    int repeat) {
+  CHECK(batch != nullptr);
+  CHECK(!batch->empty());
+  for (int i = 0; i < warmup; ++i) {
+    for (auto& seq : *batch) {
+      (void)std::get<0>(seq.one_stage->forward(
+          seq.metadata, seq.query, seq.key, seq.value, seq.one_cache));
+    }
+    for (auto& seq : *batch) {
+      (void)std::get<0>(seq.fused->forward(
+          seq.metadata, seq.query, seq.key, seq.value, seq.fused_cache));
+    }
+  }
+  CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  MultiBatchProbeMetrics avg;
+  for (int i = 0; i < repeat; ++i) {
+    std::vector<torch::Tensor> base_outputs;
+    std::vector<torch::Tensor> fused_outputs;
+    base_outputs.reserve(batch->size());
+    fused_outputs.reserve(batch->size());
+
+    auto base_wall_start = std::chrono::steady_clock::now();
+    double base_device_ms = 0.0;
+    for (auto& seq : *batch) {
+      auto output = std::get<0>(seq.one_stage->forward(
+          seq.metadata, seq.query, seq.key, seq.value, seq.one_cache));
+      const auto metrics = seq.one_stage->last_metrics();
+      base_device_ms += metrics.device_total_ms;
+      base_outputs.push_back(output);
+    }
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    const double base_wall_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - base_wall_start)
+            .count();
+
+    auto fused_wall_start = std::chrono::steady_clock::now();
+    double fused_device_ms = 0.0;
+    for (auto& seq : *batch) {
+      auto output = std::get<0>(seq.fused->forward(
+          seq.metadata, seq.query, seq.key, seq.value, seq.fused_cache));
+      const auto metrics = seq.fused->last_metrics();
+      fused_device_ms += metrics.device_total_ms;
+      fused_outputs.push_back(output);
+    }
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    const double fused_wall_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - fused_wall_start)
+            .count();
+
+    double diff_max = 0.0;
+    double diff_sum = 0.0;
+    int64_t diff_count = 0;
+    for (size_t s = 0; s < batch->size(); ++s) {
+      auto diff = (base_outputs[s].to(torch::kFloat32) -
+                   fused_outputs[s].to(torch::kFloat32))
+                      .abs();
+      diff_max = std::max(diff_max, diff.max().item<double>());
+      diff_sum += diff.sum().item<double>();
+      diff_count += diff.numel();
+    }
+
+    avg.base_device_total_ms += base_device_ms;
+    avg.base_wall_total_ms += base_wall_ms;
+    avg.fused_device_total_ms += fused_device_ms;
+    avg.fused_wall_total_ms += fused_wall_ms;
+    avg.diff_max_abs = std::max(avg.diff_max_abs, diff_max);
+    avg.diff_mean_abs +=
+        diff_count > 0 ? diff_sum / static_cast<double>(diff_count) : 0.0;
+  }
+
+  const double inv = 1.0 / static_cast<double>(repeat);
+  avg.base_device_total_ms *= inv;
+  avg.base_wall_total_ms *= inv;
+  avg.fused_device_total_ms *= inv;
+  avg.fused_wall_total_ms *= inv;
+  avg.diff_mean_abs *= inv;
+  return avg;
+}
+
+}  // namespace
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest, MultiBatchWrapperLoopProbeCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 2));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 5));
+  const int group_count =
+      std::max(1, env_int("XLLM_MTGR_ATTENTION_MULTI_BATCH_GROUPS", 20));
+  const int seed = env_int("XLLM_MTGR_ATTENTION_MULTI_BATCH_SEED", 20260502);
+  const auto batch_sizes = parse_env_int_list_or_default(
+      "XLLM_MTGR_ATTENTION_MULTI_BATCH_SIZES", {1, 2, 4, 8});
+  const std::string csv_path =
+      csv_path_from_env("XLLM_MTGR_ATTENTION_MULTI_BATCH_WRAPPER_CSV",
+                        "mtgr_attention_multi_batch_wrapper_probe.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+  csv << "branch,batch_size,group_id,base_device_total_ms,base_wall_total_ms,"
+         "fused_device_total_ms,fused_wall_total_ms,speedup_dev,speedup_wall,"
+         "delta_dev_ms,delta_wall_ms,diff_max_abs,diff_mean_abs\n";
+
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][MultiBatchWrapperLoop] groups=%d warmup=%d "
+               "repeat=%d seed=%d csv=%s\n",
+               group_count,
+               warmup,
+               repeat,
+               seed,
+               csv_path.c_str());
+
+  for (bool partial_match : {false, true}) {
+    const char* branch = partial_match ? "partial_rt" : "no_match";
+    for (int batch_size : batch_sizes) {
+      std::mt19937_64 rng(static_cast<uint64_t>(seed) ^
+                          (static_cast<uint64_t>(batch_size) << 16) ^
+                          (partial_match ? 0x9e3779b97f4a7c15ULL : 0ULL));
+      double total_base_device = 0.0;
+      double total_fused_device = 0.0;
+      double total_speedup_dev = 0.0;
+      double min_speedup_dev = std::numeric_limits<double>::infinity();
+      double max_speedup_dev = 0.0;
+      int regressions = 0;
+
+      for (int group_id = 1; group_id <= group_count; ++group_id) {
+        std::vector<MultiBatchProbeSequence> batch;
+        batch.reserve(static_cast<size_t>(batch_size));
+        for (int i = 0; i < batch_size; ++i) {
+          batch.push_back(make_probe_sequence(
+              sample_probe_shape(&rng, partial_match), device_));
+        }
+
+        const auto avg = run_wrapper_loop_batch(&batch, warmup, repeat);
+        const double speedup_dev =
+            avg.base_device_total_ms / avg.fused_device_total_ms;
+        const double speedup_wall =
+            avg.base_wall_total_ms / avg.fused_wall_total_ms;
+        const double delta_dev =
+            avg.base_device_total_ms - avg.fused_device_total_ms;
+        const double delta_wall =
+            avg.base_wall_total_ms - avg.fused_wall_total_ms;
+        if (speedup_dev < 1.0) {
+          ++regressions;
+        }
+        total_base_device += avg.base_device_total_ms;
+        total_fused_device += avg.fused_device_total_ms;
+        total_speedup_dev += speedup_dev;
+        min_speedup_dev = std::min(min_speedup_dev, speedup_dev);
+        max_speedup_dev = std::max(max_speedup_dev, speedup_dev);
+
+        csv << branch << "," << batch_size << "," << group_id << ","
+            << std::fixed << std::setprecision(6) << avg.base_device_total_ms
+            << "," << avg.base_wall_total_ms << "," << avg.fused_device_total_ms
+            << "," << avg.fused_wall_total_ms << "," << speedup_dev << ","
+            << speedup_wall << "," << delta_dev << "," << delta_wall << ","
+            << std::scientific << std::setprecision(6) << avg.diff_max_abs
+            << "," << avg.diff_mean_abs << "\n";
+        csv.flush();
+
+        std::fprintf(stderr,
+                     "[MTGR][CUDA][Perf][MultiBatchWrapperLoop %s B=%d "
+                     "%d/%d] base_device=%.6f fused_device=%.6f "
+                     "speedup=%.6f diff_max=%.6e\n",
+                     branch,
+                     batch_size,
+                     group_id,
+                     group_count,
+                     avg.base_device_total_ms,
+                     avg.fused_device_total_ms,
+                     speedup_dev,
+                     avg.diff_max_abs);
+      }
+
+      const double inv = 1.0 / static_cast<double>(group_count);
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][MultiBatchWrapperLoop][Summary] "
+                   "branch=%s batch_size=%d groups=%d regressions=%d "
+                   "avg_base_device_ms=%.6f avg_fused_device_ms=%.6f "
+                   "avg_speedup_dev=%.6f min_speedup_dev=%.6f "
+                   "max_speedup_dev=%.6f\n",
+                   branch,
+                   batch_size,
+                   group_count,
+                   regressions,
+                   total_base_device * inv,
+                   total_fused_device * inv,
+                   total_speedup_dev * inv,
+                   min_speedup_dev,
+                   max_speedup_dev);
+    }
   }
   std::fflush(stderr);
 }

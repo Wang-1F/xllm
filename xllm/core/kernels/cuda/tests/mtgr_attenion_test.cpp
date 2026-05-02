@@ -496,7 +496,8 @@ void launch_prefill_with_optional_packed_custom_mask(
         to_ffi_tensor(output_snd),
         output_lse.has_value() ? to_ffi_tensor(output_lse.value())
                                : ffi::Optional<ffi::Tensor>(),
-        /*mask_mode_code=*/causal ? 1 : 0,
+        /*mask_mode_code=*/packed_custom_mask.has_value() ? 2
+                                                          : (causal ? 1 : 0),
         /*kv_layout_code=*/0,
         /*window_left=*/-1,
         support_pdl(),

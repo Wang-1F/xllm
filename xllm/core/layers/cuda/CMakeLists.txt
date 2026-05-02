@@ -8,6 +8,7 @@ cc_library(
     attention.h
     base_attention_impl.h
     flashinfer_attention.h
+    mtgr_attention.h
     xattention.h
     xattention_planinfo.h
     flashinfer_workspace.h
@@ -19,11 +20,13 @@ cc_library(
     xattention.cpp
     xattention_planinfo.cpp
     flashinfer_attention.cpp
+    mtgr_attention.cpp
     flashinfer_workspace.cpp
     xattention_workspace.cpp
     flashinfer_planinfo.cpp
   DEPS
     :common_layers
+    :cuda_mtgr_attention_runtime
 )
 
 cc_test(
