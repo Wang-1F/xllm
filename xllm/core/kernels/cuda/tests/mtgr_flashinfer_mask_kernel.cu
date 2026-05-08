@@ -275,6 +275,282 @@ __global__ void merge_target_diag_attention_warp_half2_kernel(
   }
 }
 
+template <typename scalar_t, int kWarpsPerBlock>
+__global__ void merge_target_diag_attention_batched_warp_kernel(
+    const scalar_t* __restrict__ hcr_out,
+    const float* __restrict__ hcr_lse,
+    const scalar_t* __restrict__ packed_query,
+    const scalar_t* __restrict__ packed_key,
+    const scalar_t* __restrict__ packed_value,
+    const int32_t* __restrict__ q_seq_starts,
+    const int32_t* __restrict__ history_lens,
+    const int32_t* __restrict__ context_lens,
+    const int32_t* __restrict__ realtime_lens,
+    const int32_t* __restrict__ target_lens,
+    const int32_t* __restrict__ target_seq_starts,
+    scalar_t* __restrict__ merged_out,
+    int64_t num_heads,
+    int64_t head_dim,
+    float sm_scale_log2e) {
+  const int batch_idx = static_cast<int>(blockIdx.z);
+  const int64_t target_len = static_cast<int64_t>(target_lens[batch_idx]);
+  const int64_t target_row =
+      static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
+  if (target_row >= target_len) {
+    return;
+  }
+
+  const int64_t q_base_row = static_cast<int64_t>(q_seq_starts[batch_idx]) +
+                             history_lens[batch_idx] + context_lens[batch_idx] +
+                             realtime_lens[batch_idx] + target_row;
+  const int64_t lse_row =
+      static_cast<int64_t>(target_seq_starts[batch_idx]) + target_row;
+  const int64_t head_idx = static_cast<int64_t>(blockIdx.y);
+  const int64_t lane = threadIdx.x & 31;
+  const int64_t base = (q_base_row * num_heads + head_idx) * head_dim;
+
+  float dot = 0.0f;
+  for (int64_t d = lane; d < head_dim; d += 32) {
+    dot += static_cast<float>(packed_query[base + d]) *
+           static_cast<float>(packed_key[base + d]);
+  }
+  dot = warp_reduce_sum(dot);
+
+  float hcr_weight = 0.0f;
+  float diag_weight = 0.0f;
+  if (lane == 0) {
+    const float diag_lse = dot * sm_scale_log2e;
+    const float hcr_lse_v = hcr_lse[lse_row * num_heads + head_idx];
+    const float m = fmaxf(hcr_lse_v, diag_lse);
+    const float wh = exp2f(hcr_lse_v - m);
+    const float wd = exp2f(diag_lse - m);
+    const float inv_denom = 1.0f / (wh + wd);
+    hcr_weight = wh * inv_denom;
+    diag_weight = wd * inv_denom;
+  }
+  hcr_weight = __shfl_sync(0xffffffff, hcr_weight, 0);
+  diag_weight = __shfl_sync(0xffffffff, diag_weight, 0);
+
+  for (int64_t d = lane; d < head_dim; d += 32) {
+    const float hcr_v = static_cast<float>(hcr_out[base + d]);
+    const float diag_v = static_cast<float>(packed_value[base + d]);
+    merged_out[base + d] =
+        static_cast<scalar_t>(hcr_weight * hcr_v + diag_weight * diag_v);
+  }
+}
+
+template <int kHeadDim, int kWarpsPerBlock>
+__global__ void merge_target_diag_attention_batched_warp_half2_kernel(
+    const half* __restrict__ hcr_out,
+    const float* __restrict__ hcr_lse,
+    const half* __restrict__ packed_query,
+    const half* __restrict__ packed_key,
+    const half* __restrict__ packed_value,
+    const int32_t* __restrict__ q_seq_starts,
+    const int32_t* __restrict__ history_lens,
+    const int32_t* __restrict__ context_lens,
+    const int32_t* __restrict__ realtime_lens,
+    const int32_t* __restrict__ target_lens,
+    const int32_t* __restrict__ target_seq_starts,
+    half* __restrict__ merged_out,
+    int64_t num_heads,
+    float sm_scale_log2e) {
+  static_assert(kHeadDim == 64 || kHeadDim == 128);
+  constexpr int kHalf2PerRow = kHeadDim / 2;
+
+  const int batch_idx = static_cast<int>(blockIdx.z);
+  const int64_t target_len = static_cast<int64_t>(target_lens[batch_idx]);
+  const int64_t target_row =
+      static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
+  if (target_row >= target_len) {
+    return;
+  }
+
+  const int64_t q_base_row = static_cast<int64_t>(q_seq_starts[batch_idx]) +
+                             history_lens[batch_idx] + context_lens[batch_idx] +
+                             realtime_lens[batch_idx] + target_row;
+  const int64_t lse_row =
+      static_cast<int64_t>(target_seq_starts[batch_idx]) + target_row;
+  const int64_t head_idx = static_cast<int64_t>(blockIdx.y);
+  const int lane = threadIdx.x & 31;
+  const int64_t base = (q_base_row * num_heads + head_idx) * kHeadDim;
+
+  const half2* hcr_out_h2 = reinterpret_cast<const half2*>(hcr_out + base);
+  const half2* packed_query_h2 =
+      reinterpret_cast<const half2*>(packed_query + base);
+  const half2* packed_key_h2 =
+      reinterpret_cast<const half2*>(packed_key + base);
+  const half2* packed_value_h2 =
+      reinterpret_cast<const half2*>(packed_value + base);
+  half2* merged_out_h2 = reinterpret_cast<half2*>(merged_out + base);
+
+  float dot = 0.0f;
+  for (int idx = lane; idx < kHalf2PerRow; idx += 32) {
+    const float2 q = __half22float2(packed_query_h2[idx]);
+    const float2 k = __half22float2(packed_key_h2[idx]);
+    dot += q.x * k.x + q.y * k.y;
+  }
+  dot = warp_reduce_sum(dot);
+
+  float hcr_weight = 0.0f;
+  float diag_weight = 0.0f;
+  if (lane == 0) {
+    const float diag_lse = dot * sm_scale_log2e;
+    const float hcr_lse_v = hcr_lse[lse_row * num_heads + head_idx];
+    const float m = fmaxf(hcr_lse_v, diag_lse);
+    const float wh = exp2f(hcr_lse_v - m);
+    const float wd = exp2f(diag_lse - m);
+    const float inv_denom = 1.0f / (wh + wd);
+    hcr_weight = wh * inv_denom;
+    diag_weight = wd * inv_denom;
+  }
+  hcr_weight = __shfl_sync(0xffffffff, hcr_weight, 0);
+  diag_weight = __shfl_sync(0xffffffff, diag_weight, 0);
+
+  for (int idx = lane; idx < kHalf2PerRow; idx += 32) {
+    const float2 h = __half22float2(hcr_out_h2[idx]);
+    const float2 v = __half22float2(packed_value_h2[idx]);
+    merged_out_h2[idx] =
+        __float22half2_rn(make_float2(hcr_weight * h.x + diag_weight * v.x,
+                                      hcr_weight * h.y + diag_weight * v.y));
+  }
+}
+
+template <typename scalar_t, int kWarpsPerBlock>
+__global__ void merge_target_diag_attention_partial_batched_warp_kernel(
+    const scalar_t* __restrict__ hcr_out,
+    const float* __restrict__ hcr_lse,
+    const scalar_t* __restrict__ packed_query,
+    const scalar_t* __restrict__ packed_key,
+    const scalar_t* __restrict__ packed_value,
+    const int32_t* __restrict__ q_seq_starts,
+    const int32_t* __restrict__ realtime_unmatched_lens,
+    const int32_t* __restrict__ target_lens,
+    const int32_t* __restrict__ target_seq_starts,
+    scalar_t* __restrict__ merged_out,
+    int64_t num_heads,
+    int64_t head_dim,
+    float sm_scale_log2e) {
+  const int batch_idx = static_cast<int>(blockIdx.z);
+  const int64_t target_len = static_cast<int64_t>(target_lens[batch_idx]);
+  const int64_t target_row =
+      static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
+  if (target_row >= target_len) {
+    return;
+  }
+
+  const int64_t q_base_row = static_cast<int64_t>(q_seq_starts[batch_idx]) +
+                             realtime_unmatched_lens[batch_idx] + target_row;
+  const int64_t lse_row =
+      static_cast<int64_t>(target_seq_starts[batch_idx]) + target_row;
+  const int64_t head_idx = static_cast<int64_t>(blockIdx.y);
+  const int64_t lane = threadIdx.x & 31;
+  const int64_t base = (q_base_row * num_heads + head_idx) * head_dim;
+
+  float dot = 0.0f;
+  for (int64_t d = lane; d < head_dim; d += 32) {
+    dot += static_cast<float>(packed_query[base + d]) *
+           static_cast<float>(packed_key[base + d]);
+  }
+  dot = warp_reduce_sum(dot);
+
+  float hcr_weight = 0.0f;
+  float diag_weight = 0.0f;
+  if (lane == 0) {
+    const float diag_lse = dot * sm_scale_log2e;
+    const float hcr_lse_v = hcr_lse[lse_row * num_heads + head_idx];
+    const float m = fmaxf(hcr_lse_v, diag_lse);
+    const float wh = exp2f(hcr_lse_v - m);
+    const float wd = exp2f(diag_lse - m);
+    const float inv_denom = 1.0f / (wh + wd);
+    hcr_weight = wh * inv_denom;
+    diag_weight = wd * inv_denom;
+  }
+  hcr_weight = __shfl_sync(0xffffffff, hcr_weight, 0);
+  diag_weight = __shfl_sync(0xffffffff, diag_weight, 0);
+
+  for (int64_t d = lane; d < head_dim; d += 32) {
+    const float hcr_v = static_cast<float>(hcr_out[base + d]);
+    const float diag_v = static_cast<float>(packed_value[base + d]);
+    merged_out[base + d] =
+        static_cast<scalar_t>(hcr_weight * hcr_v + diag_weight * diag_v);
+  }
+}
+
+template <int kHeadDim, int kWarpsPerBlock>
+__global__ void merge_target_diag_attention_partial_batched_warp_half2_kernel(
+    const half* __restrict__ hcr_out,
+    const float* __restrict__ hcr_lse,
+    const half* __restrict__ packed_query,
+    const half* __restrict__ packed_key,
+    const half* __restrict__ packed_value,
+    const int32_t* __restrict__ q_seq_starts,
+    const int32_t* __restrict__ realtime_unmatched_lens,
+    const int32_t* __restrict__ target_lens,
+    const int32_t* __restrict__ target_seq_starts,
+    half* __restrict__ merged_out,
+    int64_t num_heads,
+    float sm_scale_log2e) {
+  static_assert(kHeadDim == 64 || kHeadDim == 128);
+  constexpr int kHalf2PerRow = kHeadDim / 2;
+
+  const int batch_idx = static_cast<int>(blockIdx.z);
+  const int64_t target_len = static_cast<int64_t>(target_lens[batch_idx]);
+  const int64_t target_row =
+      static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
+  if (target_row >= target_len) {
+    return;
+  }
+
+  const int64_t q_base_row = static_cast<int64_t>(q_seq_starts[batch_idx]) +
+                             realtime_unmatched_lens[batch_idx] + target_row;
+  const int64_t lse_row =
+      static_cast<int64_t>(target_seq_starts[batch_idx]) + target_row;
+  const int64_t head_idx = static_cast<int64_t>(blockIdx.y);
+  const int lane = threadIdx.x & 31;
+  const int64_t base = (q_base_row * num_heads + head_idx) * kHeadDim;
+
+  const half2* hcr_out_h2 = reinterpret_cast<const half2*>(hcr_out + base);
+  const half2* packed_query_h2 =
+      reinterpret_cast<const half2*>(packed_query + base);
+  const half2* packed_key_h2 =
+      reinterpret_cast<const half2*>(packed_key + base);
+  const half2* packed_value_h2 =
+      reinterpret_cast<const half2*>(packed_value + base);
+  half2* merged_out_h2 = reinterpret_cast<half2*>(merged_out + base);
+
+  float dot = 0.0f;
+  for (int idx = lane; idx < kHalf2PerRow; idx += 32) {
+    const float2 q = __half22float2(packed_query_h2[idx]);
+    const float2 k = __half22float2(packed_key_h2[idx]);
+    dot += q.x * k.x + q.y * k.y;
+  }
+  dot = warp_reduce_sum(dot);
+
+  float hcr_weight = 0.0f;
+  float diag_weight = 0.0f;
+  if (lane == 0) {
+    const float diag_lse = dot * sm_scale_log2e;
+    const float hcr_lse_v = hcr_lse[lse_row * num_heads + head_idx];
+    const float m = fmaxf(hcr_lse_v, diag_lse);
+    const float wh = exp2f(hcr_lse_v - m);
+    const float wd = exp2f(diag_lse - m);
+    const float inv_denom = 1.0f / (wh + wd);
+    hcr_weight = wh * inv_denom;
+    diag_weight = wd * inv_denom;
+  }
+  hcr_weight = __shfl_sync(0xffffffff, hcr_weight, 0);
+  diag_weight = __shfl_sync(0xffffffff, diag_weight, 0);
+
+  for (int idx = lane; idx < kHalf2PerRow; idx += 32) {
+    const float2 h = __half22float2(hcr_out_h2[idx]);
+    const float2 v = __half22float2(packed_value_h2[idx]);
+    merged_out_h2[idx] =
+        __float22half2_rn(make_float2(hcr_weight * h.x + diag_weight * v.x,
+                                      hcr_weight * h.y + diag_weight * v.y));
+  }
+}
+
 }  // namespace
 
 namespace xllm::kernel::cuda::test {
@@ -480,6 +756,294 @@ void merge_target_diag_attention_cuda(const torch::Tensor& hcr_out_snd,
                   num_heads,
                   head_dim,
                   sm_scale_log2e);
+        });
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void merge_target_diag_attention_batched_cuda(
+    const torch::Tensor& hcr_out_snd,
+    const torch::Tensor& hcr_lse_sh1,
+    const torch::Tensor& packed_query_snd,
+    const torch::Tensor& packed_key_snd,
+    const torch::Tensor& packed_value_snd,
+    const torch::Tensor& q_seq_starts_i32,
+    const torch::Tensor& history_lens_i32,
+    const torch::Tensor& context_lens_i32,
+    const torch::Tensor& realtime_lens_i32,
+    const torch::Tensor& target_lens_i32,
+    const torch::Tensor& target_seq_starts_i32,
+    int64_t batch_size,
+    int64_t max_target_len,
+    double sm_scale,
+    torch::Tensor merged_out_snd) {
+  CHECK(hcr_out_snd.defined());
+  CHECK(hcr_lse_sh1.defined());
+  CHECK(packed_query_snd.defined());
+  CHECK(packed_key_snd.defined());
+  CHECK(packed_value_snd.defined());
+  CHECK(merged_out_snd.defined());
+  CHECK(q_seq_starts_i32.defined());
+  CHECK(history_lens_i32.defined());
+  CHECK(context_lens_i32.defined());
+  CHECK(realtime_lens_i32.defined());
+  CHECK(target_lens_i32.defined());
+  CHECK(target_seq_starts_i32.defined());
+  CHECK(hcr_out_snd.is_cuda());
+  CHECK(hcr_lse_sh1.is_cuda());
+  CHECK(packed_query_snd.is_cuda());
+  CHECK(packed_key_snd.is_cuda());
+  CHECK(packed_value_snd.is_cuda());
+  CHECK(merged_out_snd.is_cuda());
+  CHECK(q_seq_starts_i32.is_cuda());
+  CHECK(history_lens_i32.is_cuda());
+  CHECK(context_lens_i32.is_cuda());
+  CHECK(realtime_lens_i32.is_cuda());
+  CHECK(target_lens_i32.is_cuda());
+  CHECK(target_seq_starts_i32.is_cuda());
+  CHECK_EQ(hcr_out_snd.dim(), 3);
+  CHECK_EQ(packed_query_snd.dim(), 3);
+  CHECK_EQ(packed_key_snd.dim(), 3);
+  CHECK_EQ(packed_value_snd.dim(), 3);
+  CHECK_EQ(merged_out_snd.dim(), 3);
+  CHECK_EQ(hcr_lse_sh1.dim(), 3);
+  CHECK_EQ(q_seq_starts_i32.dim(), 1);
+  CHECK_EQ(history_lens_i32.dim(), 1);
+  CHECK_EQ(context_lens_i32.dim(), 1);
+  CHECK_EQ(realtime_lens_i32.dim(), 1);
+  CHECK_EQ(target_lens_i32.dim(), 1);
+  CHECK_EQ(target_seq_starts_i32.dim(), 1);
+  CHECK_EQ(hcr_out_snd.sizes(), packed_query_snd.sizes());
+  CHECK_EQ(hcr_out_snd.sizes(), packed_key_snd.sizes());
+  CHECK_EQ(hcr_out_snd.sizes(), packed_value_snd.sizes());
+  CHECK_EQ(hcr_out_snd.sizes(), merged_out_snd.sizes());
+  CHECK_EQ(hcr_lse_sh1.size(1), hcr_out_snd.size(1));
+  CHECK_EQ(hcr_lse_sh1.size(2), 1);
+  CHECK_EQ(hcr_out_snd.scalar_type(), packed_query_snd.scalar_type());
+  CHECK_EQ(hcr_out_snd.scalar_type(), packed_key_snd.scalar_type());
+  CHECK_EQ(hcr_out_snd.scalar_type(), packed_value_snd.scalar_type());
+  CHECK_EQ(hcr_out_snd.scalar_type(), merged_out_snd.scalar_type());
+  CHECK_EQ(hcr_lse_sh1.scalar_type(), torch::kFloat32);
+  CHECK_EQ(q_seq_starts_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(history_lens_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(context_lens_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(realtime_lens_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(target_lens_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(target_seq_starts_i32.scalar_type(), torch::kInt32);
+  CHECK_GT(batch_size, 1);
+  CHECK_LE(batch_size, 4);
+  CHECK_GT(max_target_len, 0);
+  CHECK_GT(sm_scale, 0.0);
+
+  const int64_t num_heads = hcr_out_snd.size(1);
+  const int64_t head_dim = hcr_out_snd.size(2);
+  c10::cuda::CUDAGuard guard(hcr_out_snd.device());
+  constexpr int kWarpsPerBlock = 4;
+  const int threads = kWarpsPerBlock * 32;
+  const dim3 grid(
+      (static_cast<int>(max_target_len) + kWarpsPerBlock - 1) / kWarpsPerBlock,
+      static_cast<unsigned int>(num_heads),
+      static_cast<unsigned int>(batch_size));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  constexpr double kLog2E = 1.4426950408889634;
+  const float sm_scale_log2e = static_cast<float>(sm_scale * kLog2E);
+
+  if (hcr_out_snd.scalar_type() == torch::kFloat16 && head_dim == 64) {
+    merge_target_diag_attention_batched_warp_half2_kernel<64, kWarpsPerBlock>
+        <<<grid, threads, 0, stream>>>(
+            reinterpret_cast<const half*>(hcr_out_snd.data_ptr<at::Half>()),
+            hcr_lse_sh1.data_ptr<float>(),
+            reinterpret_cast<const half*>(
+                packed_query_snd.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(packed_key_snd.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(
+                packed_value_snd.data_ptr<at::Half>()),
+            q_seq_starts_i32.data_ptr<int32_t>(),
+            history_lens_i32.data_ptr<int32_t>(),
+            context_lens_i32.data_ptr<int32_t>(),
+            realtime_lens_i32.data_ptr<int32_t>(),
+            target_lens_i32.data_ptr<int32_t>(),
+            target_seq_starts_i32.data_ptr<int32_t>(),
+            reinterpret_cast<half*>(merged_out_snd.data_ptr<at::Half>()),
+            num_heads,
+            sm_scale_log2e);
+  } else if (hcr_out_snd.scalar_type() == torch::kFloat16 && head_dim == 128) {
+    merge_target_diag_attention_batched_warp_half2_kernel<128, kWarpsPerBlock>
+        <<<grid, threads, 0, stream>>>(
+            reinterpret_cast<const half*>(hcr_out_snd.data_ptr<at::Half>()),
+            hcr_lse_sh1.data_ptr<float>(),
+            reinterpret_cast<const half*>(
+                packed_query_snd.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(packed_key_snd.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(
+                packed_value_snd.data_ptr<at::Half>()),
+            q_seq_starts_i32.data_ptr<int32_t>(),
+            history_lens_i32.data_ptr<int32_t>(),
+            context_lens_i32.data_ptr<int32_t>(),
+            realtime_lens_i32.data_ptr<int32_t>(),
+            target_lens_i32.data_ptr<int32_t>(),
+            target_seq_starts_i32.data_ptr<int32_t>(),
+            reinterpret_cast<half*>(merged_out_snd.data_ptr<at::Half>()),
+            num_heads,
+            sm_scale_log2e);
+  } else {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        hcr_out_snd.scalar_type(),
+        "merge_target_diag_attention_batched_cuda",
+        [&] {
+          merge_target_diag_attention_batched_warp_kernel<scalar_t,
+                                                          kWarpsPerBlock>
+              <<<grid, threads, 0, stream>>>(
+                  hcr_out_snd.data_ptr<scalar_t>(),
+                  hcr_lse_sh1.data_ptr<float>(),
+                  packed_query_snd.data_ptr<scalar_t>(),
+                  packed_key_snd.data_ptr<scalar_t>(),
+                  packed_value_snd.data_ptr<scalar_t>(),
+                  q_seq_starts_i32.data_ptr<int32_t>(),
+                  history_lens_i32.data_ptr<int32_t>(),
+                  context_lens_i32.data_ptr<int32_t>(),
+                  realtime_lens_i32.data_ptr<int32_t>(),
+                  target_lens_i32.data_ptr<int32_t>(),
+                  target_seq_starts_i32.data_ptr<int32_t>(),
+                  merged_out_snd.data_ptr<scalar_t>(),
+                  num_heads,
+                  head_dim,
+                  sm_scale_log2e);
+        });
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void merge_target_diag_attention_partial_batched_cuda(
+    const torch::Tensor& hcr_out_snd,
+    const torch::Tensor& hcr_lse_sh1,
+    const torch::Tensor& packed_query_snd,
+    const torch::Tensor& packed_key_snd,
+    const torch::Tensor& packed_value_snd,
+    const torch::Tensor& q_seq_starts_i32,
+    const torch::Tensor& realtime_unmatched_lens_i32,
+    const torch::Tensor& target_lens_i32,
+    const torch::Tensor& target_seq_starts_i32,
+    int64_t batch_size,
+    int64_t max_target_len,
+    double sm_scale,
+    torch::Tensor merged_out_snd) {
+  CHECK(hcr_out_snd.defined());
+  CHECK(hcr_lse_sh1.defined());
+  CHECK(packed_query_snd.defined());
+  CHECK(packed_key_snd.defined());
+  CHECK(packed_value_snd.defined());
+  CHECK(merged_out_snd.defined());
+  CHECK(q_seq_starts_i32.defined());
+  CHECK(realtime_unmatched_lens_i32.defined());
+  CHECK(target_lens_i32.defined());
+  CHECK(target_seq_starts_i32.defined());
+  CHECK(hcr_out_snd.is_cuda());
+  CHECK(hcr_lse_sh1.is_cuda());
+  CHECK(packed_query_snd.is_cuda());
+  CHECK(packed_key_snd.is_cuda());
+  CHECK(packed_value_snd.is_cuda());
+  CHECK(merged_out_snd.is_cuda());
+  CHECK(q_seq_starts_i32.is_cuda());
+  CHECK(realtime_unmatched_lens_i32.is_cuda());
+  CHECK(target_lens_i32.is_cuda());
+  CHECK(target_seq_starts_i32.is_cuda());
+  CHECK_EQ(hcr_out_snd.dim(), 3);
+  CHECK_EQ(packed_query_snd.dim(), 3);
+  CHECK_EQ(packed_key_snd.dim(), 3);
+  CHECK_EQ(packed_value_snd.dim(), 3);
+  CHECK_EQ(merged_out_snd.dim(), 3);
+  CHECK_EQ(hcr_lse_sh1.dim(), 3);
+  CHECK_EQ(q_seq_starts_i32.dim(), 1);
+  CHECK_EQ(realtime_unmatched_lens_i32.dim(), 1);
+  CHECK_EQ(target_lens_i32.dim(), 1);
+  CHECK_EQ(target_seq_starts_i32.dim(), 1);
+  CHECK_EQ(hcr_out_snd.sizes(), packed_query_snd.sizes());
+  CHECK_EQ(hcr_out_snd.sizes(), packed_key_snd.sizes());
+  CHECK_EQ(hcr_out_snd.sizes(), packed_value_snd.sizes());
+  CHECK_EQ(hcr_out_snd.sizes(), merged_out_snd.sizes());
+  CHECK_EQ(hcr_lse_sh1.size(1), hcr_out_snd.size(1));
+  CHECK_EQ(hcr_lse_sh1.size(2), 1);
+  CHECK_EQ(hcr_out_snd.scalar_type(), packed_query_snd.scalar_type());
+  CHECK_EQ(hcr_out_snd.scalar_type(), packed_key_snd.scalar_type());
+  CHECK_EQ(hcr_out_snd.scalar_type(), packed_value_snd.scalar_type());
+  CHECK_EQ(hcr_out_snd.scalar_type(), merged_out_snd.scalar_type());
+  CHECK_EQ(hcr_lse_sh1.scalar_type(), torch::kFloat32);
+  CHECK_EQ(q_seq_starts_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(realtime_unmatched_lens_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(target_lens_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(target_seq_starts_i32.scalar_type(), torch::kInt32);
+  CHECK_GT(batch_size, 1);
+  CHECK_LE(batch_size, 4);
+  CHECK_GT(max_target_len, 0);
+  CHECK_GT(sm_scale, 0.0);
+
+  const int64_t num_heads = hcr_out_snd.size(1);
+  const int64_t head_dim = hcr_out_snd.size(2);
+  c10::cuda::CUDAGuard guard(hcr_out_snd.device());
+  constexpr int kWarpsPerBlock = 4;
+  const int threads = kWarpsPerBlock * 32;
+  const dim3 grid(
+      (static_cast<int>(max_target_len) + kWarpsPerBlock - 1) / kWarpsPerBlock,
+      static_cast<unsigned int>(num_heads),
+      static_cast<unsigned int>(batch_size));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  constexpr double kLog2E = 1.4426950408889634;
+  const float sm_scale_log2e = static_cast<float>(sm_scale * kLog2E);
+
+  if (hcr_out_snd.scalar_type() == torch::kFloat16 && head_dim == 64) {
+    merge_target_diag_attention_partial_batched_warp_half2_kernel<
+        64,
+        kWarpsPerBlock><<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const half*>(hcr_out_snd.data_ptr<at::Half>()),
+        hcr_lse_sh1.data_ptr<float>(),
+        reinterpret_cast<const half*>(packed_query_snd.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(packed_key_snd.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(packed_value_snd.data_ptr<at::Half>()),
+        q_seq_starts_i32.data_ptr<int32_t>(),
+        realtime_unmatched_lens_i32.data_ptr<int32_t>(),
+        target_lens_i32.data_ptr<int32_t>(),
+        target_seq_starts_i32.data_ptr<int32_t>(),
+        reinterpret_cast<half*>(merged_out_snd.data_ptr<at::Half>()),
+        num_heads,
+        sm_scale_log2e);
+  } else if (hcr_out_snd.scalar_type() == torch::kFloat16 && head_dim == 128) {
+    merge_target_diag_attention_partial_batched_warp_half2_kernel<
+        128,
+        kWarpsPerBlock><<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const half*>(hcr_out_snd.data_ptr<at::Half>()),
+        hcr_lse_sh1.data_ptr<float>(),
+        reinterpret_cast<const half*>(packed_query_snd.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(packed_key_snd.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(packed_value_snd.data_ptr<at::Half>()),
+        q_seq_starts_i32.data_ptr<int32_t>(),
+        realtime_unmatched_lens_i32.data_ptr<int32_t>(),
+        target_lens_i32.data_ptr<int32_t>(),
+        target_seq_starts_i32.data_ptr<int32_t>(),
+        reinterpret_cast<half*>(merged_out_snd.data_ptr<at::Half>()),
+        num_heads,
+        sm_scale_log2e);
+  } else {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        hcr_out_snd.scalar_type(),
+        "merge_target_diag_attention_partial_batched_cuda",
+        [&] {
+          merge_target_diag_attention_partial_batched_warp_kernel<
+              scalar_t,
+              kWarpsPerBlock><<<grid, threads, 0, stream>>>(
+              hcr_out_snd.data_ptr<scalar_t>(),
+              hcr_lse_sh1.data_ptr<float>(),
+              packed_query_snd.data_ptr<scalar_t>(),
+              packed_key_snd.data_ptr<scalar_t>(),
+              packed_value_snd.data_ptr<scalar_t>(),
+              q_seq_starts_i32.data_ptr<int32_t>(),
+              realtime_unmatched_lens_i32.data_ptr<int32_t>(),
+              target_lens_i32.data_ptr<int32_t>(),
+              target_seq_starts_i32.data_ptr<int32_t>(),
+              merged_out_snd.data_ptr<scalar_t>(),
+              num_heads,
+              head_dim,
+              sm_scale_log2e);
         });
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();

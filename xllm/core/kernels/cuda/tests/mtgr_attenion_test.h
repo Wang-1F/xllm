@@ -69,6 +69,11 @@ struct MTGRAttentionTestMetrics {
   std::vector<MTGRStageMetric> stages;
 };
 
+struct MTGRPartialBatchSetup {
+  xllm::layer::AttentionMetadata metadata;
+  xllm::KVCache kv_cache;
+};
+
 class MTGRAttentionImplTest {
  public:
   MTGRAttentionImplTest() = default;
@@ -101,6 +106,11 @@ xllm::layer::AttentionMetadata make_mtgr_attention_metadata(
     const torch::Device& device,
     int64_t block_size = 128);
 
+xllm::layer::AttentionMetadata make_mtgr_attention_metadata(
+    const std::vector<MTGRAttentionTestShape>& shapes,
+    const torch::Device& device,
+    int64_t block_size = 128);
+
 xllm::KVCache make_mtgr_kv_cache(const MTGRAttentionTestShape& shape,
                                  const torch::Device& device,
                                  torch::ScalarType dtype,
@@ -111,6 +121,14 @@ void prefill_mtgr_matched_prefix_cache(const torch::Tensor& full_key_bsnd,
                                        const MTGRAttentionTestShape& shape,
                                        int64_t block_size,
                                        xllm::KVCache& kv_cache);
+
+MTGRPartialBatchSetup make_mtgr_partial_batch_setup(
+    const std::vector<MTGRAttentionTestShape>& shapes,
+    const std::vector<torch::Tensor>& full_key_bsnd,
+    const std::vector<torch::Tensor>& full_value_bsnd,
+    const torch::Device& device,
+    torch::ScalarType dtype,
+    int64_t block_size = 128);
 
 std::vector<MTGRAttentionTestShape> build_mtgr_sweep_shapes(bool full_sweep,
                                                             bool partial_match);

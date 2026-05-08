@@ -1865,6 +1865,8 @@ namespace {
 
 struct MultiBatchProbeSequence {
   MTGRAttentionTestShape shape;
+  torch::Tensor full_key_bsnd;
+  torch::Tensor full_value_bsnd;
   torch::Tensor query;
   torch::Tensor key;
   torch::Tensor value;
@@ -1876,6 +1878,7 @@ struct MultiBatchProbeSequence {
 };
 
 struct MultiBatchProbeMetrics {
+  double base_mask_build_ms = 0.0;
   double base_device_total_ms = 0.0;
   double base_wall_total_ms = 0.0;
   double fused_device_total_ms = 0.0;
@@ -1936,6 +1939,277 @@ MTGRAttentionTestShape sample_probe_shape(std::mt19937_64* rng,
   return shape;
 }
 
+MTGRAttentionTestShape sample_odd_no_match_probe_shape(std::mt19937_64* rng,
+                                                       int64_t heads,
+                                                       int64_t head_dim) {
+  CHECK(rng != nullptr);
+  MTGRAttentionTestShape shape;
+  shape.heads = heads;
+  shape.kv_heads = heads;
+  shape.head_dim = head_dim;
+  shape.history = sample_non_aligned_len(rng, 1350, 4096);
+  shape.context = 8;
+  shape.realtime = sample_non_aligned_len(rng, 100, 600);
+  shape.target = sample_non_aligned_len(rng, 800, 2400);
+  shape.matched_prefix = 0;
+  return shape;
+}
+
+std::string encode_true_multi_batch_group_key(
+    const std::vector<MTGRAttentionTestShape>& shapes) {
+  std::ostringstream oss;
+  for (size_t i = 0; i < shapes.size(); ++i) {
+    if (i != 0) {
+      oss << "|";
+    }
+    const auto& shape = shapes[i];
+    oss << shape.heads << ":" << shape.head_dim << ":" << shape.history << ":"
+        << shape.realtime << ":" << shape.target;
+  }
+  return oss.str();
+}
+
+void append_true_multi_batch_shape_cells(
+    std::ostream& os,
+    const std::vector<MTGRAttentionTestShape>& shapes) {
+  for (size_t i = 0; i < 4; ++i) {
+    if (i < shapes.size()) {
+      const auto& shape = shapes[i];
+      os << "," << shape.history << "," << shape.realtime << ","
+         << shape.target;
+    } else {
+      os << ",,,";
+    }
+  }
+}
+
+struct TrueFusedBatchSetup {
+  xllm::layer::AttentionMetadata metadata;
+  xllm::KVCache kv_cache;
+  torch::Tensor packed_query;
+  torch::Tensor packed_key;
+  torch::Tensor packed_value;
+};
+
+enum class TrueBatchBaseBackend {
+  kWrapperFused,
+  kOneStage,
+};
+
+std::string encode_probe_shape_local_key(const MTGRAttentionTestShape& shape) {
+  return std::to_string(shape.history) + "_" + std::to_string(shape.realtime) +
+         "_" + std::to_string(shape.target);
+}
+
+MTGRAttentionTestShape sample_partial_probe_shape_with_fixed_layout(
+    std::mt19937_64* rng,
+    int64_t heads,
+    int64_t head_dim) {
+  auto shape = sample_probe_shape(rng, /*partial_match=*/true);
+  shape.heads = heads;
+  shape.kv_heads = heads;
+  shape.head_dim = head_dim;
+  shape.matched_prefix =
+      shape.history + shape.context + (shape.realtime * 4) / 5;
+  return shape;
+}
+
+MultiBatchProbeSequence make_probe_sequence(const MTGRAttentionTestShape& shape,
+                                            const torch::Device& device);
+
+void build_probe_batch_from_shapes(
+    const std::vector<MTGRAttentionTestShape>& shapes,
+    const torch::Device& device,
+    std::vector<MultiBatchProbeSequence>* batch) {
+  CHECK(batch != nullptr);
+  batch->clear();
+  batch->reserve(shapes.size());
+  for (const auto& shape : shapes) {
+    batch->push_back(make_probe_sequence(shape, device));
+  }
+}
+
+bool build_unique_true_multi_batch_no_match_group(
+    std::mt19937_64* rng,
+    int batch_size,
+    const torch::Device& device,
+    std::unordered_set<std::string>* seen_groups,
+    std::vector<MTGRAttentionTestShape>* shapes,
+    std::vector<MultiBatchProbeSequence>* batch) {
+  CHECK(rng != nullptr);
+  CHECK(seen_groups != nullptr);
+  CHECK(shapes != nullptr);
+  CHECK(batch != nullptr);
+
+  const std::vector<int64_t> heads_all = {4, 8, 12};
+  const std::vector<int64_t> head_dims_all = {64, 128};
+  std::uniform_int_distribution<int> heads_dist(
+      0, static_cast<int>(heads_all.size() - 1));
+  std::uniform_int_distribution<int> head_dim_dist(
+      0, static_cast<int>(head_dims_all.size() - 1));
+
+  shapes->clear();
+  batch->clear();
+  for (int attempt = 0; attempt < 256; ++attempt) {
+    shapes->clear();
+    const int64_t heads = heads_all[heads_dist(*rng)];
+    const int64_t head_dim = head_dims_all[head_dim_dist(*rng)];
+    std::unordered_set<std::string> local_seen;
+    for (int i = 0; i < batch_size; ++i) {
+      MTGRAttentionTestShape shape =
+          sample_odd_no_match_probe_shape(rng, heads, head_dim);
+      if (!local_seen.insert(encode_probe_shape_local_key(shape)).second) {
+        shapes->clear();
+        break;
+      }
+      shapes->push_back(shape);
+    }
+    if (static_cast<int>(shapes->size()) != batch_size) {
+      continue;
+    }
+    if (!seen_groups->insert(encode_true_multi_batch_group_key(*shapes))
+             .second) {
+      continue;
+    }
+    build_probe_batch_from_shapes(*shapes, device, batch);
+    return true;
+  }
+
+  shapes->clear();
+  batch->clear();
+  return false;
+}
+
+bool build_unique_true_multi_batch_partial_group(
+    std::mt19937_64* rng,
+    int batch_size,
+    const torch::Device& device,
+    std::unordered_set<std::string>* seen_groups,
+    std::vector<MTGRAttentionTestShape>* shapes,
+    std::vector<MultiBatchProbeSequence>* batch) {
+  CHECK(rng != nullptr);
+  CHECK(seen_groups != nullptr);
+  CHECK(shapes != nullptr);
+  CHECK(batch != nullptr);
+
+  shapes->clear();
+  batch->clear();
+  for (int attempt = 0; attempt < 256; ++attempt) {
+    shapes->clear();
+    const MTGRAttentionTestShape ref_shape =
+        sample_probe_shape(rng, /*partial_match=*/true);
+    const int64_t heads = ref_shape.heads;
+    const int64_t head_dim = ref_shape.head_dim;
+    std::unordered_set<std::string> local_seen;
+    for (int i = 0; i < batch_size; ++i) {
+      MTGRAttentionTestShape shape =
+          sample_partial_probe_shape_with_fixed_layout(rng, heads, head_dim);
+      if (!local_seen.insert(encode_probe_shape_local_key(shape)).second) {
+        shapes->clear();
+        break;
+      }
+      shapes->push_back(shape);
+    }
+    if (static_cast<int>(shapes->size()) != batch_size) {
+      continue;
+    }
+    if (!seen_groups->insert(encode_true_multi_batch_group_key(*shapes))
+             .second) {
+      continue;
+    }
+    build_probe_batch_from_shapes(*shapes, device, batch);
+    return true;
+  }
+
+  shapes->clear();
+  batch->clear();
+  return false;
+}
+
+TrueFusedBatchSetup make_true_fused_batch_setup(
+    const std::vector<MultiBatchProbeSequence>& batch) {
+  CHECK(!batch.empty());
+  const auto& ref = batch.front().shape;
+  const bool partial_match = ref.matched_prefix > 0;
+
+  std::vector<MTGRAttentionTestShape> shapes;
+  std::vector<torch::Tensor> full_keys;
+  std::vector<torch::Tensor> full_values;
+  std::vector<torch::Tensor> packed_queries;
+  std::vector<torch::Tensor> packed_keys;
+  std::vector<torch::Tensor> packed_values;
+  shapes.reserve(batch.size());
+  packed_queries.reserve(batch.size());
+  packed_keys.reserve(batch.size());
+  packed_values.reserve(batch.size());
+  if (partial_match) {
+    full_keys.reserve(batch.size());
+    full_values.reserve(batch.size());
+  }
+
+  for (const auto& seq : batch) {
+    CHECK_EQ(seq.shape.heads, ref.heads);
+    CHECK_EQ(seq.shape.kv_heads, ref.kv_heads);
+    CHECK_EQ(seq.shape.head_dim, ref.head_dim);
+    CHECK_EQ(seq.shape.matched_prefix > 0, partial_match);
+    if (partial_match) {
+      CHECK_GT(seq.shape.matched_prefix, 0);
+      full_keys.push_back(seq.full_key_bsnd);
+      full_values.push_back(seq.full_value_bsnd);
+    } else {
+      CHECK_EQ(seq.shape.matched_prefix, 0);
+    }
+    shapes.push_back(seq.shape);
+    packed_queries.push_back(seq.query);
+    packed_keys.push_back(seq.key);
+    packed_values.push_back(seq.value);
+  }
+
+  TrueFusedBatchSetup setup;
+  setup.packed_query = torch::cat(packed_queries, 0).contiguous();
+  setup.packed_key = torch::cat(packed_keys, 0).contiguous();
+  setup.packed_value = torch::cat(packed_values, 0).contiguous();
+
+  if (partial_match) {
+    auto partial_setup =
+        make_mtgr_partial_batch_setup(shapes,
+                                      full_keys,
+                                      full_values,
+                                      setup.packed_query.device(),
+                                      torch::kFloat16,
+                                      kBlockSize);
+    setup.metadata = std::move(partial_setup.metadata);
+    setup.kv_cache = std::move(partial_setup.kv_cache);
+  } else {
+    setup.metadata = make_mtgr_attention_metadata(
+        shapes, setup.packed_query.device(), kBlockSize);
+  }
+  return setup;
+}
+
+torch::Tensor run_true_batch_base_once(MultiBatchProbeSequence* seq,
+                                       TrueBatchBaseBackend base_backend,
+                                       double* base_mask_build_ms,
+                                       double* base_device_ms) {
+  CHECK(seq != nullptr);
+  CHECK(base_mask_build_ms != nullptr);
+  CHECK(base_device_ms != nullptr);
+
+  if (base_backend == TrueBatchBaseBackend::kOneStage) {
+    auto output = std::get<0>(seq->one_stage->forward(
+        seq->metadata, seq->query, seq->key, seq->value, seq->one_cache));
+    const auto metrics = seq->one_stage->last_metrics();
+    *base_mask_build_ms += metrics.mask_build_ms;
+    *base_device_ms += metrics.device_total_ms;
+    return output;
+  }
+
+  auto output = std::get<0>(seq->fused->forward(
+      seq->metadata, seq->query, seq->key, seq->value, seq->fused_cache));
+  *base_device_ms += seq->fused->last_metrics().device_total_ms;
+  return output;
+}
+
 MultiBatchProbeSequence make_probe_sequence(const MTGRAttentionTestShape& shape,
                                             const torch::Device& device) {
   auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device);
@@ -1952,6 +2226,8 @@ MultiBatchProbeSequence make_probe_sequence(const MTGRAttentionTestShape& shape,
 
   MultiBatchProbeSequence seq;
   seq.shape = shape;
+  seq.full_key_bsnd = full_key.contiguous();
+  seq.full_value_bsnd = full_value.contiguous();
   seq.query = full_query.select(0, 0)
                   .narrow(0, shape.matched_prefix, local)
                   .contiguous()
@@ -2073,6 +2349,138 @@ MultiBatchProbeMetrics run_wrapper_loop_batch(
   return avg;
 }
 
+MultiBatchProbeMetrics run_true_fused_batch_impl(
+    std::vector<MultiBatchProbeSequence>* batch,
+    int warmup,
+    int repeat,
+    TrueBatchBaseBackend base_backend) {
+  CHECK(batch != nullptr);
+  CHECK(!batch->empty());
+  const auto& ref = batch->front().shape;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(ref.head_dim));
+  auto packed_setup = make_true_fused_batch_setup(*batch);
+
+  LayerMTGRAttentionImpl batched_fused(ref.heads,
+                                       ref.head_dim,
+                                       scale,
+                                       ref.kv_heads,
+                                       LayerMTGRAttentionBackend::kFused);
+
+  for (int i = 0; i < warmup; ++i) {
+    for (auto& seq : *batch) {
+      double ignored_mask_build_ms = 0.0;
+      double ignored_device_ms = 0.0;
+      (void)run_true_batch_base_once(
+          &seq, base_backend, &ignored_mask_build_ms, &ignored_device_ms);
+    }
+    (void)std::get<0>(batched_fused.forward(packed_setup.metadata,
+                                            packed_setup.packed_query,
+                                            packed_setup.packed_key,
+                                            packed_setup.packed_value,
+                                            packed_setup.kv_cache));
+  }
+  CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  MultiBatchProbeMetrics avg;
+  for (int i = 0; i < repeat; ++i) {
+    std::vector<torch::Tensor> base_outputs;
+    base_outputs.reserve(batch->size());
+
+    auto base_wall_start = std::chrono::steady_clock::now();
+    double base_mask_build_ms = 0.0;
+    double base_device_ms = 0.0;
+    for (auto& seq : *batch) {
+      base_outputs.push_back(run_true_batch_base_once(
+          &seq, base_backend, &base_mask_build_ms, &base_device_ms));
+    }
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    const double base_wall_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - base_wall_start)
+            .count();
+
+    auto fused_wall_start = std::chrono::steady_clock::now();
+    auto fused_output =
+        std::get<0>(batched_fused.forward(packed_setup.metadata,
+                                          packed_setup.packed_query,
+                                          packed_setup.packed_key,
+                                          packed_setup.packed_value,
+                                          packed_setup.kv_cache));
+    const auto fused_metrics = batched_fused.last_metrics();
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    const double fused_wall_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - fused_wall_start)
+            .count();
+
+    auto base_output = torch::cat(base_outputs, 0).contiguous();
+    auto diff =
+        (base_output.to(torch::kFloat32) - fused_output.to(torch::kFloat32))
+            .abs();
+
+    avg.base_mask_build_ms += base_mask_build_ms;
+    avg.base_device_total_ms += base_device_ms;
+    avg.base_wall_total_ms += base_wall_ms;
+    avg.fused_device_total_ms += fused_metrics.device_total_ms;
+    avg.fused_wall_total_ms += fused_wall_ms;
+    avg.diff_max_abs = std::max(avg.diff_max_abs, diff.max().item<double>());
+    avg.diff_mean_abs += diff.mean().item<double>();
+  }
+
+  const double inv = 1.0 / static_cast<double>(repeat);
+  avg.base_mask_build_ms *= inv;
+  avg.base_device_total_ms *= inv;
+  avg.base_wall_total_ms *= inv;
+  avg.fused_device_total_ms *= inv;
+  avg.fused_wall_total_ms *= inv;
+  avg.diff_mean_abs *= inv;
+  return avg;
+}
+
+MultiBatchProbeMetrics run_true_fused_no_match_batch(
+    std::vector<MultiBatchProbeSequence>* batch,
+    int warmup,
+    int repeat) {
+  CHECK(batch != nullptr);
+  CHECK(!batch->empty());
+  CHECK_EQ(batch->front().shape.matched_prefix, 0);
+  return run_true_fused_batch_impl(
+      batch, warmup, repeat, TrueBatchBaseBackend::kWrapperFused);
+}
+
+MultiBatchProbeMetrics run_true_fused_no_match_batch_vs_one_stage(
+    std::vector<MultiBatchProbeSequence>* batch,
+    int warmup,
+    int repeat) {
+  CHECK(batch != nullptr);
+  CHECK(!batch->empty());
+  CHECK_EQ(batch->front().shape.matched_prefix, 0);
+  return run_true_fused_batch_impl(
+      batch, warmup, repeat, TrueBatchBaseBackend::kOneStage);
+}
+
+MultiBatchProbeMetrics run_true_fused_partial_batch(
+    std::vector<MultiBatchProbeSequence>* batch,
+    int warmup,
+    int repeat) {
+  CHECK(batch != nullptr);
+  CHECK(!batch->empty());
+  CHECK_GT(batch->front().shape.matched_prefix, 0);
+  return run_true_fused_batch_impl(
+      batch, warmup, repeat, TrueBatchBaseBackend::kWrapperFused);
+}
+
+MultiBatchProbeMetrics run_true_fused_partial_batch_vs_one_stage(
+    std::vector<MultiBatchProbeSequence>* batch,
+    int warmup,
+    int repeat) {
+  CHECK(batch != nullptr);
+  CHECK(!batch->empty());
+  CHECK_GT(batch->front().shape.matched_prefix, 0);
+  return run_true_fused_batch_impl(
+      batch, warmup, repeat, TrueBatchBaseBackend::kOneStage);
+}
+
 }  // namespace
 
 TEST_F(MTGRAttentionOneVsMultiStagePerfTest, MultiBatchWrapperLoopProbeCsv) {
@@ -2183,6 +2591,775 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest, MultiBatchWrapperLoopProbeCsv) {
     }
   }
   std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       TrueMultiBatchFusedNoMatchOddLengthRandomCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 2));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 5));
+  const int group_count = std::max(
+      1, env_int("XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_ODD_GROUPS", 20));
+  const int seed =
+      env_int("XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_ODD_SEED", 20260503);
+  const auto batch_sizes = parse_env_int_list_or_default(
+      "XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_ODD_BATCH_SIZES", {2, 3, 4});
+  const std::string csv_path =
+      csv_path_from_env("XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_ODD_CSV",
+                        "mtgr_attention_true_multi_batch_odd_random.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+  csv << "batch_size,group_id,heads,head_dim,"
+         "s0_history,s0_realtime,s0_target,"
+         "s1_history,s1_realtime,s1_target,"
+         "s2_history,s2_realtime,s2_target,"
+         "s3_history,s3_realtime,s3_target,"
+         "wrapper_fused_device_ms,wrapper_fused_wall_ms,"
+         "batched_fused_device_ms,batched_fused_wall_ms,"
+         "speedup_dev,speedup_wall,delta_dev_ms,delta_wall_ms,"
+         "diff_max_abs,diff_mean_abs\n";
+
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][TrueMultiBatchFusedOddRandom] groups=%d "
+               "warmup=%d repeat=%d seed=%d csv=%s\n",
+               group_count,
+               warmup,
+               repeat,
+               seed,
+               csv_path.c_str());
+
+  for (int batch_size : batch_sizes) {
+    CHECK_GT(batch_size, 1);
+    CHECK_LE(batch_size, 4);
+    std::unordered_set<std::string> seen;
+    double total_wrapper_device = 0.0;
+    double total_wrapper_wall = 0.0;
+    double total_batched_device = 0.0;
+    double total_batched_wall = 0.0;
+    double total_speedup_dev = 0.0;
+    double total_speedup_wall = 0.0;
+    double max_speedup_dev = 0.0;
+    double min_speedup_dev = std::numeric_limits<double>::infinity();
+    double worst_diff_max = 0.0;
+    double worst_diff_mean = 0.0;
+    int regressions = 0;
+    int precision_regressions = 0;
+
+    for (int group_id = 1; group_id <= group_count; ++group_id) {
+      std::vector<MTGRAttentionTestShape> shapes;
+      std::vector<MultiBatchProbeSequence> batch;
+      const bool accepted = build_unique_true_multi_batch_no_match_group(
+          &rng, batch_size, device_, &seen, &shapes, &batch);
+
+      ASSERT_TRUE(accepted) << "failed to build unique odd-length group";
+      const auto avg = run_true_fused_no_match_batch(&batch, warmup, repeat);
+      const double speedup_dev =
+          avg.base_device_total_ms / avg.fused_device_total_ms;
+      const double speedup_wall =
+          avg.base_wall_total_ms / avg.fused_wall_total_ms;
+      const double delta_dev =
+          avg.base_device_total_ms - avg.fused_device_total_ms;
+      const double delta_wall =
+          avg.base_wall_total_ms - avg.fused_wall_total_ms;
+
+      if (speedup_dev < 1.0) {
+        ++regressions;
+      }
+      if (!(avg.diff_max_abs < 1.0e-3) || !(avg.diff_mean_abs < 1.0e-5)) {
+        ++precision_regressions;
+      }
+      total_wrapper_device += avg.base_device_total_ms;
+      total_wrapper_wall += avg.base_wall_total_ms;
+      total_batched_device += avg.fused_device_total_ms;
+      total_batched_wall += avg.fused_wall_total_ms;
+      total_speedup_dev += speedup_dev;
+      total_speedup_wall += speedup_wall;
+      max_speedup_dev = std::max(max_speedup_dev, speedup_dev);
+      min_speedup_dev = std::min(min_speedup_dev, speedup_dev);
+      worst_diff_max = std::max(worst_diff_max, avg.diff_max_abs);
+      worst_diff_mean = std::max(worst_diff_mean, avg.diff_mean_abs);
+
+      std::ostringstream row;
+      row << std::fixed << std::setprecision(6) << batch_size << "," << group_id
+          << "," << shapes.front().heads << "," << shapes.front().head_dim;
+      append_true_multi_batch_shape_cells(row, shapes);
+      row << "," << avg.base_device_total_ms << "," << avg.base_wall_total_ms
+          << "," << avg.fused_device_total_ms << "," << avg.fused_wall_total_ms
+          << "," << speedup_dev << "," << speedup_wall << "," << delta_dev
+          << "," << delta_wall << "," << avg.diff_max_abs << ","
+          << avg.diff_mean_abs;
+      csv << row.str() << "\n";
+      csv.flush();
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][TrueMultiBatchFusedOddRandom "
+                   "batch=%d group=%d/%d] %s\n",
+                   batch_size,
+                   group_id,
+                   group_count,
+                   row.str().c_str());
+      std::fflush(stderr);
+
+      EXPECT_LT(avg.diff_max_abs, 1.0e-3);
+      EXPECT_LT(avg.diff_mean_abs, 1.0e-5);
+    }
+
+    const double inv = 1.0 / static_cast<double>(group_count);
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][TrueMultiBatchFusedOddRandom][Summary] "
+                 "batch_size=%d groups=%d regressions=%d "
+                 "precision_regressions=%d avg_wrapper_device_ms=%.6f "
+                 "avg_wrapper_wall_ms=%.6f avg_batched_device_ms=%.6f "
+                 "avg_batched_wall_ms=%.6f avg_speedup_dev=%.6f "
+                 "avg_speedup_wall=%.6f min_speedup_dev=%.6f "
+                 "max_speedup_dev=%.6f worst_diff_max=%.6e "
+                 "worst_diff_mean=%.6e\n",
+                 batch_size,
+                 group_count,
+                 regressions,
+                 precision_regressions,
+                 total_wrapper_device * inv,
+                 total_wrapper_wall * inv,
+                 total_batched_device * inv,
+                 total_batched_wall * inv,
+                 total_speedup_dev * inv,
+                 total_speedup_wall * inv,
+                 min_speedup_dev,
+                 max_speedup_dev,
+                 worst_diff_max,
+                 worst_diff_mean);
+    std::fflush(stderr);
+  }
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       TrueMultiBatchFusedPartialOddLengthRandomCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 2));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 5));
+  const int group_count = std::max(
+      1,
+      env_int("XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_PARTIAL_ODD_GROUPS", 20));
+  const int seed = env_int(
+      "XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_PARTIAL_ODD_SEED", 20260505);
+  const auto batch_sizes = parse_env_int_list_or_default(
+      "XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_PARTIAL_ODD_BATCH_SIZES",
+      {2, 3, 4});
+  const std::string csv_path = csv_path_from_env(
+      "XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_PARTIAL_ODD_CSV",
+      "mtgr_attention_true_multi_batch_partial_odd_random.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+  csv << "batch_size,group_id,heads,head_dim,"
+         "s0_history,s0_realtime,s0_target,"
+         "s1_history,s1_realtime,s1_target,"
+         "s2_history,s2_realtime,s2_target,"
+         "s3_history,s3_realtime,s3_target,"
+         "wrapper_fused_device_ms,wrapper_fused_wall_ms,"
+         "batched_fused_device_ms,batched_fused_wall_ms,"
+         "speedup_dev,speedup_wall,delta_dev_ms,delta_wall_ms,"
+         "diff_max_abs,diff_mean_abs\n";
+
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][TrueMultiBatchFusedPartialOddRandom] "
+               "groups=%d warmup=%d repeat=%d seed=%d csv=%s\n",
+               group_count,
+               warmup,
+               repeat,
+               seed,
+               csv_path.c_str());
+
+  for (int batch_size : batch_sizes) {
+    CHECK_GT(batch_size, 1);
+    CHECK_LE(batch_size, 4);
+    std::unordered_set<std::string> seen;
+    double total_wrapper_device = 0.0;
+    double total_wrapper_wall = 0.0;
+    double total_batched_device = 0.0;
+    double total_batched_wall = 0.0;
+    double total_speedup_dev = 0.0;
+    double total_speedup_wall = 0.0;
+    double max_speedup_dev = 0.0;
+    double min_speedup_dev = std::numeric_limits<double>::infinity();
+    double worst_diff_max = 0.0;
+    double worst_diff_mean = 0.0;
+    int regressions = 0;
+    int precision_regressions = 0;
+
+    for (int group_id = 1; group_id <= group_count; ++group_id) {
+      std::vector<MTGRAttentionTestShape> shapes;
+      std::vector<MultiBatchProbeSequence> batch;
+      const bool accepted = build_unique_true_multi_batch_partial_group(
+          &rng, batch_size, device_, &seen, &shapes, &batch);
+
+      ASSERT_TRUE(accepted)
+          << "failed to build unique odd-length partial group";
+      const auto avg = run_true_fused_partial_batch(&batch, warmup, repeat);
+      const double speedup_dev =
+          avg.base_device_total_ms / avg.fused_device_total_ms;
+      const double speedup_wall =
+          avg.base_wall_total_ms / avg.fused_wall_total_ms;
+      const double delta_dev =
+          avg.base_device_total_ms - avg.fused_device_total_ms;
+      const double delta_wall =
+          avg.base_wall_total_ms - avg.fused_wall_total_ms;
+
+      if (speedup_dev < 1.0) {
+        ++regressions;
+      }
+      if (!(avg.diff_max_abs < 1.0e-3) || !(avg.diff_mean_abs < 1.0e-5)) {
+        ++precision_regressions;
+      }
+      total_wrapper_device += avg.base_device_total_ms;
+      total_wrapper_wall += avg.base_wall_total_ms;
+      total_batched_device += avg.fused_device_total_ms;
+      total_batched_wall += avg.fused_wall_total_ms;
+      total_speedup_dev += speedup_dev;
+      total_speedup_wall += speedup_wall;
+      max_speedup_dev = std::max(max_speedup_dev, speedup_dev);
+      min_speedup_dev = std::min(min_speedup_dev, speedup_dev);
+      worst_diff_max = std::max(worst_diff_max, avg.diff_max_abs);
+      worst_diff_mean = std::max(worst_diff_mean, avg.diff_mean_abs);
+
+      std::ostringstream row;
+      row << std::fixed << std::setprecision(6) << batch_size << "," << group_id
+          << "," << shapes.front().heads << "," << shapes.front().head_dim;
+      append_true_multi_batch_shape_cells(row, shapes);
+      row << "," << avg.base_device_total_ms << "," << avg.base_wall_total_ms
+          << "," << avg.fused_device_total_ms << "," << avg.fused_wall_total_ms
+          << "," << speedup_dev << "," << speedup_wall << "," << delta_dev
+          << "," << delta_wall << "," << avg.diff_max_abs << ","
+          << avg.diff_mean_abs;
+      csv << row.str() << "\n";
+      csv.flush();
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][TrueMultiBatchFusedPartialOddRandom "
+                   "batch=%d group=%d/%d] %s\n",
+                   batch_size,
+                   group_id,
+                   group_count,
+                   row.str().c_str());
+      std::fflush(stderr);
+
+      EXPECT_LT(avg.diff_max_abs, 1.0e-3);
+      EXPECT_LT(avg.diff_mean_abs, 1.0e-5);
+    }
+
+    const double inv = 1.0 / static_cast<double>(group_count);
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][TrueMultiBatchFusedPartialOddRandom]"
+                 "[Summary] batch_size=%d groups=%d regressions=%d "
+                 "precision_regressions=%d avg_wrapper_device_ms=%.6f "
+                 "avg_wrapper_wall_ms=%.6f avg_batched_device_ms=%.6f "
+                 "avg_batched_wall_ms=%.6f avg_speedup_dev=%.6f "
+                 "avg_speedup_wall=%.6f min_speedup_dev=%.6f "
+                 "max_speedup_dev=%.6f worst_diff_max=%.6e "
+                 "worst_diff_mean=%.6e\n",
+                 batch_size,
+                 group_count,
+                 regressions,
+                 precision_regressions,
+                 total_wrapper_device * inv,
+                 total_wrapper_wall * inv,
+                 total_batched_device * inv,
+                 total_batched_wall * inv,
+                 total_speedup_dev * inv,
+                 total_speedup_wall * inv,
+                 min_speedup_dev,
+                 max_speedup_dev,
+                 worst_diff_max,
+                 worst_diff_mean);
+    std::fflush(stderr);
+  }
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       TrueMultiBatchFusedVsOneStageOddLengthRandomCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 1));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 2));
+  const int groups_per_batch = std::max(
+      1, env_int("XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_ONE_STAGE_GROUPS", 250));
+  const int seed =
+      env_int("XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_ONE_STAGE_SEED", 20260504);
+  const auto batch_sizes = parse_env_int_list_or_default(
+      "XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_ONE_STAGE_BATCH_SIZES",
+      {1, 2, 3, 4});
+  const std::string csv_path = csv_path_from_env(
+      "XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_ONE_STAGE_CSV",
+      "mtgr_attention_true_multi_batch_vs_one_stage_odd_random.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+  csv << "batch_size,group_id,heads,head_dim,"
+         "s0_history,s0_realtime,s0_target,"
+         "s1_history,s1_realtime,s1_target,"
+         "s2_history,s2_realtime,s2_target,"
+         "s3_history,s3_realtime,s3_target,"
+         "one_stage_mask_build_ms,one_stage_device_ms,"
+         "one_stage_mask_build_plus_device_ms,one_stage_wall_ms,"
+         "batched_fused_device_ms,batched_fused_wall_ms,"
+         "speedup_dev,speedup_wall,delta_dev_ms,delta_wall_ms,"
+         "diff_max_abs,diff_mean_abs\n";
+
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][TrueMultiBatchVsOneStageOddRandom] "
+               "groups_per_batch=%d warmup=%d repeat=%d seed=%d csv=%s\n",
+               groups_per_batch,
+               warmup,
+               repeat,
+               seed,
+               csv_path.c_str());
+
+  for (int batch_size : batch_sizes) {
+    CHECK_GT(batch_size, 0);
+    CHECK_LE(batch_size, 4);
+    std::unordered_set<std::string> seen;
+    double total_base_mask_build = 0.0;
+    double total_base_device = 0.0;
+    double total_base_mask_plus_device = 0.0;
+    double total_base_wall = 0.0;
+    double total_fused_device = 0.0;
+    double total_fused_wall = 0.0;
+    double total_speedup_dev = 0.0;
+    double total_speedup_wall = 0.0;
+    double min_speedup_dev = std::numeric_limits<double>::infinity();
+    double max_speedup_dev = 0.0;
+    double worst_diff_max = 0.0;
+    double worst_diff_mean = 0.0;
+    int regressions = 0;
+    int precision_regressions = 0;
+
+    for (int group_id = 1; group_id <= groups_per_batch; ++group_id) {
+      std::vector<MTGRAttentionTestShape> shapes;
+      std::vector<MultiBatchProbeSequence> batch;
+      const bool accepted = build_unique_true_multi_batch_no_match_group(
+          &rng, batch_size, device_, &seen, &shapes, &batch);
+
+      ASSERT_TRUE(accepted) << "failed to build unique odd-length group";
+      const auto avg =
+          run_true_fused_no_match_batch_vs_one_stage(&batch, warmup, repeat);
+      const double base_mask_build_plus_device_ms =
+          avg.base_mask_build_ms + avg.base_device_total_ms;
+      const double speedup_dev =
+          base_mask_build_plus_device_ms / avg.fused_device_total_ms;
+      const double speedup_wall =
+          avg.base_wall_total_ms / avg.fused_wall_total_ms;
+      const double delta_dev =
+          base_mask_build_plus_device_ms - avg.fused_device_total_ms;
+      const double delta_wall =
+          avg.base_wall_total_ms - avg.fused_wall_total_ms;
+
+      if (speedup_dev < 1.0) {
+        ++regressions;
+      }
+      if (!(avg.diff_max_abs < 1.0e-3) || !(avg.diff_mean_abs < 1.0e-5)) {
+        ++precision_regressions;
+      }
+
+      total_base_mask_build += avg.base_mask_build_ms;
+      total_base_device += avg.base_device_total_ms;
+      total_base_mask_plus_device += base_mask_build_plus_device_ms;
+      total_base_wall += avg.base_wall_total_ms;
+      total_fused_device += avg.fused_device_total_ms;
+      total_fused_wall += avg.fused_wall_total_ms;
+      total_speedup_dev += speedup_dev;
+      total_speedup_wall += speedup_wall;
+      min_speedup_dev = std::min(min_speedup_dev, speedup_dev);
+      max_speedup_dev = std::max(max_speedup_dev, speedup_dev);
+      worst_diff_max = std::max(worst_diff_max, avg.diff_max_abs);
+      worst_diff_mean = std::max(worst_diff_mean, avg.diff_mean_abs);
+
+      std::ostringstream row;
+      row << std::fixed << std::setprecision(6) << batch_size << "," << group_id
+          << "," << shapes.front().heads << "," << shapes.front().head_dim;
+      append_true_multi_batch_shape_cells(row, shapes);
+      row << "," << avg.base_mask_build_ms << "," << avg.base_device_total_ms
+          << "," << base_mask_build_plus_device_ms << ","
+          << avg.base_wall_total_ms << "," << avg.fused_device_total_ms << ","
+          << avg.fused_wall_total_ms << "," << speedup_dev << ","
+          << speedup_wall << "," << delta_dev << "," << delta_wall << ","
+          << avg.diff_max_abs << "," << avg.diff_mean_abs;
+      csv << row.str() << "\n";
+      csv.flush();
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Perf][TrueMultiBatchVsOneStageOddRandom "
+                   "batch=%d group=%d/%d] %s\n",
+                   batch_size,
+                   group_id,
+                   groups_per_batch,
+                   row.str().c_str());
+      std::fflush(stderr);
+
+      EXPECT_LT(avg.diff_max_abs, 1.0e-3);
+      EXPECT_LT(avg.diff_mean_abs, 1.0e-5);
+    }
+
+    const double inv = 1.0 / static_cast<double>(groups_per_batch);
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][TrueMultiBatchVsOneStageOddRandom]"
+                 "[Summary] batch_size=%d groups=%d regressions=%d "
+                 "precision_regressions=%d avg_base_mask_build_ms=%.6f "
+                 "avg_base_device_ms=%.6f avg_base_mask_plus_device_ms=%.6f "
+                 "avg_base_wall_ms=%.6f avg_fused_device_ms=%.6f "
+                 "avg_fused_wall_ms=%.6f avg_speedup_dev=%.6f "
+                 "avg_speedup_wall=%.6f min_speedup_dev=%.6f "
+                 "max_speedup_dev=%.6f worst_diff_max=%.6e "
+                 "worst_diff_mean=%.6e\n",
+                 batch_size,
+                 groups_per_batch,
+                 regressions,
+                 precision_regressions,
+                 total_base_mask_build * inv,
+                 total_base_device * inv,
+                 total_base_mask_plus_device * inv,
+                 total_base_wall * inv,
+                 total_fused_device * inv,
+                 total_fused_wall * inv,
+                 total_speedup_dev * inv,
+                 total_speedup_wall * inv,
+                 min_speedup_dev,
+                 max_speedup_dev,
+                 worst_diff_max,
+                 worst_diff_mean);
+    std::fflush(stderr);
+  }
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       TrueMultiBatchFusedPartialVsOneStageOddLengthRandomCsv) {
+  torch::NoGradGuard no_grad_guard;
+  const int warmup = std::max(0, env_int("XLLM_MTGR_ATTENTION_WARMUP", 1));
+  const int repeat = std::max(1, env_int("XLLM_MTGR_ATTENTION_REPEAT", 2));
+  const int groups_per_batch = std::max(
+      1,
+      env_int("XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_PARTIAL_ONE_STAGE_GROUPS",
+              250));
+  const int seed = env_int(
+      "XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_PARTIAL_ONE_STAGE_SEED", 20260506);
+  const auto batch_sizes = parse_env_int_list_or_default(
+      "XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_PARTIAL_ONE_STAGE_BATCH_SIZES",
+      {1, 2, 3, 4});
+  const std::string csv_path = csv_path_from_env(
+      "XLLM_MTGR_ATTENTION_TRUE_MULTI_BATCH_PARTIAL_ONE_STAGE_CSV",
+      "mtgr_attention_true_multi_batch_partial_vs_one_stage_odd_random.csv");
+  std::ofstream csv(csv_path, std::ios::out | std::ios::trunc);
+  CHECK(csv.is_open()) << "failed to open csv path: " << csv_path;
+  csv << "batch_size,group_id,heads,head_dim,"
+         "s0_history,s0_realtime,s0_target,"
+         "s1_history,s1_realtime,s1_target,"
+         "s2_history,s2_realtime,s2_target,"
+         "s3_history,s3_realtime,s3_target,"
+         "one_stage_mask_build_ms,one_stage_device_ms,"
+         "one_stage_mask_build_plus_device_ms,one_stage_wall_ms,"
+         "batched_fused_device_ms,batched_fused_wall_ms,"
+         "speedup_dev,speedup_wall,delta_dev_ms,delta_wall_ms,"
+         "diff_max_abs,diff_mean_abs\n";
+
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][TrueMultiBatchPartialVsOneStageOddRandom] "
+               "groups_per_batch=%d warmup=%d repeat=%d seed=%d csv=%s\n",
+               groups_per_batch,
+               warmup,
+               repeat,
+               seed,
+               csv_path.c_str());
+
+  for (int batch_size : batch_sizes) {
+    CHECK_GT(batch_size, 0);
+    CHECK_LE(batch_size, 4);
+    std::unordered_set<std::string> seen;
+    double total_base_mask_build = 0.0;
+    double total_base_device = 0.0;
+    double total_base_mask_plus_device = 0.0;
+    double total_base_wall = 0.0;
+    double total_fused_device = 0.0;
+    double total_fused_wall = 0.0;
+    double total_speedup_dev = 0.0;
+    double total_speedup_wall = 0.0;
+    double min_speedup_dev = std::numeric_limits<double>::infinity();
+    double max_speedup_dev = 0.0;
+    double worst_diff_max = 0.0;
+    double worst_diff_mean = 0.0;
+    int regressions = 0;
+    int precision_regressions = 0;
+
+    for (int group_id = 1; group_id <= groups_per_batch; ++group_id) {
+      std::vector<MTGRAttentionTestShape> shapes;
+      std::vector<MultiBatchProbeSequence> batch;
+      const bool accepted = build_unique_true_multi_batch_partial_group(
+          &rng, batch_size, device_, &seen, &shapes, &batch);
+
+      ASSERT_TRUE(accepted)
+          << "failed to build unique odd-length partial group";
+      const auto avg =
+          run_true_fused_partial_batch_vs_one_stage(&batch, warmup, repeat);
+      const double base_mask_build_plus_device_ms =
+          avg.base_mask_build_ms + avg.base_device_total_ms;
+      const double speedup_dev =
+          base_mask_build_plus_device_ms / avg.fused_device_total_ms;
+      const double speedup_wall =
+          avg.base_wall_total_ms / avg.fused_wall_total_ms;
+      const double delta_dev =
+          base_mask_build_plus_device_ms - avg.fused_device_total_ms;
+      const double delta_wall =
+          avg.base_wall_total_ms - avg.fused_wall_total_ms;
+
+      if (speedup_dev < 1.0) {
+        ++regressions;
+      }
+      if (!(avg.diff_max_abs < 1.0e-3) || !(avg.diff_mean_abs < 1.0e-5)) {
+        ++precision_regressions;
+      }
+
+      total_base_mask_build += avg.base_mask_build_ms;
+      total_base_device += avg.base_device_total_ms;
+      total_base_mask_plus_device += base_mask_build_plus_device_ms;
+      total_base_wall += avg.base_wall_total_ms;
+      total_fused_device += avg.fused_device_total_ms;
+      total_fused_wall += avg.fused_wall_total_ms;
+      total_speedup_dev += speedup_dev;
+      total_speedup_wall += speedup_wall;
+      min_speedup_dev = std::min(min_speedup_dev, speedup_dev);
+      max_speedup_dev = std::max(max_speedup_dev, speedup_dev);
+      worst_diff_max = std::max(worst_diff_max, avg.diff_max_abs);
+      worst_diff_mean = std::max(worst_diff_mean, avg.diff_mean_abs);
+
+      std::ostringstream row;
+      row << std::fixed << std::setprecision(6) << batch_size << "," << group_id
+          << "," << shapes.front().heads << "," << shapes.front().head_dim;
+      append_true_multi_batch_shape_cells(row, shapes);
+      row << "," << avg.base_mask_build_ms << "," << avg.base_device_total_ms
+          << "," << base_mask_build_plus_device_ms << ","
+          << avg.base_wall_total_ms << "," << avg.fused_device_total_ms << ","
+          << avg.fused_wall_total_ms << "," << speedup_dev << ","
+          << speedup_wall << "," << delta_dev << "," << delta_wall << ","
+          << avg.diff_max_abs << "," << avg.diff_mean_abs;
+      csv << row.str() << "\n";
+      csv.flush();
+      std::fprintf(
+          stderr,
+          "[MTGR][CUDA][Perf][TrueMultiBatchPartialVsOneStageOddRandom "
+          "batch=%d group=%d/%d] %s\n",
+          batch_size,
+          group_id,
+          groups_per_batch,
+          row.str().c_str());
+      std::fflush(stderr);
+
+      EXPECT_LT(avg.diff_max_abs, 1.0e-3);
+      EXPECT_LT(avg.diff_mean_abs, 1.0e-5);
+    }
+
+    const double inv = 1.0 / static_cast<double>(groups_per_batch);
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Perf][TrueMultiBatchPartialVsOneStageOddRandom]"
+                 "[Summary] batch_size=%d groups=%d regressions=%d "
+                 "precision_regressions=%d avg_base_mask_build_ms=%.6f "
+                 "avg_base_device_ms=%.6f avg_base_mask_plus_device_ms=%.6f "
+                 "avg_base_wall_ms=%.6f avg_fused_device_ms=%.6f "
+                 "avg_fused_wall_ms=%.6f avg_speedup_dev=%.6f "
+                 "avg_speedup_wall=%.6f min_speedup_dev=%.6f "
+                 "max_speedup_dev=%.6f worst_diff_max=%.6e "
+                 "worst_diff_mean=%.6e\n",
+                 batch_size,
+                 groups_per_batch,
+                 regressions,
+                 precision_regressions,
+                 total_base_mask_build * inv,
+                 total_base_device * inv,
+                 total_base_mask_plus_device * inv,
+                 total_base_wall * inv,
+                 total_fused_device * inv,
+                 total_fused_wall * inv,
+                 total_speedup_dev * inv,
+                 total_speedup_wall * inv,
+                 min_speedup_dev,
+                 max_speedup_dev,
+                 worst_diff_max,
+                 worst_diff_mean);
+    std::fflush(stderr);
+  }
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest, TrueMultiBatchFusedNoMatchSmoke) {
+  std::vector<MTGRAttentionTestShape> shapes(4);
+  for (auto& shape : shapes) {
+    shape.heads = 8;
+    shape.kv_heads = 8;
+    shape.head_dim = 128;
+    shape.context = 8;
+    shape.matched_prefix = 0;
+  }
+  shapes[0].history = 2048;
+  shapes[0].realtime = 512;
+  shapes[0].target = 1600;
+  shapes[1].history = 1985;
+  shapes[1].realtime = 447;
+  shapes[1].target = 1537;
+  shapes[2].history = 2113;
+  shapes[2].realtime = 385;
+  shapes[2].target = 1409;
+  shapes[3].history = 1793;
+  shapes[3].realtime = 577;
+  shapes[3].target = 1665;
+
+  std::vector<MultiBatchProbeSequence> batch;
+  batch.reserve(shapes.size());
+  for (const auto& shape : shapes) {
+    batch.push_back(make_probe_sequence(shape, device_));
+  }
+
+  const int warmup = env_int("MTGR_BATCHED_FUSED_WARMUP", 1);
+  const int repeat = env_int("MTGR_BATCHED_FUSED_REPEAT", 3);
+  const auto avg = run_true_fused_no_match_batch(&batch, warmup, repeat);
+  const double device_speedup =
+      avg.base_device_total_ms / avg.fused_device_total_ms;
+  const double wall_speedup = avg.base_wall_total_ms / avg.fused_wall_total_ms;
+
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][TrueMultiBatchFusedNoMatch] "
+               "wrapper_fused_device=%.6f batched_fused_device=%.6f "
+               "device_speedup=%.6f wrapper_fused_wall=%.6f "
+               "batched_fused_wall=%.6f wall_speedup=%.6f "
+               "diff_max=%.6e diff_mean=%.6e\n",
+               avg.base_device_total_ms,
+               avg.fused_device_total_ms,
+               device_speedup,
+               avg.base_wall_total_ms,
+               avg.fused_wall_total_ms,
+               wall_speedup,
+               avg.diff_max_abs,
+               avg.diff_mean_abs);
+  std::fflush(stderr);
+
+  EXPECT_LT(avg.diff_max_abs, 1.0e-3);
+  EXPECT_LT(avg.diff_mean_abs, 1.0e-5);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest, TrueMultiBatchFusedPartialSmoke) {
+  std::vector<MTGRAttentionTestShape> shapes(4);
+  for (auto& shape : shapes) {
+    shape.heads = 8;
+    shape.kv_heads = 8;
+    shape.head_dim = 128;
+    shape.context = 8;
+  }
+  shapes[0].history = 2048;
+  shapes[0].realtime = 512;
+  shapes[0].target = 1600;
+  shapes[0].matched_prefix = shapes[0].history + shapes[0].context + 409;
+  shapes[1].history = 1985;
+  shapes[1].realtime = 447;
+  shapes[1].target = 1537;
+  shapes[1].matched_prefix = shapes[1].history + shapes[1].context + 347;
+  shapes[2].history = 2113;
+  shapes[2].realtime = 385;
+  shapes[2].target = 1409;
+  shapes[2].matched_prefix = shapes[2].history + shapes[2].context + 289;
+  shapes[3].history = 1793;
+  shapes[3].realtime = 577;
+  shapes[3].target = 1665;
+  shapes[3].matched_prefix = shapes[3].history + shapes[3].context + 449;
+
+  std::vector<MultiBatchProbeSequence> batch;
+  batch.reserve(shapes.size());
+  for (const auto& shape : shapes) {
+    batch.push_back(make_probe_sequence(shape, device_));
+  }
+
+  const int warmup = env_int("MTGR_BATCHED_FUSED_WARMUP", 1);
+  const int repeat = env_int("MTGR_BATCHED_FUSED_REPEAT", 3);
+  const auto avg = run_true_fused_partial_batch(&batch, warmup, repeat);
+  const double device_speedup =
+      avg.base_device_total_ms / avg.fused_device_total_ms;
+  const double wall_speedup = avg.base_wall_total_ms / avg.fused_wall_total_ms;
+
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][TrueMultiBatchFusedPartial] "
+               "wrapper_fused_device=%.6f batched_fused_device=%.6f "
+               "device_speedup=%.6f wrapper_fused_wall=%.6f "
+               "batched_fused_wall=%.6f wall_speedup=%.6f "
+               "diff_max=%.6e diff_mean=%.6e\n",
+               avg.base_device_total_ms,
+               avg.fused_device_total_ms,
+               device_speedup,
+               avg.base_wall_total_ms,
+               avg.fused_wall_total_ms,
+               wall_speedup,
+               avg.diff_max_abs,
+               avg.diff_mean_abs);
+  std::fflush(stderr);
+
+  EXPECT_LT(avg.diff_max_abs, 1.0e-3);
+  EXPECT_LT(avg.diff_mean_abs, 1.0e-5);
+}
+
+TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
+       TrueMultiBatchFusedPartialVsOneStageSmoke) {
+  std::vector<MTGRAttentionTestShape> shapes(4);
+  for (auto& shape : shapes) {
+    shape.heads = 8;
+    shape.kv_heads = 8;
+    shape.head_dim = 128;
+    shape.context = 8;
+  }
+  shapes[0].history = 2048;
+  shapes[0].realtime = 512;
+  shapes[0].target = 1600;
+  shapes[0].matched_prefix = shapes[0].history + shapes[0].context + 409;
+  shapes[1].history = 1985;
+  shapes[1].realtime = 447;
+  shapes[1].target = 1537;
+  shapes[1].matched_prefix = shapes[1].history + shapes[1].context + 347;
+  shapes[2].history = 2113;
+  shapes[2].realtime = 385;
+  shapes[2].target = 1409;
+  shapes[2].matched_prefix = shapes[2].history + shapes[2].context + 289;
+  shapes[3].history = 1793;
+  shapes[3].realtime = 577;
+  shapes[3].target = 1665;
+  shapes[3].matched_prefix = shapes[3].history + shapes[3].context + 449;
+
+  std::vector<MultiBatchProbeSequence> batch;
+  batch.reserve(shapes.size());
+  for (const auto& shape : shapes) {
+    batch.push_back(make_probe_sequence(shape, device_));
+  }
+
+  const int warmup = env_int("MTGR_BATCHED_FUSED_WARMUP", 1);
+  const int repeat = env_int("MTGR_BATCHED_FUSED_REPEAT", 3);
+  const auto avg =
+      run_true_fused_partial_batch_vs_one_stage(&batch, warmup, repeat);
+  const double base_mask_build_plus_device_ms =
+      avg.base_mask_build_ms + avg.base_device_total_ms;
+  const double device_speedup =
+      base_mask_build_plus_device_ms / avg.fused_device_total_ms;
+  const double wall_speedup = avg.base_wall_total_ms / avg.fused_wall_total_ms;
+
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Perf][TrueMultiBatchFusedPartialVsOneStage] "
+               "one_stage_mask_build=%.6f one_stage_device=%.6f "
+               "one_stage_mask_plus_device=%.6f batched_fused_device=%.6f "
+               "device_speedup=%.6f one_stage_wall=%.6f "
+               "batched_fused_wall=%.6f wall_speedup=%.6f "
+               "diff_max=%.6e diff_mean=%.6e\n",
+               avg.base_mask_build_ms,
+               avg.base_device_total_ms,
+               base_mask_build_plus_device_ms,
+               avg.fused_device_total_ms,
+               device_speedup,
+               avg.base_wall_total_ms,
+               avg.fused_wall_total_ms,
+               wall_speedup,
+               avg.diff_max_abs,
+               avg.diff_mean_abs);
+  std::fflush(stderr);
+
+  EXPECT_LT(avg.diff_max_abs, 1.0e-3);
+  EXPECT_LT(avg.diff_mean_abs, 1.0e-5);
 }
 
 }  // namespace xllm::kernel::cuda::test

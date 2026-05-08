@@ -18,8 +18,14 @@ limitations under the License.
 #include <torch/cuda.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <random>
+#include <sstream>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "core/common/global_flags.h"
 #include "layers/cuda/mtgr_attention.h"
@@ -31,6 +37,64 @@ namespace {
 constexpr double kMaxAbs = 2.0e-1;
 constexpr double kMeanAbs = 5.0e-3;
 constexpr int64_t kBlockSize = 128;
+
+struct MultiBatchPrecisionMetrics {
+  double max_abs = 0.0;
+  double mean_abs = 0.0;
+  bool finite = true;
+};
+
+int64_t sample_non_aligned_len(std::mt19937_64* rng, int64_t lo, int64_t hi) {
+  CHECK(rng != nullptr);
+  CHECK_LE(lo, hi);
+  std::uniform_int_distribution<int64_t> dist(lo, hi);
+  for (int attempt = 0; attempt < 1024; ++attempt) {
+    const int64_t v = dist(*rng);
+    if ((v % 32) != 0 && (v % 64) != 0) {
+      return v;
+    }
+  }
+  int64_t v = dist(*rng);
+  if ((v % 32) != 0 && (v % 64) != 0) {
+    return v;
+  }
+  if (v < hi) {
+    ++v;
+  } else if (v > lo) {
+    --v;
+  }
+  return v;
+}
+
+std::string describe_multi_batch_shapes(
+    const std::vector<MTGRAttentionTestShape>& shapes) {
+  std::ostringstream oss;
+  for (size_t i = 0; i < shapes.size(); ++i) {
+    if (i != 0) {
+      oss << " | ";
+    }
+    const auto& shape = shapes[i];
+    oss << "#" << i << "(h=" << shape.history << ",r=" << shape.realtime
+        << ",t=" << shape.target << ")";
+  }
+  return oss.str();
+}
+
+MTGRAttentionTestShape sample_odd_no_match_shape(std::mt19937_64* rng,
+                                                 int64_t heads,
+                                                 int64_t head_dim) {
+  CHECK(rng != nullptr);
+  MTGRAttentionTestShape shape;
+  shape.heads = heads;
+  shape.kv_heads = heads;
+  shape.head_dim = head_dim;
+  shape.history = sample_non_aligned_len(rng, 1350, 4096);
+  shape.context = 8;
+  shape.realtime = sample_non_aligned_len(rng, 100, 600);
+  shape.target = sample_non_aligned_len(rng, 800, 2400);
+  shape.matched_prefix = 0;
+  return shape;
+}
 
 class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
  protected:
@@ -259,6 +323,144 @@ class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
     EXPECT_TRUE(threshold_ok);
   }
 
+  MultiBatchPrecisionMetrics measure_multi_batch_fused_case(
+      const char* name,
+      const std::vector<MTGRAttentionTestShape>& shapes) {
+    CHECK(!shapes.empty());
+    const auto& ref = shapes.front();
+    const float scale = 1.0f / std::sqrt(static_cast<float>(ref.head_dim));
+    auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+    const bool all_no_match =
+        std::all_of(shapes.begin(), shapes.end(), [](const auto& shape) {
+          return shape.matched_prefix == 0;
+        });
+    const bool all_partial =
+        std::all_of(shapes.begin(), shapes.end(), [](const auto& shape) {
+          return shape.matched_prefix > 0;
+        });
+    CHECK(all_no_match || all_partial)
+        << "Mixed no_match and partial_match batches are not supported";
+
+    std::vector<torch::Tensor> packed_queries;
+    std::vector<torch::Tensor> packed_keys;
+    std::vector<torch::Tensor> packed_values;
+    std::vector<torch::Tensor> full_keys;
+    std::vector<torch::Tensor> full_values;
+    std::vector<torch::Tensor> baseline_outputs;
+    packed_queries.reserve(shapes.size());
+    packed_keys.reserve(shapes.size());
+    packed_values.reserve(shapes.size());
+    full_keys.reserve(shapes.size());
+    full_values.reserve(shapes.size());
+    baseline_outputs.reserve(shapes.size());
+
+    xllm::layer::MTGRAttentionImpl one_stage(
+        ref.heads,
+        ref.head_dim,
+        scale,
+        ref.kv_heads,
+        xllm::layer::MTGRAttentionBackend::kOneStage);
+    for (const auto& shape : shapes) {
+      CHECK_EQ(shape.heads, ref.heads);
+      CHECK_EQ(shape.kv_heads, ref.kv_heads);
+      CHECK_EQ(shape.head_dim, ref.head_dim);
+
+      const int64_t total = shape.total_len();
+      const int64_t local = shape.local_len();
+      auto full_query =
+          torch::randn({1, total, shape.heads, shape.head_dim}, opts) * 0.05;
+      auto full_key =
+          torch::randn({1, total, shape.kv_heads, shape.head_dim}, opts) * 0.05;
+      auto full_value =
+          torch::randn({1, total, shape.kv_heads, shape.head_dim}, opts) * 0.05;
+
+      auto query = full_query.select(0, 0)
+                       .narrow(0, shape.matched_prefix, local)
+                       .contiguous()
+                       .view({local, shape.heads * shape.head_dim});
+      auto key = full_key.select(0, 0)
+                     .narrow(0, shape.matched_prefix, local)
+                     .contiguous()
+                     .view({local, shape.kv_heads * shape.head_dim});
+      auto value = full_value.select(0, 0)
+                       .narrow(0, shape.matched_prefix, local)
+                       .contiguous()
+                       .view({local, shape.kv_heads * shape.head_dim});
+
+      auto metadata = make_mtgr_attention_metadata(shape, device_, kBlockSize);
+      auto one_cache =
+          make_mtgr_kv_cache(shape, device_, torch::kFloat16, kBlockSize);
+      prefill_mtgr_matched_prefix_cache(
+          full_key, full_value, shape, kBlockSize, one_cache);
+      baseline_outputs.push_back(std::get<0>(
+          one_stage.forward(metadata, query, key, value, one_cache)));
+      packed_queries.push_back(query);
+      packed_keys.push_back(key);
+      packed_values.push_back(value);
+      full_keys.push_back(full_key.contiguous());
+      full_values.push_back(full_value.contiguous());
+    }
+
+    auto packed_query = torch::cat(packed_queries, 0).contiguous();
+    auto packed_key = torch::cat(packed_keys, 0).contiguous();
+    auto packed_value = torch::cat(packed_values, 0).contiguous();
+    auto baseline_output = torch::cat(baseline_outputs, 0).contiguous();
+
+    xllm::layer::MTGRAttentionImpl fused(
+        ref.heads,
+        ref.head_dim,
+        scale,
+        ref.kv_heads,
+        xllm::layer::MTGRAttentionBackend::kFused);
+    torch::Tensor fused_output;
+    if (all_no_match) {
+      auto batch_metadata =
+          make_mtgr_attention_metadata(shapes, device_, kBlockSize);
+      xllm::KVCache empty_cache;
+      fused_output = std::get<0>(fused.forward(
+          batch_metadata, packed_query, packed_key, packed_value, empty_cache));
+    } else {
+      auto batch_setup = make_mtgr_partial_batch_setup(
+          shapes, full_keys, full_values, device_, torch::kFloat16, kBlockSize);
+      fused_output = std::get<0>(fused.forward(batch_setup.metadata,
+                                               packed_query,
+                                               packed_key,
+                                               packed_value,
+                                               batch_setup.kv_cache));
+    }
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    auto baseline_f32 = baseline_output.to(torch::kFloat32);
+    auto fused_f32 = fused_output.to(torch::kFloat32);
+    auto diff = (baseline_f32 - fused_f32).abs();
+    const double max_abs = diff.max().item<double>();
+    const double mean_abs = diff.mean().item<double>();
+    std::fprintf(stderr,
+                 "[MTGR][CUDA][Precision][%s] batch=%zu rows=%lld "
+                 "max_abs=%.6e mean_abs=%.6e\n",
+                 name,
+                 shapes.size(),
+                 static_cast<long long>(packed_query.size(0)),
+                 max_abs,
+                 mean_abs);
+    std::fflush(stderr);
+
+    MultiBatchPrecisionMetrics metrics;
+    metrics.max_abs = max_abs;
+    metrics.mean_abs = mean_abs;
+    metrics.finite = torch::isfinite(fused_output).all().item<bool>();
+    return metrics;
+  }
+
+  void run_multi_batch_fused_case(
+      const char* name,
+      const std::vector<MTGRAttentionTestShape>& shapes) {
+    const auto metrics = measure_multi_batch_fused_case(name, shapes);
+    ASSERT_TRUE(metrics.finite);
+    EXPECT_LT(metrics.max_abs, kMaxAbs);
+    EXPECT_LT(metrics.mean_abs, kMeanAbs);
+  }
+
   torch::Device device_ = torch::Device(torch::kCPU);
 };
 
@@ -319,6 +521,257 @@ TEST_F(MTGRAttentionE2EPrecisionTest,
   run_case_vs_backend("fused_partial_real_time_match_hot_shape",
                       shape,
                       xllm::layer::MTGRAttentionBackend::kFused);
+}
+
+TEST_F(MTGRAttentionE2EPrecisionTest,
+       FusedNoMatchMultiBatchAlignsWithOneStage) {
+  std::vector<MTGRAttentionTestShape> shapes(4);
+  for (auto& shape : shapes) {
+    shape.heads = 8;
+    shape.kv_heads = 8;
+    shape.head_dim = 128;
+    shape.context = 8;
+    shape.matched_prefix = 0;
+  }
+  shapes[0].history = 513;
+  shapes[0].realtime = 161;
+  shapes[0].target = 321;
+  shapes[1].history = 1027;
+  shapes[1].realtime = 193;
+  shapes[1].target = 287;
+  shapes[2].history = 769;
+  shapes[2].realtime = 257;
+  shapes[2].target = 415;
+  shapes[3].history = 1537;
+  shapes[3].realtime = 129;
+  shapes[3].target = 511;
+  run_multi_batch_fused_case("fused_no_match_multi_batch", shapes);
+}
+
+TEST_F(MTGRAttentionE2EPrecisionTest,
+       FusedPartialMultiBatchAlignsWithOneStage) {
+  std::vector<MTGRAttentionTestShape> shapes(4);
+  for (auto& shape : shapes) {
+    shape.heads = 8;
+    shape.kv_heads = 8;
+    shape.head_dim = 128;
+    shape.context = 8;
+  }
+  shapes[0].history = 513;
+  shapes[0].realtime = 161;
+  shapes[0].target = 321;
+  shapes[0].matched_prefix = shapes[0].history + shapes[0].context + 129;
+  shapes[1].history = 1027;
+  shapes[1].realtime = 193;
+  shapes[1].target = 287;
+  shapes[1].matched_prefix = shapes[1].history + shapes[1].context + 151;
+  shapes[2].history = 769;
+  shapes[2].realtime = 257;
+  shapes[2].target = 415;
+  shapes[2].matched_prefix = shapes[2].history + shapes[2].context + 201;
+  shapes[3].history = 1537;
+  shapes[3].realtime = 129;
+  shapes[3].target = 511;
+  shapes[3].matched_prefix = shapes[3].history + shapes[3].context + 97;
+  run_multi_batch_fused_case("fused_partial_multi_batch", shapes);
+}
+
+TEST_F(MTGRAttentionE2EPrecisionTest, FusedNoMatchMultiBatchOddLengthRandom) {
+  const int groups_per_batch_size = std::max(
+      1, env_int("XLLM_MTGR_ATTENTION_MULTI_BATCH_ODD_RANDOM_GROUPS", 8));
+  const int seed =
+      env_int("XLLM_MTGR_ATTENTION_MULTI_BATCH_ODD_RANDOM_SEED", 20260503);
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  const std::vector<int64_t> heads_all = {4, 8, 12};
+  const std::vector<int64_t> head_dims_all = {64, 128};
+  std::uniform_int_distribution<int> heads_dist(
+      0, static_cast<int>(heads_all.size() - 1));
+  std::uniform_int_distribution<int> head_dim_dist(
+      0, static_cast<int>(head_dims_all.size() - 1));
+
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Precision][FusedNoMatchMultiBatchOddRandom] "
+               "groups_per_batch_size=%d seed=%d\n",
+               groups_per_batch_size,
+               seed);
+
+  int completed = 0;
+  double total_mean_abs = 0.0;
+  double worst_max_abs = 0.0;
+  double worst_mean_abs = 0.0;
+  for (int batch_size : {2, 3, 4}) {
+    std::unordered_set<std::string> seen;
+    for (int group_id = 1; group_id <= groups_per_batch_size; ++group_id) {
+      std::vector<MTGRAttentionTestShape> shapes;
+      bool accepted = false;
+      for (int attempt = 0; attempt < 256 && !accepted; ++attempt) {
+        shapes.clear();
+        const int64_t heads = heads_all[heads_dist(rng)];
+        const int64_t head_dim = head_dims_all[head_dim_dist(rng)];
+        std::unordered_set<std::string> local_seen;
+        for (int i = 0; i < batch_size; ++i) {
+          MTGRAttentionTestShape shape =
+              sample_odd_no_match_shape(&rng, heads, head_dim);
+          const std::string local_key = std::to_string(shape.history) + "_" +
+                                        std::to_string(shape.realtime) + "_" +
+                                        std::to_string(shape.target);
+          if (!local_seen.insert(local_key).second) {
+            shapes.clear();
+            break;
+          }
+          shapes.push_back(shape);
+        }
+        if (static_cast<int>(shapes.size()) != batch_size) {
+          continue;
+        }
+        const std::string group_key = std::to_string(heads) + "_" +
+                                      std::to_string(head_dim) + "_" +
+                                      describe_multi_batch_shapes(shapes);
+        accepted = seen.insert(group_key).second;
+      }
+      ASSERT_EQ(static_cast<int>(shapes.size()), batch_size)
+          << "failed to build unique odd-length multi-batch group";
+
+      const auto metrics = measure_multi_batch_fused_case(
+          "fused_no_match_multi_batch_odd_random", shapes);
+      const auto shape_desc = describe_multi_batch_shapes(shapes);
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Precision][FusedNoMatchMultiBatchOddRandom] "
+                   "batch=%d group=%d/%d heads=%lld head_dim=%lld shapes=%s "
+                   "max_abs=%.6e mean_abs=%.6e finite=%s\n",
+                   batch_size,
+                   group_id,
+                   groups_per_batch_size,
+                   static_cast<long long>(shapes.front().heads),
+                   static_cast<long long>(shapes.front().head_dim),
+                   shape_desc.c_str(),
+                   metrics.max_abs,
+                   metrics.mean_abs,
+                   metrics.finite ? "true" : "false");
+      std::fflush(stderr);
+
+      ASSERT_TRUE(metrics.finite) << shape_desc;
+      EXPECT_LT(metrics.max_abs, kMaxAbs) << shape_desc;
+      EXPECT_LT(metrics.mean_abs, kMeanAbs) << shape_desc;
+      ++completed;
+      total_mean_abs += metrics.mean_abs;
+      worst_max_abs = std::max(worst_max_abs, metrics.max_abs);
+      worst_mean_abs = std::max(worst_mean_abs, metrics.mean_abs);
+    }
+  }
+
+  const double avg_mean_abs =
+      completed > 0 ? total_mean_abs / static_cast<double>(completed) : 0.0;
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Precision][FusedNoMatchMultiBatchOddRandom] "
+               "completed=%d worst_max_abs=%.6e worst_mean_abs=%.6e "
+               "avg_mean_abs=%.6e\n",
+               completed,
+               worst_max_abs,
+               worst_mean_abs,
+               avg_mean_abs);
+  std::fflush(stderr);
+}
+
+TEST_F(MTGRAttentionE2EPrecisionTest, FusedPartialMultiBatchOddLengthRandom) {
+  const int groups_per_batch_size = std::max(
+      1,
+      env_int("XLLM_MTGR_ATTENTION_MULTI_BATCH_PARTIAL_ODD_RANDOM_GROUPS", 8));
+  const int seed = env_int(
+      "XLLM_MTGR_ATTENTION_MULTI_BATCH_PARTIAL_ODD_RANDOM_SEED", 20260504);
+  std::mt19937_64 rng(static_cast<uint64_t>(seed));
+  const std::vector<int64_t> heads_all = {4, 8, 12};
+  const std::vector<int64_t> head_dims_all = {64, 128};
+  std::uniform_int_distribution<int> heads_dist(
+      0, static_cast<int>(heads_all.size() - 1));
+  std::uniform_int_distribution<int> head_dim_dist(
+      0, static_cast<int>(head_dims_all.size() - 1));
+
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Precision][FusedPartialMultiBatchOddRandom] "
+               "groups_per_batch_size=%d seed=%d\n",
+               groups_per_batch_size,
+               seed);
+
+  int completed = 0;
+  double total_mean_abs = 0.0;
+  double worst_max_abs = 0.0;
+  double worst_mean_abs = 0.0;
+  for (int batch_size : {2, 3, 4}) {
+    std::unordered_set<std::string> seen;
+    for (int group_id = 1; group_id <= groups_per_batch_size; ++group_id) {
+      std::vector<MTGRAttentionTestShape> shapes;
+      bool accepted = false;
+      for (int attempt = 0; attempt < 256 && !accepted; ++attempt) {
+        shapes.clear();
+        const int64_t heads = heads_all[heads_dist(rng)];
+        const int64_t head_dim = head_dims_all[head_dim_dist(rng)];
+        std::unordered_set<std::string> local_seen;
+        for (int i = 0; i < batch_size; ++i) {
+          MTGRAttentionTestShape shape =
+              sample_odd_no_match_shape(&rng, heads, head_dim);
+          shape.matched_prefix =
+              shape.history + shape.context + (shape.realtime * 4) / 5;
+          const std::string local_key = std::to_string(shape.history) + "_" +
+                                        std::to_string(shape.realtime) + "_" +
+                                        std::to_string(shape.target) + "_" +
+                                        std::to_string(shape.matched_prefix);
+          if (!local_seen.insert(local_key).second) {
+            shapes.clear();
+            break;
+          }
+          shapes.push_back(shape);
+        }
+        if (static_cast<int>(shapes.size()) != batch_size) {
+          continue;
+        }
+        const std::string group_key = std::to_string(heads) + "_" +
+                                      std::to_string(head_dim) + "_" +
+                                      describe_multi_batch_shapes(shapes);
+        accepted = seen.insert(group_key).second;
+      }
+      ASSERT_EQ(static_cast<int>(shapes.size()), batch_size)
+          << "failed to build unique odd-length partial multi-batch group";
+
+      const auto metrics = measure_multi_batch_fused_case(
+          "fused_partial_multi_batch_odd_random", shapes);
+      const auto shape_desc = describe_multi_batch_shapes(shapes);
+      std::fprintf(stderr,
+                   "[MTGR][CUDA][Precision][FusedPartialMultiBatchOddRandom] "
+                   "batch=%d group=%d/%d heads=%lld head_dim=%lld shapes=%s "
+                   "max_abs=%.6e mean_abs=%.6e finite=%s\n",
+                   batch_size,
+                   group_id,
+                   groups_per_batch_size,
+                   static_cast<long long>(shapes.front().heads),
+                   static_cast<long long>(shapes.front().head_dim),
+                   shape_desc.c_str(),
+                   metrics.max_abs,
+                   metrics.mean_abs,
+                   metrics.finite ? "true" : "false");
+      std::fflush(stderr);
+
+      ASSERT_TRUE(metrics.finite) << shape_desc;
+      EXPECT_LT(metrics.max_abs, kMaxAbs) << shape_desc;
+      EXPECT_LT(metrics.mean_abs, kMeanAbs) << shape_desc;
+      ++completed;
+      total_mean_abs += metrics.mean_abs;
+      worst_max_abs = std::max(worst_max_abs, metrics.max_abs);
+      worst_mean_abs = std::max(worst_mean_abs, metrics.mean_abs);
+    }
+  }
+
+  const double avg_mean_abs =
+      completed > 0 ? total_mean_abs / static_cast<double>(completed) : 0.0;
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Precision][FusedPartialMultiBatchOddRandom] "
+               "completed=%d worst_max_abs=%.6e worst_mean_abs=%.6e "
+               "avg_mean_abs=%.6e\n",
+               completed,
+               worst_max_abs,
+               worst_mean_abs,
+               avg_mean_abs);
+  std::fflush(stderr);
 }
 
 }  // namespace xllm::kernel::cuda::test
