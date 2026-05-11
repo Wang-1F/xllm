@@ -117,6 +117,30 @@ void mtgr_fused_no_match_attention_batched_cuda(
     torch::Tensor output_snd,
     torch::Tensor target_hcr_lse_sh1);
 
+void mtgr_fused_segmented_no_match_attention_batched_cuda(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    const torch::Tensor& target_seq_starts_i32,
+    const torch::Tensor& target_lens_i32,
+    double sm_scale,
+    torch::Tensor output_snd,
+    torch::Tensor target_hcr_lse_sh1);
+
+void mtgr_ragged_segment_attention_batched_cuda(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    int64_t max_request_len,
+    double sm_scale,
+    torch::Tensor output_snd);
+
 void mtgr_fused_no_match_attention_batched_batch4_cuda(
     const torch::Tensor& query_snd,
     const torch::Tensor& key_snd,
@@ -212,6 +236,10 @@ std::vector<StageTimeline> build_partial_rt_multi_timeline() {
 
 std::vector<StageTimeline> build_fused_no_match_timeline() {
   return {{"mtgr_fused_no_match_attention"}, {"tgt_diag_update_fused"}};
+}
+
+std::vector<StageTimeline> build_ragged_segment_timeline() {
+  return {{"mtgr_ragged_segment_attention"}};
 }
 
 std::vector<StageTimeline> build_fused_partial_rt_timeline() {
@@ -1015,6 +1043,45 @@ struct MTGRNoMatchBatchLayout {
   int64_t max_history = 0;
 };
 
+struct MTGRSegmentedNoMatchBatchLayout {
+  std::vector<int64_t> q_seq_lens;
+  std::vector<int64_t> segment_offsets;
+  std::vector<int64_t> segment_rules;
+  std::vector<int64_t> row_to_batch;
+  std::vector<int64_t> target_seq_starts;
+  std::vector<int64_t> target_lens;
+  std::vector<int64_t> target_row_indices;
+  std::vector<int64_t> target_offsets;
+  torch::Tensor segment_offsets_i32;
+  torch::Tensor segment_rules_i32;
+  torch::Tensor row_to_batch_i32;
+  torch::Tensor target_seq_starts_i32;
+  torch::Tensor target_lens_i32;
+  torch::Tensor target_row_indices_i64;
+  torch::Tensor q_seq_starts_i32;
+  torch::Tensor target_offsets_i32;
+  int64_t batch_size = 0;
+  int64_t num_segments = 0;
+  int64_t total_q = 0;
+  int64_t total_target = 0;
+  int64_t max_q = 0;
+  int64_t max_target = 0;
+};
+
+struct MTGRRaggedSegmentBatchLayout {
+  std::vector<int64_t> q_seq_lens;
+  std::vector<int64_t> segment_offsets;
+  std::vector<int64_t> segment_rules;
+  std::vector<int64_t> row_to_batch;
+  torch::Tensor segment_offsets_i32;
+  torch::Tensor segment_rules_i32;
+  torch::Tensor row_to_batch_i32;
+  int64_t batch_size = 0;
+  int64_t num_segments = 0;
+  int64_t total_q = 0;
+  int64_t max_q = 0;
+};
+
 struct MTGRPartialBatchLayout {
   std::vector<int64_t> q_seq_lens;
   std::vector<int64_t> q_seq_starts;
@@ -1038,6 +1105,22 @@ struct MTGRPartialBatchLayout {
   int64_t max_realtime_unmatched = 0;
 };
 
+size_t hash_cpu_int64_tensor_values(const torch::Tensor& tensor) {
+  CHECK(tensor.defined());
+  CHECK_EQ(tensor.dim(), 1);
+  CHECK_EQ(tensor.device().type(), torch::kCPU);
+  CHECK_EQ(tensor.scalar_type(), torch::kInt64);
+  size_t h = std::hash<int64_t>{}(tensor.size(0));
+  const auto mix = [&h](size_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+  };
+  auto accessor = tensor.accessor<int64_t, 1>();
+  for (int64_t i = 0; i < tensor.size(0); ++i) {
+    mix(std::hash<int64_t>{}(accessor[i]));
+  }
+  return h;
+}
+
 struct MTGRNoMatchBatchLayoutCacheKey {
   const void* q_seq_lens_ptr = nullptr;
   const void* kv_seq_lens_ptr = nullptr;
@@ -1046,6 +1129,13 @@ struct MTGRNoMatchBatchLayoutCacheKey {
   const void* realtime_lens_ptr = nullptr;
   const void* target_lens_ptr = nullptr;
   const void* matched_prefix_lens_ptr = nullptr;
+  size_t q_seq_lens_hash = 0;
+  size_t kv_seq_lens_hash = 0;
+  size_t history_lens_hash = 0;
+  size_t context_lens_hash = 0;
+  size_t realtime_lens_hash = 0;
+  size_t target_lens_hash = 0;
+  size_t matched_prefix_lens_hash = 0;
   int device_idx = -1;
 
   bool operator==(const MTGRNoMatchBatchLayoutCacheKey& other) const {
@@ -1056,6 +1146,13 @@ struct MTGRNoMatchBatchLayoutCacheKey {
            realtime_lens_ptr == other.realtime_lens_ptr &&
            target_lens_ptr == other.target_lens_ptr &&
            matched_prefix_lens_ptr == other.matched_prefix_lens_ptr &&
+           q_seq_lens_hash == other.q_seq_lens_hash &&
+           kv_seq_lens_hash == other.kv_seq_lens_hash &&
+           history_lens_hash == other.history_lens_hash &&
+           context_lens_hash == other.context_lens_hash &&
+           realtime_lens_hash == other.realtime_lens_hash &&
+           target_lens_hash == other.target_lens_hash &&
+           matched_prefix_lens_hash == other.matched_prefix_lens_hash &&
            device_idx == other.device_idx;
   }
 };
@@ -1069,6 +1166,13 @@ struct MTGRPartialBatchLayoutCacheKey {
   const void* target_lens_ptr = nullptr;
   const void* matched_prefix_lens_ptr = nullptr;
   const void* block_table_ptr = nullptr;
+  size_t q_seq_lens_hash = 0;
+  size_t kv_seq_lens_hash = 0;
+  size_t history_lens_hash = 0;
+  size_t context_lens_hash = 0;
+  size_t realtime_lens_hash = 0;
+  size_t target_lens_hash = 0;
+  size_t matched_prefix_lens_hash = 0;
   int device_idx = -1;
 
   bool operator==(const MTGRPartialBatchLayoutCacheKey& other) const {
@@ -1080,6 +1184,13 @@ struct MTGRPartialBatchLayoutCacheKey {
            target_lens_ptr == other.target_lens_ptr &&
            matched_prefix_lens_ptr == other.matched_prefix_lens_ptr &&
            block_table_ptr == other.block_table_ptr &&
+           q_seq_lens_hash == other.q_seq_lens_hash &&
+           kv_seq_lens_hash == other.kv_seq_lens_hash &&
+           history_lens_hash == other.history_lens_hash &&
+           context_lens_hash == other.context_lens_hash &&
+           realtime_lens_hash == other.realtime_lens_hash &&
+           target_lens_hash == other.target_lens_hash &&
+           matched_prefix_lens_hash == other.matched_prefix_lens_hash &&
            device_idx == other.device_idx;
   }
 };
@@ -1097,6 +1208,13 @@ struct MTGRNoMatchBatchLayoutCacheKeyHash {
     mix(std::hash<const void*>{}(key.realtime_lens_ptr));
     mix(std::hash<const void*>{}(key.target_lens_ptr));
     mix(std::hash<const void*>{}(key.matched_prefix_lens_ptr));
+    mix(key.q_seq_lens_hash);
+    mix(key.kv_seq_lens_hash);
+    mix(key.history_lens_hash);
+    mix(key.context_lens_hash);
+    mix(key.realtime_lens_hash);
+    mix(key.target_lens_hash);
+    mix(key.matched_prefix_lens_hash);
     mix(std::hash<int>{}(key.device_idx));
     return h;
   }
@@ -1116,6 +1234,13 @@ struct MTGRPartialBatchLayoutCacheKeyHash {
     mix(std::hash<const void*>{}(key.target_lens_ptr));
     mix(std::hash<const void*>{}(key.matched_prefix_lens_ptr));
     mix(std::hash<const void*>{}(key.block_table_ptr));
+    mix(key.q_seq_lens_hash);
+    mix(key.kv_seq_lens_hash);
+    mix(key.history_lens_hash);
+    mix(key.context_lens_hash);
+    mix(key.realtime_lens_hash);
+    mix(key.target_lens_hash);
+    mix(key.matched_prefix_lens_hash);
     mix(std::hash<int>{}(key.device_idx));
     return h;
   }
@@ -1147,6 +1272,146 @@ torch::Tensor make_int64_tensor_on_device(const std::vector<int64_t>& values,
   return torch::tensor(
              values, torch::TensorOptions().dtype(torch::kInt64).device(device))
       .contiguous();
+}
+
+MTGRSegmentedNoMatchBatchLayout build_segmented_no_match_batch_layout(
+    const std::vector<std::vector<int64_t>>& segment_lens,
+    const std::vector<int64_t>& segment_rules,
+    const torch::Device& device) {
+  CHECK(!segment_lens.empty());
+  CHECK(!segment_rules.empty());
+  const int64_t batch_size = static_cast<int64_t>(segment_lens.size());
+  const int64_t num_segments = static_cast<int64_t>(segment_rules.size());
+  CHECK_GE(num_segments, 2);
+  CHECK_EQ(segment_rules.back(), 2)
+      << "The current segmented no_match path reserves the last segment for "
+         "target diagonal merge";
+  for (int64_t i = 0; i + 1 < num_segments; ++i) {
+    CHECK(segment_rules[i] == 0 || segment_rules[i] == 1)
+        << "Non-target segmented rules must be 0(causal) or 1(full)";
+  }
+
+  MTGRSegmentedNoMatchBatchLayout layout;
+  layout.batch_size = batch_size;
+  layout.num_segments = num_segments;
+  layout.segment_rules = segment_rules;
+  layout.segment_offsets.reserve(
+      static_cast<size_t>(batch_size * (num_segments + 1)));
+  layout.q_seq_lens.reserve(static_cast<size_t>(batch_size));
+  layout.target_seq_starts.reserve(static_cast<size_t>(batch_size));
+  layout.target_lens.reserve(static_cast<size_t>(batch_size));
+  layout.target_offsets.reserve(static_cast<size_t>(batch_size));
+
+  for (int64_t b = 0; b < batch_size; ++b) {
+    CHECK_EQ(static_cast<int64_t>(segment_lens[b].size()), num_segments)
+        << "All requests in a segmented batch must have the same segment count";
+    const int64_t request_start = layout.total_q;
+    int64_t cursor = request_start;
+    layout.segment_offsets.push_back(cursor);
+    for (int64_t s = 0; s < num_segments; ++s) {
+      const int64_t len = segment_lens[b][s];
+      CHECK_GT(len, 0);
+      cursor += len;
+      layout.segment_offsets.push_back(cursor);
+    }
+
+    const int64_t q_len = cursor - request_start;
+    const int64_t target_len = segment_lens[b].back();
+    const int64_t target_begin = cursor - target_len;
+    const int64_t target_offset = target_begin - request_start;
+    layout.q_seq_lens.push_back(q_len);
+    layout.row_to_batch.insert(layout.row_to_batch.end(), q_len, b);
+    layout.target_seq_starts.push_back(layout.total_target);
+    layout.target_lens.push_back(target_len);
+    layout.target_offsets.push_back(target_offset);
+    for (int64_t j = 0; j < target_len; ++j) {
+      layout.target_row_indices.push_back(target_begin + j);
+    }
+
+    layout.total_q += q_len;
+    layout.total_target += target_len;
+    layout.max_q = std::max(layout.max_q, q_len);
+    layout.max_target = std::max(layout.max_target, target_len);
+  }
+
+  CHECK_EQ(static_cast<int64_t>(layout.row_to_batch.size()), layout.total_q);
+  CHECK_EQ(static_cast<int64_t>(layout.target_row_indices.size()),
+           layout.total_target);
+  layout.segment_offsets_i32 =
+      make_int32_tensor_on_device(layout.segment_offsets, device)
+          .view({batch_size, num_segments + 1})
+          .contiguous();
+  layout.segment_rules_i32 =
+      make_int32_tensor_on_device(layout.segment_rules, device);
+  layout.row_to_batch_i32 =
+      make_int32_tensor_on_device(layout.row_to_batch, device);
+  layout.target_seq_starts_i32 =
+      make_int32_tensor_on_device(layout.target_seq_starts, device);
+  layout.target_lens_i32 =
+      make_int32_tensor_on_device(layout.target_lens, device);
+  layout.target_row_indices_i64 =
+      make_int64_tensor_on_device(layout.target_row_indices, device);
+  layout.q_seq_starts_i32 = torch::empty(
+      {batch_size}, torch::TensorOptions().dtype(torch::kInt32).device(device));
+  layout.target_offsets_i32 =
+      make_int32_tensor_on_device(layout.target_offsets, device);
+  layout.q_seq_starts_i32.copy_(layout.segment_offsets_i32.select(1, 0));
+  return layout;
+}
+
+MTGRRaggedSegmentBatchLayout build_ragged_segment_batch_layout(
+    const std::vector<std::vector<int64_t>>& segment_lens,
+    const std::vector<int64_t>& segment_rules,
+    const torch::Device& device) {
+  CHECK(!segment_lens.empty());
+  CHECK(!segment_rules.empty());
+  const int64_t batch_size = static_cast<int64_t>(segment_lens.size());
+  const int64_t num_segments = static_cast<int64_t>(segment_rules.size());
+  CHECK_GE(num_segments, 2);
+  for (const int64_t rule : segment_rules) {
+    CHECK(rule == 0 || rule == 1 || rule == 2)
+        << "Segment rules must be causal(0), full(1), or diagonal(2)";
+  }
+
+  MTGRRaggedSegmentBatchLayout layout;
+  layout.batch_size = batch_size;
+  layout.num_segments = num_segments;
+  layout.segment_rules = segment_rules;
+  layout.segment_offsets.reserve(
+      static_cast<size_t>(batch_size * (num_segments + 1)));
+  layout.q_seq_lens.reserve(static_cast<size_t>(batch_size));
+  layout.row_to_batch.reserve(static_cast<size_t>(batch_size));
+
+  for (int64_t b = 0; b < batch_size; ++b) {
+    CHECK_EQ(static_cast<int64_t>(segment_lens[b].size()), num_segments)
+        << "All requests in a ragged batch must have the same segment count";
+    const int64_t request_start = layout.total_q;
+    int64_t cursor = request_start;
+    layout.segment_offsets.push_back(cursor);
+    for (int64_t s = 0; s < num_segments; ++s) {
+      const int64_t len = segment_lens[b][s];
+      CHECK_GT(len, 0);
+      cursor += len;
+      layout.segment_offsets.push_back(cursor);
+    }
+
+    const int64_t q_len = cursor - request_start;
+    layout.q_seq_lens.push_back(q_len);
+    layout.row_to_batch.insert(layout.row_to_batch.end(), q_len, b);
+    layout.total_q += q_len;
+    layout.max_q = std::max(layout.max_q, q_len);
+  }
+
+  CHECK_EQ(static_cast<int64_t>(layout.row_to_batch.size()), layout.total_q);
+  layout.segment_offsets_i32 =
+      make_int32_tensor_on_device(layout.segment_offsets, device)
+          .view({batch_size, num_segments + 1})
+          .contiguous();
+  layout.segment_rules_i32 =
+      make_int32_tensor_on_device(layout.segment_rules, device);
+  layout.row_to_batch_i32 =
+      make_int32_tensor_on_device(layout.row_to_batch, device);
+  return layout;
 }
 
 MTGRNoMatchBatchLayout build_no_match_batch_layout_uncached(
@@ -1255,6 +1520,14 @@ const MTGRNoMatchBatchLayout& get_cached_no_match_batch_layout(
       .realtime_lens_ptr = realtime_lens.data_ptr(),
       .target_lens_ptr = target_lens.data_ptr(),
       .matched_prefix_lens_ptr = matched_prefix_lens.data_ptr(),
+      .q_seq_lens_hash = hash_cpu_int64_tensor_values(q_seq_lens),
+      .kv_seq_lens_hash = hash_cpu_int64_tensor_values(kv_seq_lens),
+      .history_lens_hash = hash_cpu_int64_tensor_values(history_lens),
+      .context_lens_hash = hash_cpu_int64_tensor_values(context_lens),
+      .realtime_lens_hash = hash_cpu_int64_tensor_values(realtime_lens),
+      .target_lens_hash = hash_cpu_int64_tensor_values(target_lens),
+      .matched_prefix_lens_hash =
+          hash_cpu_int64_tensor_values(matched_prefix_lens),
       .device_idx = device.index(),
   };
   auto it = cache.find(key);
@@ -1380,6 +1653,14 @@ const MTGRPartialBatchLayout& get_cached_partial_batch_layout(
       .target_lens_ptr = target_lens.data_ptr(),
       .matched_prefix_lens_ptr = matched_prefix_lens.data_ptr(),
       .block_table_ptr = block_table.data_ptr(),
+      .q_seq_lens_hash = hash_cpu_int64_tensor_values(q_seq_lens),
+      .kv_seq_lens_hash = hash_cpu_int64_tensor_values(kv_seq_lens),
+      .history_lens_hash = hash_cpu_int64_tensor_values(history_lens),
+      .context_lens_hash = hash_cpu_int64_tensor_values(context_lens),
+      .realtime_lens_hash = hash_cpu_int64_tensor_values(realtime_lens),
+      .target_lens_hash = hash_cpu_int64_tensor_values(target_lens),
+      .matched_prefix_lens_hash =
+          hash_cpu_int64_tensor_values(matched_prefix_lens),
       .device_idx = device.index(),
   };
   auto it = cache.find(key);
@@ -1930,6 +2211,167 @@ torch::Tensor run_fused_no_match_batched(const torch::Tensor& query,
   return output;
 }
 
+torch::Tensor run_fused_segmented_no_match_batched(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const MTGRSegmentedNoMatchBatchLayout& layout,
+    double sm_scale,
+    MTGRAttentionTestMetrics* metrics) {
+  CHECK_EQ(query.dim(), 3);
+  CHECK_EQ(key.dim(), 3);
+  CHECK_EQ(value.dim(), 3);
+  CHECK_EQ(query.sizes(), key.sizes());
+  CHECK_EQ(query.sizes(), value.sizes());
+  CHECK_EQ(query.size(0), layout.total_q);
+  CHECK_EQ(layout.segment_offsets_i32.size(0), layout.batch_size);
+  CHECK_EQ(layout.segment_offsets_i32.size(1), layout.num_segments + 1);
+
+  auto timeline = build_fused_no_match_timeline();
+  prepare_timeline_events(&timeline);
+  auto wall_start = std::chrono::steady_clock::now();
+
+  constexpr size_t kFusedIdx = 0;
+  constexpr size_t kFusedUpdateIdx = 1;
+  auto output = torch::empty_like(query);
+  auto target_hcr_lse = torch::empty(
+      {layout.total_target, query.size(1), 1},
+      torch::TensorOptions().dtype(torch::kFloat32).device(query.device()));
+  const auto* props = at::cuda::getCurrentDeviceProperties();
+  const bool use_batch4_fast_path =
+      layout.batch_size > 1 && layout.batch_size <= 4 && props->major >= 8 &&
+      (query.size(2) == 64 || query.size(2) == 128);
+
+  record_stage_begin_if_needed(&timeline[kFusedIdx], query.device());
+  mtgr_fused_segmented_no_match_attention_batched_cuda(
+      query,
+      key,
+      value,
+      layout.segment_offsets_i32,
+      layout.segment_rules_i32,
+      layout.row_to_batch_i32,
+      layout.target_seq_starts_i32,
+      layout.target_lens_i32,
+      sm_scale,
+      output,
+      target_hcr_lse);
+  record_stage_end_if_needed(&timeline[kFusedIdx], query.device());
+
+  record_stage_begin_if_needed(&timeline[kFusedUpdateIdx], query.device());
+  if (layout.batch_size == 1) {
+    const int64_t target_len = layout.target_lens[0];
+    const int64_t target_begin =
+        layout.segment_offsets[layout.num_segments] - target_len;
+    auto target_query = query.narrow(0, target_begin, target_len);
+    auto target_key = key.narrow(0, target_begin, target_len);
+    auto target_value = value.narrow(0, target_begin, target_len);
+    auto target_output = output.narrow(0, target_begin, target_len);
+    merge_target_diag_attention_into(target_output,
+                                     target_hcr_lse,
+                                     target_query,
+                                     target_key,
+                                     target_value,
+                                     sm_scale,
+                                     target_output);
+  } else if (use_batch4_fast_path) {
+    merge_target_diag_attention_partial_batched_cuda(
+        output,
+        target_hcr_lse,
+        query,
+        key,
+        value,
+        layout.q_seq_starts_i32,
+        layout.target_offsets_i32,
+        layout.target_lens_i32,
+        layout.target_seq_starts_i32,
+        layout.batch_size,
+        layout.max_target,
+        sm_scale,
+        output);
+  } else {
+    auto target_query =
+        query.index_select(0, layout.target_row_indices_i64).contiguous();
+    auto target_key =
+        key.index_select(0, layout.target_row_indices_i64).contiguous();
+    auto target_value =
+        value.index_select(0, layout.target_row_indices_i64).contiguous();
+    auto target_hcr_out =
+        output.index_select(0, layout.target_row_indices_i64).contiguous();
+    auto merged_target = torch::empty_like(target_query);
+    merge_target_diag_attention_into(target_hcr_out,
+                                     target_hcr_lse,
+                                     target_query,
+                                     target_key,
+                                     target_value,
+                                     sm_scale,
+                                     merged_target);
+    output.index_copy_(0, layout.target_row_indices_i64, merged_target);
+  }
+  record_stage_end_if_needed(&timeline[kFusedUpdateIdx], query.device());
+
+  auto summary = collect_timeline_summary(&timeline);
+  auto wall_end = std::chrono::steady_clock::now();
+  if (metrics != nullptr) {
+    metrics->device_total_ms = summary.total_ms;
+    metrics->wall_total_ms =
+        std::chrono::duration<double, std::milli>(wall_end - wall_start)
+            .count();
+    metrics->workspace_ms = 0.0;
+    fill_stage_metrics(timeline, summary, metrics);
+  }
+  release_timeline_events(&timeline);
+  return output;
+}
+
+torch::Tensor run_ragged_segment_attention_batched(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const MTGRRaggedSegmentBatchLayout& layout,
+    double sm_scale,
+    MTGRAttentionTestMetrics* metrics) {
+  CHECK_EQ(query.dim(), 3);
+  CHECK_EQ(key.dim(), 3);
+  CHECK_EQ(value.dim(), 3);
+  CHECK_EQ(query.sizes(), key.sizes());
+  CHECK_EQ(query.sizes(), value.sizes());
+  CHECK_EQ(query.size(0), layout.total_q);
+  CHECK_EQ(layout.segment_offsets_i32.size(0), layout.batch_size);
+  CHECK_EQ(layout.segment_offsets_i32.size(1), layout.num_segments + 1);
+
+  auto timeline = build_ragged_segment_timeline();
+  prepare_timeline_events(&timeline);
+  auto wall_start = std::chrono::steady_clock::now();
+
+  constexpr size_t kRaggedIdx = 0;
+  auto output = torch::empty_like(query);
+  record_stage_begin_if_needed(&timeline[kRaggedIdx], query.device());
+  mtgr_ragged_segment_attention_batched_cuda(query,
+                                             key,
+                                             value,
+                                             layout.segment_offsets_i32,
+                                             layout.segment_rules_i32,
+                                             layout.row_to_batch_i32,
+                                             layout.max_q,
+                                             sm_scale,
+                                             output);
+  record_stage_end_if_needed(&timeline[kRaggedIdx], query.device());
+
+  auto summary = collect_timeline_summary(&timeline);
+  auto wall_end = std::chrono::steady_clock::now();
+  if (metrics != nullptr) {
+    metrics->fia_ms = summary.total_ms;
+    metrics->device_total_ms = summary.total_ms;
+    metrics->wall_total_ms =
+        std::chrono::duration<double, std::milli>(wall_end - wall_start)
+            .count();
+    metrics->workspace_ms = 0.0;
+    fill_stage_metrics(timeline, summary, metrics);
+  }
+  release_timeline_events(&timeline);
+  return output;
+}
+
 torch::Tensor run_fused_partial_rt_batched(const torch::Tensor& query,
                                            const torch::Tensor& key,
                                            const torch::Tensor& value,
@@ -2161,6 +2603,66 @@ torch::Tensor run_fused_partial_rt(const torch::Tensor& query,
 }
 
 }  // namespace
+
+torch::Tensor run_fused_segmented_no_match_batched_for_test(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const std::vector<std::vector<int64_t>>& segment_lens,
+    const std::vector<int64_t>& segment_rules,
+    double sm_scale,
+    MTGRAttentionTestMetrics* metrics) {
+  CHECK(query_snd.defined());
+  CHECK(key_snd.defined());
+  CHECK(value_snd.defined());
+  CHECK(query_snd.is_cuda());
+  CHECK(key_snd.is_cuda());
+  CHECK(value_snd.is_cuda());
+  CHECK_EQ(query_snd.dim(), 3);
+  CHECK_EQ(query_snd.sizes(), key_snd.sizes());
+  CHECK_EQ(query_snd.sizes(), value_snd.sizes());
+  CHECK_EQ(query_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(key_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(value_snd.scalar_type(), torch::kFloat16);
+  auto query = query_snd.contiguous();
+  auto key = key_snd.contiguous();
+  auto value = value_snd.contiguous();
+  auto layout = build_segmented_no_match_batch_layout(
+      segment_lens, segment_rules, query.device());
+  CHECK_EQ(query.size(0), layout.total_q);
+  return run_fused_segmented_no_match_batched(
+      query, key, value, layout, sm_scale, metrics);
+}
+
+torch::Tensor run_ragged_segment_attention_batched_for_test(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const std::vector<std::vector<int64_t>>& segment_lens,
+    const std::vector<int64_t>& segment_rules,
+    double sm_scale,
+    MTGRAttentionTestMetrics* metrics) {
+  CHECK(query_snd.defined());
+  CHECK(key_snd.defined());
+  CHECK(value_snd.defined());
+  CHECK(query_snd.is_cuda());
+  CHECK(key_snd.is_cuda());
+  CHECK(value_snd.is_cuda());
+  CHECK_EQ(query_snd.dim(), 3);
+  CHECK_EQ(query_snd.sizes(), key_snd.sizes());
+  CHECK_EQ(query_snd.sizes(), value_snd.sizes());
+  CHECK_EQ(query_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(key_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(value_snd.scalar_type(), torch::kFloat16);
+  auto query = query_snd.contiguous();
+  auto key = key_snd.contiguous();
+  auto value = value_snd.contiguous();
+  auto layout = build_ragged_segment_batch_layout(
+      segment_lens, segment_rules, query.device());
+  CHECK_EQ(query.size(0), layout.total_q);
+  return run_ragged_segment_attention_batched(
+      query, key, value, layout, sm_scale, metrics);
+}
 
 MTGRAttentionImplTest::MTGRAttentionImplTest(int64_t num_heads,
                                              int64_t head_size,

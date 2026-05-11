@@ -21,6 +21,7 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
@@ -94,6 +95,87 @@ MTGRAttentionTestShape sample_odd_no_match_shape(std::mt19937_64* rng,
   shape.target = sample_non_aligned_len(rng, 800, 2400);
   shape.matched_prefix = 0;
   return shape;
+}
+
+int64_t segmented_visible_end(int64_t q_local,
+                              const std::vector<int64_t>& offsets,
+                              const std::vector<int64_t>& rules) {
+  CHECK_EQ(offsets.size(), rules.size() + 1);
+  int64_t seg_id = 0;
+  for (; seg_id < static_cast<int64_t>(rules.size()); ++seg_id) {
+    if (q_local < offsets[seg_id + 1]) {
+      break;
+    }
+  }
+  CHECK_LT(seg_id, static_cast<int64_t>(rules.size()));
+  const int64_t rule = rules[seg_id];
+  if (rule == 1) {
+    return offsets[seg_id + 1];
+  }
+  if (rule == 0) {
+    return q_local + 1;
+  }
+  CHECK_EQ(rule, 2);
+  return offsets[seg_id];
+}
+
+torch::Tensor run_ragged_segment_reference(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const std::vector<std::vector<int64_t>>& segment_lens,
+    const std::vector<int64_t>& segment_rules,
+    double sm_scale) {
+  CHECK_EQ(query_snd.dim(), 3);
+  CHECK_EQ(query_snd.sizes(), key_snd.sizes());
+  CHECK_EQ(query_snd.sizes(), value_snd.sizes());
+  CHECK(!segment_lens.empty());
+  CHECK(!segment_rules.empty());
+  for (const int64_t rule : segment_rules) {
+    CHECK(rule == 0 || rule == 1 || rule == 2);
+  }
+  const int64_t num_segments = static_cast<int64_t>(segment_rules.size());
+  auto query = query_snd.to(torch::kFloat32);
+  auto key = key_snd.to(torch::kFloat32);
+  auto value = value_snd.to(torch::kFloat32);
+  auto output = torch::empty_like(query);
+  int64_t request_start = 0;
+  for (const auto& lens : segment_lens) {
+    CHECK_EQ(static_cast<int64_t>(lens.size()), num_segments);
+    std::vector<int64_t> offsets;
+    offsets.reserve(static_cast<size_t>(num_segments + 1));
+    offsets.push_back(0);
+    for (const int64_t len : lens) {
+      CHECK_GT(len, 0);
+      offsets.push_back(offsets.back() + len);
+    }
+    for (int64_t q_local = 0; q_local < offsets.back(); ++q_local) {
+      int64_t seg_id = 0;
+      for (; seg_id < num_segments; ++seg_id) {
+        if (q_local < offsets[seg_id + 1]) {
+          break;
+        }
+      }
+      CHECK_LT(seg_id, num_segments);
+      const int64_t q_idx = request_start + q_local;
+      const int64_t visible_end =
+          segmented_visible_end(q_local, offsets, segment_rules);
+      auto k_attn = key.narrow(0, request_start, visible_end);
+      auto v_attn = value.narrow(0, request_start, visible_end);
+      if (segment_rules[seg_id] == 2) {
+        k_attn = torch::cat({k_attn, key.narrow(0, q_idx, 1)}, 0);
+        v_attn = torch::cat({v_attn, value.narrow(0, q_idx, 1)}, 0);
+      }
+      auto q_row = query.select(0, q_idx);
+      auto scores =
+          (k_attn * q_row.unsqueeze(0)).sum(-1) * static_cast<float>(sm_scale);
+      auto probs = torch::softmax(scores, 0);
+      output.select(0, q_idx).copy_((probs.unsqueeze(-1) * v_attn).sum(0));
+    }
+    request_start += offsets.back();
+  }
+  CHECK_EQ(request_start, query_snd.size(0));
+  return output;
 }
 
 class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
@@ -546,6 +628,112 @@ TEST_F(MTGRAttentionE2EPrecisionTest,
   shapes[3].realtime = 129;
   shapes[3].target = 511;
   run_multi_batch_fused_case("fused_no_match_multi_batch", shapes);
+}
+
+TEST_F(MTGRAttentionE2EPrecisionTest,
+       FusedSegmentedNoMatchFiveSegmentsAlignsWithReference) {
+  const int64_t heads = 4;
+  const int64_t head_dim = 64;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+  const std::vector<std::vector<int64_t>> segment_lens = {
+      {257, 7, 109, 17, 193},
+      {129, 11, 211, 19, 151},
+  };
+  const std::vector<int64_t> segment_rules = {
+      0,  // causal
+      1,  // full
+      1,  // full
+      0,  // causal
+      2,  // target diagonal
+  };
+  const int64_t total_tokens = std::accumulate(
+      segment_lens.begin(),
+      segment_lens.end(),
+      0LL,
+      [](int64_t acc, const auto& lens) {
+        return acc + std::accumulate(lens.begin(), lens.end(), 0LL);
+      });
+  auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+  auto query = torch::randn({total_tokens, heads, head_dim}, opts) * 0.05;
+  auto key = torch::randn({total_tokens, heads, head_dim}, opts) * 0.05;
+  auto value = torch::randn({total_tokens, heads, head_dim}, opts) * 0.05;
+
+  MTGRAttentionTestMetrics metrics;
+  auto fused = run_fused_segmented_no_match_batched_for_test(
+      query, key, value, segment_lens, segment_rules, scale, &metrics);
+  auto reference = run_ragged_segment_reference(
+      query, key, value, segment_lens, segment_rules, scale);
+  CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  auto fused_f32 = fused.to(torch::kFloat32);
+  auto diff = (reference - fused_f32).abs();
+  const double max_abs = diff.max().item<double>();
+  const double mean_abs = diff.mean().item<double>();
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Precision][FusedSegmentedNoMatchFiveSegments] "
+               "rows=%lld max_abs=%.6e mean_abs=%.6e device_ms=%.6f\n",
+               static_cast<long long>(total_tokens),
+               max_abs,
+               mean_abs,
+               metrics.device_total_ms);
+  std::fflush(stderr);
+
+  ASSERT_TRUE(torch::isfinite(fused).all().item<bool>());
+  EXPECT_LT(max_abs, kMaxAbs);
+  EXPECT_LT(mean_abs, kMeanAbs);
+}
+
+TEST_F(MTGRAttentionE2EPrecisionTest,
+       RaggedSegmentAttentionFiveSegmentsAlignsWithReference) {
+  const int64_t heads = 4;
+  const int64_t head_dim = 64;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+  const std::vector<std::vector<int64_t>> segment_lens = {
+      {193, 17, 109, 7, 257},
+      {151, 19, 211, 11, 129},
+  };
+  const std::vector<int64_t> segment_rules = {
+      0,  // causal
+      2,  // diagonal
+      1,  // full
+      0,  // causal
+      2,  // diagonal
+  };
+  const int64_t total_tokens = std::accumulate(
+      segment_lens.begin(),
+      segment_lens.end(),
+      0LL,
+      [](int64_t acc, const auto& lens) {
+        return acc + std::accumulate(lens.begin(), lens.end(), 0LL);
+      });
+  auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+  auto query = torch::randn({total_tokens, heads, head_dim}, opts) * 0.05;
+  auto key = torch::randn({total_tokens, heads, head_dim}, opts) * 0.05;
+  auto value = torch::randn({total_tokens, heads, head_dim}, opts) * 0.05;
+
+  MTGRAttentionTestMetrics metrics;
+  auto fused = run_ragged_segment_attention_batched_for_test(
+      query, key, value, segment_lens, segment_rules, scale, &metrics);
+  auto reference = run_ragged_segment_reference(
+      query, key, value, segment_lens, segment_rules, scale);
+  CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  auto fused_f32 = fused.to(torch::kFloat32);
+  auto diff = (reference - fused_f32).abs();
+  const double max_abs = diff.max().item<double>();
+  const double mean_abs = diff.mean().item<double>();
+  std::fprintf(stderr,
+               "[MTGR][CUDA][Precision][RaggedSegmentAttentionFiveSegments] "
+               "rows=%lld max_abs=%.6e mean_abs=%.6e device_ms=%.6f\n",
+               static_cast<long long>(total_tokens),
+               max_abs,
+               mean_abs,
+               metrics.device_total_ms);
+  std::fflush(stderr);
+
+  ASSERT_TRUE(torch::isfinite(fused).all().item<bool>());
+  EXPECT_LT(max_abs, kMaxAbs);
+  EXPECT_LT(mean_abs, kMeanAbs);
 }
 
 TEST_F(MTGRAttentionE2EPrecisionTest,

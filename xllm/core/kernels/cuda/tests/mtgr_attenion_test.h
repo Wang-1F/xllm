@@ -136,4 +136,22 @@ std::vector<MTGRAttentionTestShape> build_mtgr_sweep_shapes(bool full_sweep,
 int env_int(const char* name, int default_value);
 bool env_flag_enabled(const char* name, bool default_value);
 
+torch::Tensor run_fused_segmented_no_match_batched_for_test(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const std::vector<std::vector<int64_t>>& segment_lens,
+    const std::vector<int64_t>& segment_rules,
+    double sm_scale,
+    MTGRAttentionTestMetrics* metrics = nullptr);
+
+torch::Tensor run_ragged_segment_attention_batched_for_test(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const std::vector<std::vector<int64_t>>& segment_lens,
+    const std::vector<int64_t>& segment_rules,
+    double sm_scale,
+    MTGRAttentionTestMetrics* metrics = nullptr);
+
 }  // namespace xllm::kernel::cuda::test

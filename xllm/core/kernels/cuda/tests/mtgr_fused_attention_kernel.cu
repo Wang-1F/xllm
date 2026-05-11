@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <cuda_fp16.h>
@@ -376,6 +377,15 @@ inline bool use_mtgr_sm90_hd64_q64_regfrag_kv128_experimental() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+inline bool use_mtgr_ragged_hd128_q64_regfrag_split_diag_experimental() {
+  const char* env =
+      std::getenv("XLLM_MTGR_CUDA_RAGGED_HD128_Q64_REGFRAG_SPLIT_DIAG");
+  if (env == nullptr || env[0] == '\0') {
+    return true;
+  }
+  return env[0] != '0';
+}
+
 inline int mtgr_env_int_or_default(const char* name, int default_value) {
   const char* env = std::getenv(name);
   if (env == nullptr || env[0] == '\0') {
@@ -483,6 +493,107 @@ __device__ __forceinline__ int mtgr_visible_end_for_no_match(int q_idx,
     return q_idx + 1;
   }
   return realtime_end;
+}
+
+template <int StaticNumSegments = 0>
+__device__ __forceinline__ int mtgr_visible_end_for_segmented_no_match(
+    int q_local_idx,
+    const int32_t* __restrict__ segment_offsets,
+    const int32_t* __restrict__ segment_rules,
+    int num_segments,
+    int* seg_id_out) {
+  constexpr int kRuleCausal = 0;
+  constexpr int kRuleFull = 1;
+  constexpr int kRuleLastDiagonal = 2;
+
+  const int request_start = segment_offsets[0];
+  const int segment_count =
+      StaticNumSegments > 0 ? StaticNumSegments : num_segments;
+  int seg_id = 0;
+  if constexpr (StaticNumSegments > 0) {
+#pragma unroll
+    for (int s = 0; s < StaticNumSegments; ++s) {
+      const int seg_end_local = segment_offsets[s + 1] - request_start;
+      if (q_local_idx < seg_end_local) {
+        seg_id = s;
+        break;
+      }
+    }
+  } else {
+#pragma unroll 1
+    for (; seg_id < segment_count; ++seg_id) {
+      const int seg_end_local = segment_offsets[seg_id + 1] - request_start;
+      if (q_local_idx < seg_end_local) {
+        break;
+      }
+    }
+  }
+  if (seg_id >= segment_count) {
+    seg_id = segment_count - 1;
+  }
+  if (seg_id_out != nullptr) {
+    *seg_id_out = seg_id;
+  }
+
+  const int seg_start_local = segment_offsets[seg_id] - request_start;
+  const int seg_end_local = segment_offsets[seg_id + 1] - request_start;
+  const int rule = segment_rules[seg_id];
+  if (rule == kRuleFull) {
+    return seg_end_local;
+  }
+  if (rule == kRuleCausal) {
+    return seg_start_local + (q_local_idx - seg_start_local) + 1;
+  }
+  if (rule == kRuleLastDiagonal) {
+    return seg_start_local;
+  }
+  return seg_end_local;
+}
+
+template <int HeadDim, int LaneElems>
+__device__ __forceinline__ void mtgr_accumulate_attention_token(
+    const float (&q_frag)[LaneElems],
+    float (&o_frag)[LaneElems],
+    const half* __restrict__ key,
+    const half* __restrict__ value,
+    int64_t kv_base,
+    float sm_scale_log2e,
+    int lane,
+    float& row_m,
+    float& row_d) {
+  float dot_lane = 0.0f;
+#pragma unroll
+  for (int i = 0; i + 1 < LaneElems; i += 2) {
+    const half2 k2 = *reinterpret_cast<const half2*>(key + kv_base + i);
+    const float2 kf = __half22float2(k2);
+    dot_lane += q_frag[i] * kf.x + q_frag[i + 1] * kf.y;
+  }
+  if constexpr ((LaneElems & 1) != 0) {
+    dot_lane +=
+        q_frag[LaneElems - 1] * __half2float(key[kv_base + LaneElems - 1]);
+  }
+  dot_lane = warp_reduce_sum(dot_lane);
+
+  float alpha = 0.0f;
+  float beta = 0.0f;
+  if (lane == 0) {
+    const float score = dot_lane * sm_scale_log2e;
+    const float new_m = fmaxf(row_m, score);
+    alpha = row_m == -INFINITY ? 0.0f : exp2f(row_m - new_m);
+    beta = exp2f(score - new_m);
+    row_d = row_d * alpha + beta;
+    row_m = new_m;
+  }
+  alpha = __shfl_sync(0xffffffff, alpha, 0);
+  beta = __shfl_sync(0xffffffff, beta, 0);
+  row_d = __shfl_sync(0xffffffff, row_d, 0);
+  row_m = __shfl_sync(0xffffffff, row_m, 0);
+
+#pragma unroll
+  for (int i = 0; i < LaneElems; ++i) {
+    const float v = __half2float(value[kv_base + i]);
+    o_frag[i] = o_frag[i] * alpha + beta * v;
+  }
 }
 
 __device__ __forceinline__ int mtgr_visible_end_for_partial_rt(
@@ -726,6 +837,228 @@ __launch_bounds__(WarpsPerBlock * 32) void mtgr_fused_no_match_attention_batched
                           num_heads +
                       head_idx)] = row_m + log2f(row_d);
     }
+  }
+}
+
+template <int HeadDim, int WarpsPerBlock, int StaticNumSegments = 0>
+__global__
+__launch_bounds__(WarpsPerBlock * 32) void mtgr_fused_segmented_no_match_attention_batched_fallback_kernel(
+    const half* __restrict__ query,
+    const half* __restrict__ key,
+    const half* __restrict__ value,
+    const int32_t* __restrict__ segment_offsets,
+    const int32_t* __restrict__ segment_rules,
+    const int32_t* __restrict__ row_to_batch,
+    const int32_t* __restrict__ target_seq_starts,
+    const int32_t* __restrict__ target_lens,
+    half* __restrict__ output,
+    float* __restrict__ target_hcr_lse,
+    int total_len,
+    int num_heads,
+    int num_segments,
+    float sm_scale_log2e) {
+  constexpr int kLaneElems = HeadDim / 32;
+  static_assert(HeadDim % 32 == 0);
+
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int row = blockIdx.x * WarpsPerBlock + warp_id;
+  const int num_rows = total_len * num_heads;
+  if (row >= num_rows) {
+    return;
+  }
+
+  const int q_idx = row / num_heads;
+  const int head_idx = row - q_idx * num_heads;
+  const int batch_idx = row_to_batch[q_idx];
+  const int segment_stride =
+      StaticNumSegments > 0 ? StaticNumSegments + 1 : num_segments + 1;
+  const int32_t* const offsets_row =
+      segment_offsets + static_cast<int64_t>(batch_idx) * segment_stride;
+  const int batch_q_start = offsets_row[0];
+  const int local_q_idx = q_idx - batch_q_start;
+  const int target_seq_start = target_seq_starts[batch_idx];
+  const int target_len = target_lens[batch_idx];
+
+  int seg_id = 0;
+  const int visible_end =
+      mtgr_visible_end_for_segmented_no_match<StaticNumSegments>(
+          local_q_idx, offsets_row, segment_rules, num_segments, &seg_id);
+  const int segment_count =
+      StaticNumSegments > 0 ? StaticNumSegments : num_segments;
+  const int last_seg_id = segment_count - 1;
+  const int last_seg_start_local = offsets_row[last_seg_id] - batch_q_start;
+  const int last_seg_end_local = offsets_row[last_seg_id + 1] - batch_q_start;
+  const bool write_target_lse = seg_id == last_seg_id;
+
+  float q_frag[kLaneElems];
+  float o_frag[kLaneElems];
+  const int dim_base = lane * kLaneElems;
+  const int64_t q_base =
+      (static_cast<int64_t>(q_idx) * num_heads + head_idx) * HeadDim + dim_base;
+#pragma unroll
+  for (int i = 0; i < kLaneElems; ++i) {
+    q_frag[i] = __half2float(query[q_base + i]);
+    o_frag[i] = 0.0f;
+  }
+
+  float row_m = -INFINITY;
+  float row_d = 0.0f;
+  for (int kv_local_idx = 0; kv_local_idx < visible_end; ++kv_local_idx) {
+    const int kv_idx = batch_q_start + kv_local_idx;
+    const int64_t kv_base =
+        (static_cast<int64_t>(kv_idx) * num_heads + head_idx) * HeadDim +
+        dim_base;
+    float dot_lane = 0.0f;
+#pragma unroll
+    for (int i = 0; i + 1 < kLaneElems; i += 2) {
+      const half2 k2 = *reinterpret_cast<const half2*>(key + kv_base + i);
+      const float2 kf = __half22float2(k2);
+      dot_lane += q_frag[i] * kf.x + q_frag[i + 1] * kf.y;
+    }
+    if constexpr ((kLaneElems & 1) != 0) {
+      dot_lane +=
+          q_frag[kLaneElems - 1] * __half2float(key[kv_base + kLaneElems - 1]);
+    }
+    dot_lane = warp_reduce_sum(dot_lane);
+
+    float alpha = 0.0f;
+    float beta = 0.0f;
+    if (lane == 0) {
+      const float score = dot_lane * sm_scale_log2e;
+      const float new_m = fmaxf(row_m, score);
+      alpha = row_m == -INFINITY ? 0.0f : exp2f(row_m - new_m);
+      beta = exp2f(score - new_m);
+      row_d = row_d * alpha + beta;
+      row_m = new_m;
+    }
+    alpha = __shfl_sync(0xffffffff, alpha, 0);
+    beta = __shfl_sync(0xffffffff, beta, 0);
+    row_d = __shfl_sync(0xffffffff, row_d, 0);
+    row_m = __shfl_sync(0xffffffff, row_m, 0);
+
+#pragma unroll
+    for (int i = 0; i < kLaneElems; ++i) {
+      const float v = __half2float(value[kv_base + i]);
+      o_frag[i] = o_frag[i] * alpha + beta * v;
+    }
+  }
+
+  const float inv_d = row_d > 0.0f ? 1.0f / row_d : 0.0f;
+  const int64_t o_base =
+      (static_cast<int64_t>(q_idx) * num_heads + head_idx) * HeadDim + dim_base;
+#pragma unroll
+  for (int i = 0; i < kLaneElems; ++i) {
+    output[o_base + i] = __float2half_rn(o_frag[i] * inv_d);
+  }
+
+  if (write_target_lse && lane == 0) {
+    const int target_row = local_q_idx - last_seg_start_local;
+    if (target_row < target_len &&
+        target_row < last_seg_end_local - last_seg_start_local &&
+        row_d > 0.0f) {
+      target_hcr_lse[(static_cast<int64_t>(target_seq_start + target_row) *
+                          num_heads +
+                      head_idx)] = row_m + log2f(row_d);
+    }
+  }
+}
+
+template <int HeadDim, int WarpsPerBlock, int StaticNumSegments = 0>
+__global__
+__launch_bounds__(WarpsPerBlock * 32) void mtgr_ragged_segment_attention_batched_kernel(
+    const half* __restrict__ query,
+    const half* __restrict__ key,
+    const half* __restrict__ value,
+    const int32_t* __restrict__ segment_offsets,
+    const int32_t* __restrict__ segment_rules,
+    const int32_t* __restrict__ row_to_batch,
+    half* __restrict__ output,
+    int total_len,
+    int num_heads,
+    int num_segments,
+    float sm_scale_log2e) {
+  constexpr int kLaneElems = HeadDim / 32;
+  static_assert(HeadDim % 32 == 0);
+
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int row = blockIdx.x * WarpsPerBlock + warp_id;
+  const int num_rows = total_len * num_heads;
+  if (row >= num_rows) {
+    return;
+  }
+
+  const int q_idx = row / num_heads;
+  const int head_idx = row - q_idx * num_heads;
+  const int batch_idx = row_to_batch[q_idx];
+  const int segment_stride =
+      StaticNumSegments > 0 ? StaticNumSegments + 1 : num_segments + 1;
+  const int32_t* const offsets_row =
+      segment_offsets + static_cast<int64_t>(batch_idx) * segment_stride;
+  const int batch_q_start = offsets_row[0];
+  const int local_q_idx = q_idx - batch_q_start;
+
+  int seg_id = 0;
+  const int visible_end =
+      mtgr_visible_end_for_segmented_no_match<StaticNumSegments>(
+          local_q_idx, offsets_row, segment_rules, num_segments, &seg_id);
+  const int rule = segment_rules[seg_id];
+  const bool has_diag = rule == 2;
+  const int diag_local_idx = has_diag ? local_q_idx : -1;
+
+  float q_frag[kLaneElems];
+  float o_frag[kLaneElems];
+  const int dim_base = lane * kLaneElems;
+  const int64_t q_base =
+      (static_cast<int64_t>(q_idx) * num_heads + head_idx) * HeadDim + dim_base;
+#pragma unroll
+  for (int i = 0; i < kLaneElems; ++i) {
+    q_frag[i] = __half2float(query[q_base + i]);
+    o_frag[i] = 0.0f;
+  }
+
+  float row_m = -INFINITY;
+  float row_d = 0.0f;
+  for (int kv_local_idx = 0; kv_local_idx < visible_end; ++kv_local_idx) {
+    const int kv_idx = batch_q_start + kv_local_idx;
+    const int64_t kv_base =
+        (static_cast<int64_t>(kv_idx) * num_heads + head_idx) * HeadDim +
+        dim_base;
+    mtgr_accumulate_attention_token<HeadDim, kLaneElems>(q_frag,
+                                                         o_frag,
+                                                         key,
+                                                         value,
+                                                         kv_base,
+                                                         sm_scale_log2e,
+                                                         lane,
+                                                         row_m,
+                                                         row_d);
+  }
+
+  if (has_diag) {
+    const int64_t kv_base =
+        (static_cast<int64_t>(batch_q_start + diag_local_idx) * num_heads +
+         head_idx) *
+            HeadDim +
+        dim_base;
+    mtgr_accumulate_attention_token<HeadDim, kLaneElems>(q_frag,
+                                                         o_frag,
+                                                         key,
+                                                         value,
+                                                         kv_base,
+                                                         sm_scale_log2e,
+                                                         lane,
+                                                         row_m,
+                                                         row_d);
+  }
+
+  const float inv_d = row_d > 0.0f ? 1.0f / row_d : 0.0f;
+  const int64_t o_base =
+      (static_cast<int64_t>(q_idx) * num_heads + head_idx) * HeadDim + dim_base;
+#pragma unroll
+  for (int i = 0; i < kLaneElems; ++i) {
+    output[o_base + i] = __float2half_rn(o_frag[i] * inv_d);
   }
 }
 
@@ -2544,6 +2877,477 @@ __launch_bounds__(4 * kWarpSize) void mtgr_fused_no_match_attention_batch4_q64_r
 #endif
 }
 
+template <int HeadDim,
+          int NumMmaKV,
+          int StaticNumSegments = 0,
+          bool InlineDiagMerge = true>
+__global__
+__launch_bounds__(4 * kWarpSize) void mtgr_ragged_segment_attention_q64_regfrag_prefix_kernel(
+    const half* __restrict__ query,
+    const half* __restrict__ key,
+    const half* __restrict__ value,
+    const int32_t* __restrict__ segment_offsets,
+    const int32_t* __restrict__ segment_rules,
+    half* __restrict__ output,
+    float* __restrict__ diag_prefix_lse,
+    int max_request_len,
+    int num_heads,
+    int num_segments,
+    float sm_scale_log2e) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  static_assert(HeadDim == 64 || HeadDim == 128);
+  constexpr int kHeadDim = HeadDim;
+  constexpr int kQueriesPerWarp = 16;
+  constexpr int kQueriesPerBlock = 64;
+  constexpr int kWarpsPerBlock = 4;
+  constexpr int kNumMmaKV = NumMmaKV;
+  constexpr int kKvTile = kNumMmaKV * 16;
+  constexpr int kNumMmaD = kHeadDim / 16;
+  constexpr int kUpcastStride = kHeadDim / 8;
+  if constexpr (InlineDiagMerge) {
+    (void)diag_prefix_lse;
+  }
+  (void)max_request_len;
+
+  const int batch_idx = static_cast<int>(blockIdx.z);
+  const int segment_count =
+      StaticNumSegments > 0 ? StaticNumSegments : num_segments;
+  const int32_t* offsets_row =
+      segment_offsets + static_cast<int64_t>(batch_idx) * (segment_count + 1);
+  const int seq_start = offsets_row[0];
+  const int total_len = offsets_row[segment_count] - seq_start;
+  const int q_block_start_local =
+      static_cast<int>(blockIdx.x) * kQueriesPerBlock;
+  if (q_block_start_local >= total_len) {
+    return;
+  }
+
+  __shared__ b128_t q_shared_perm[kQueriesPerBlock * kUpcastStride];
+  extern __shared__ __align__(16) uint8_t mtgr_dyn_smem[];
+  auto* k_shared_perm = reinterpret_cast<b128_t*>(mtgr_dyn_smem);
+  auto* v_shared_perm = k_shared_perm + kKvTile * kUpcastStride;
+
+  const int lane = threadIdx.x & (kWarpSize - 1);
+  const int warp_id = threadIdx.x >> 5;
+  const int q_block_end_local =
+      min(q_block_start_local + kQueriesPerBlock, total_len);
+  const int head_idx = static_cast<int>(blockIdx.y);
+  int block_last_seg_id = 0;
+  const int block_max_visible_end =
+      q_block_end_local > q_block_start_local
+          ? mtgr_visible_end_for_segmented_no_match<StaticNumSegments>(
+                q_block_end_local - 1,
+                offsets_row,
+                segment_rules,
+                num_segments,
+                &block_last_seg_id)
+          : 0;
+
+  for (int flat = threadIdx.x; flat < kQueriesPerBlock * kUpcastStride;
+       flat += blockDim.x) {
+    const int row = flat / kUpcastStride;
+    const int chunk = flat % kUpcastStride;
+    const uint32_t perm_offset = mtgr_perm128_offset<kUpcastStride>(row, chunk);
+    const int q_local_idx = q_block_start_local + row;
+    const bool pred_guard = q_local_idx < total_len;
+    const int64_t base =
+        pred_guard
+            ? (static_cast<int64_t>(seq_start + q_local_idx) * num_heads +
+               head_idx) *
+                  kHeadDim
+            : 0;
+    const b128_t* src = reinterpret_cast<const b128_t*>(query + base);
+    mtgr_cp_async_load_128b(
+        q_shared_perm + perm_offset, src + chunk, pred_guard);
+  }
+  mtgr_cp_async_commit_group();
+  mtgr_cp_async_wait_group<0>();
+  __syncthreads();
+  mtgr_scale_shared_half2<kQueriesPerBlock * kUpcastStride * 4>(
+      reinterpret_cast<half2*>(q_shared_perm),
+      __float2half2_rn(sm_scale_log2e));
+  __syncthreads();
+
+  MtgrPermutedSmem128<kUpcastStride> q_smem(q_shared_perm);
+  MtgrPermutedSmem128<kUpcastStride> k_smem(k_shared_perm);
+  MtgrPermutedSmem128<kUpcastStride> v_smem(v_shared_perm);
+
+  const int warp_q_base_local = q_block_start_local + warp_id * kQueriesPerWarp;
+  const int row0_local = lane >> 2;
+  const int row1_local = row0_local + 8;
+  const int q_local_idx_row[2] = {warp_q_base_local + row0_local,
+                                  warp_q_base_local + row1_local};
+  const bool row_valid[2] = {q_local_idx_row[0] < total_len,
+                             q_local_idx_row[1] < total_len};
+  int row_seg_id[2] = {0, 0};
+  const int row_visible_end[2] = {
+      row_valid[0] ? mtgr_visible_end_for_segmented_no_match<StaticNumSegments>(
+                         q_local_idx_row[0],
+                         offsets_row,
+                         segment_rules,
+                         num_segments,
+                         &row_seg_id[0])
+                   : 0,
+      row_valid[1] ? mtgr_visible_end_for_segmented_no_match<StaticNumSegments>(
+                         q_local_idx_row[1],
+                         offsets_row,
+                         segment_rules,
+                         num_segments,
+                         &row_seg_id[1])
+                   : 0};
+  const bool row_is_diag[2] = {
+      row_valid[0] && segment_rules[row_seg_id[0]] == 2,
+      row_valid[1] && segment_rules[row_seg_id[1]] == 2};
+
+  float m[2] = {kNegInf, kNegInf};
+  float d[2] = {0.0f, 0.0f};
+  float o_frag[kNumMmaD][8];
+#pragma unroll
+  for (int mma_d = 0; mma_d < kNumMmaD; ++mma_d) {
+#pragma unroll
+    for (int reg_id = 0; reg_id < 8; ++reg_id) {
+      o_frag[mma_d][reg_id] = 0.0f;
+    }
+  }
+
+  for (int kv_tile_start = 0; kv_tile_start < block_max_visible_end;
+       kv_tile_start += kKvTile) {
+    const int valid_rows = min(kKvTile, block_max_visible_end - kv_tile_start);
+
+    for (int flat = threadIdx.x; flat < kKvTile * kUpcastStride;
+         flat += blockDim.x) {
+      const int row = flat / kUpcastStride;
+      const int chunk = flat % kUpcastStride;
+      const uint32_t perm_offset =
+          mtgr_perm128_offset<kUpcastStride>(row, chunk);
+      const int kv_local_idx = kv_tile_start + row;
+      const bool pred_guard = row < valid_rows;
+      const int64_t base =
+          pred_guard
+              ? (static_cast<int64_t>(seq_start + kv_local_idx) * num_heads +
+                 head_idx) *
+                    kHeadDim
+              : 0;
+      const b128_t* k_src = reinterpret_cast<const b128_t*>(key + base);
+      const b128_t* v_src = reinterpret_cast<const b128_t*>(value + base);
+      mtgr_cp_async_load_128b(
+          k_shared_perm + perm_offset, k_src + chunk, pred_guard);
+      mtgr_cp_async_load_128b(
+          v_shared_perm + perm_offset, v_src + chunk, pred_guard);
+    }
+    mtgr_cp_async_commit_group();
+    mtgr_cp_async_wait_group<0>();
+    __syncthreads();
+
+    float s_frag[kNumMmaKV][8];
+    uint32_t q_frag[4];
+    uint32_t k_frag[4];
+    uint32_t q_offset = mtgr_perm128_offset<kUpcastStride>(
+        warp_id * kQueriesPerWarp + (lane % 16), lane / 16);
+    uint32_t k_offset = mtgr_perm128_offset<kUpcastStride>(
+        8 * (lane / 16) + (lane % 8), (lane % 16) / 8);
+
+#pragma unroll
+    for (int mma_d = 0; mma_d < kNumMmaD; ++mma_d) {
+      q_smem.ldmatrix_m8n8x4(q_offset, q_frag);
+      q_offset = MtgrPermutedSmem128<kUpcastStride>::
+          template advance_offset_by_row<16, kUpcastStride>(q_offset);
+
+#pragma unroll
+      for (int mma_kv = 0; mma_kv < kNumMmaKV; ++mma_kv) {
+        k_smem.ldmatrix_m8n8x4(k_offset, k_frag);
+        k_offset = MtgrPermutedSmem128<kUpcastStride>::
+            template advance_offset_by_row<16, kUpcastStride>(k_offset);
+        if (mma_d == 0) {
+          mtgr_mma_sync_m16n16k16_row_col_f16f16f32<MtgrMmaMode::kInit>(
+              s_frag[mma_kv], q_frag, k_frag);
+        } else {
+          mtgr_mma_sync_m16n16k16_row_col_f16f16f32(
+              s_frag[mma_kv], q_frag, k_frag);
+        }
+      }
+
+      k_offset =
+          MtgrPermutedSmem128<kUpcastStride>::template advance_offset_by_column<
+              2>(k_offset, mma_d) -
+          kNumMmaKV * kQueriesPerWarp * kUpcastStride;
+      q_offset =
+          MtgrPermutedSmem128<kUpcastStride>::template advance_offset_by_column<
+              2>(q_offset, mma_d) -
+          kQueriesPerWarp * kUpcastStride;
+    }
+
+#pragma unroll
+    for (int mma_kv = 0; mma_kv < kNumMmaKV; ++mma_kv) {
+#pragma unroll
+      for (int reg_id = 0; reg_id < 8; ++reg_id) {
+        const int row_sel = (reg_id % 4) / 2;
+        const int kv_local_idx = kv_tile_start + mma_kv * 16 + 2 * (lane % 4) +
+                                 8 * (reg_id / 4) + (reg_id & 1);
+        const bool visible = row_valid[row_sel] &&
+                             kv_local_idx < kv_tile_start + valid_rows &&
+                             kv_local_idx < row_visible_end[row_sel];
+        s_frag[mma_kv][reg_id] = visible ? s_frag[mma_kv][reg_id] : kNegInf;
+      }
+    }
+
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const bool row_has_prefix = row_valid[j] && row_visible_end[j] > 0;
+      const float m_prev = m[j];
+      float m_new = row_has_prefix ? m_prev : kNegInf;
+#pragma unroll
+      for (int mma_kv = 0; mma_kv < kNumMmaKV; ++mma_kv) {
+        const float m_local =
+            fmaxf(fmaxf(s_frag[mma_kv][j * 2 + 0], s_frag[mma_kv][j * 2 + 1]),
+                  fmaxf(s_frag[mma_kv][j * 2 + 4], s_frag[mma_kv][j * 2 + 5]));
+        m_new = fmaxf(m_new, m_local);
+      }
+      m_new = fmaxf(m_new, __shfl_xor_sync(0xffffffff, m_new, 0x2));
+      m_new = fmaxf(m_new, __shfl_xor_sync(0xffffffff, m_new, 0x1));
+
+      const float o_scale =
+          row_has_prefix ? (m_prev == kNegInf ? 0.0f : exp2f(m_prev - m_new))
+                         : 0.0f;
+      d[j] *= o_scale;
+#pragma unroll
+      for (int mma_d = 0; mma_d < kNumMmaD; ++mma_d) {
+        o_frag[mma_d][j * 2 + 0] *= o_scale;
+        o_frag[mma_d][j * 2 + 1] *= o_scale;
+        o_frag[mma_d][j * 2 + 4] *= o_scale;
+        o_frag[mma_d][j * 2 + 5] *= o_scale;
+      }
+#pragma unroll
+      for (int mma_kv = 0; mma_kv < kNumMmaKV; ++mma_kv) {
+        s_frag[mma_kv][j * 2 + 0] =
+            row_has_prefix ? exp2f(s_frag[mma_kv][j * 2 + 0] - m_new) : 0.0f;
+        s_frag[mma_kv][j * 2 + 1] =
+            row_has_prefix ? exp2f(s_frag[mma_kv][j * 2 + 1] - m_new) : 0.0f;
+        s_frag[mma_kv][j * 2 + 4] =
+            row_has_prefix ? exp2f(s_frag[mma_kv][j * 2 + 4] - m_new) : 0.0f;
+        s_frag[mma_kv][j * 2 + 5] =
+            row_has_prefix ? exp2f(s_frag[mma_kv][j * 2 + 5] - m_new) : 0.0f;
+      }
+      m[j] = row_has_prefix ? m_new : kNegInf;
+    }
+
+    half s_frag_half[kNumMmaKV][8];
+#pragma unroll
+    for (int mma_kv = 0; mma_kv < kNumMmaKV; ++mma_kv) {
+      mtgr_vec_cast_8(s_frag_half[mma_kv], s_frag[mma_kv]);
+      mtgr_m16k16_rowsum_f16f16f32(d, s_frag_half[mma_kv]);
+
+      uint32_t v_frag[4];
+      uint32_t v_offset = mtgr_perm128_offset<kUpcastStride>(
+          mma_kv * 16 + (lane % 16), lane / 16);
+#pragma unroll
+      for (int mma_d = 0; mma_d < kNumMmaD; ++mma_d) {
+        v_smem.ldmatrix_m8n8x4_trans(v_offset, v_frag);
+        mtgr_mma_sync_m16n16k16_row_col_f16f16f32(
+            o_frag[mma_d],
+            reinterpret_cast<uint32_t*>(s_frag_half[mma_kv]),
+            v_frag);
+        v_offset = MtgrPermutedSmem128<
+            kUpcastStride>::template advance_offset_by_column<2>(v_offset,
+                                                                 mma_d);
+      }
+    }
+    __syncthreads();
+  }
+
+  const int pair_base = (lane % 4) * 2;
+#pragma unroll
+  for (int j = 0; j < 2; ++j) {
+    const int q_local_idx = warp_q_base_local + (lane / 4) + j * 8;
+    if (q_local_idx < total_len) {
+      const int64_t out_base =
+          (static_cast<int64_t>(seq_start + q_local_idx) * num_heads +
+           head_idx) *
+          kHeadDim;
+      if constexpr (!InlineDiagMerge) {
+        const float inv_d = d[j] > 0.0f ? 1.0f / d[j] : 0.0f;
+#pragma unroll
+        for (int mma_d = 0; mma_d < kNumMmaD; ++mma_d) {
+          const int col_mma_base = mma_d * 16;
+          output[out_base + col_mma_base + pair_base + 0] =
+              __float2half_rn(o_frag[mma_d][j * 2 + 0] * inv_d);
+          output[out_base + col_mma_base + pair_base + 1] =
+              __float2half_rn(o_frag[mma_d][j * 2 + 1] * inv_d);
+          output[out_base + col_mma_base + 8 + pair_base + 0] =
+              __float2half_rn(o_frag[mma_d][4 + j * 2 + 0] * inv_d);
+          output[out_base + col_mma_base + 8 + pair_base + 1] =
+              __float2half_rn(o_frag[mma_d][4 + j * 2 + 1] * inv_d);
+        }
+        if (row_is_diag[j] && (lane % 4) == 0) {
+          diag_prefix_lse[(static_cast<int64_t>(seq_start + q_local_idx) *
+                               num_heads +
+                           head_idx)] = m[j] + log2f(d[j]);
+        }
+      } else {
+        float self_dot = 0.0f;
+        if (row_is_diag[j]) {
+#pragma unroll
+          for (int mma_d = 0; mma_d < kNumMmaD; ++mma_d) {
+            const int col_mma_base = mma_d * 16;
+            const int dim0 = col_mma_base + pair_base + 0;
+            const int dim1 = col_mma_base + pair_base + 1;
+            const int dim2 = col_mma_base + 8 + pair_base + 0;
+            const int dim3 = col_mma_base + 8 + pair_base + 1;
+            self_dot += __half2float(query[out_base + dim0]) *
+                        __half2float(key[out_base + dim0]);
+            self_dot += __half2float(query[out_base + dim1]) *
+                        __half2float(key[out_base + dim1]);
+            self_dot += __half2float(query[out_base + dim2]) *
+                        __half2float(key[out_base + dim2]);
+            self_dot += __half2float(query[out_base + dim3]) *
+                        __half2float(key[out_base + dim3]);
+          }
+          self_dot += __shfl_xor_sync(0xffffffff, self_dot, 0x1);
+          self_dot += __shfl_xor_sync(0xffffffff, self_dot, 0x2);
+        }
+        const float self_score = self_dot * sm_scale_log2e;
+        const float merged_m = row_is_diag[j] ? fmaxf(m[j], self_score) : m[j];
+        const float prefix_scale =
+            row_is_diag[j] && d[j] > 0.0f ? exp2f(m[j] - merged_m) : 1.0f;
+        const float self_scale =
+            row_is_diag[j] ? exp2f(self_score - merged_m) : 0.0f;
+        const float merged_d =
+            row_is_diag[j] ? d[j] * prefix_scale + self_scale : d[j];
+        const float inv_d = merged_d > 0.0f ? 1.0f / merged_d : 0.0f;
+#pragma unroll
+        for (int mma_d = 0; mma_d < kNumMmaD; ++mma_d) {
+          const int col_mma_base = mma_d * 16;
+          float out0 = o_frag[mma_d][j * 2 + 0];
+          float out1 = o_frag[mma_d][j * 2 + 1];
+          float out2 = o_frag[mma_d][4 + j * 2 + 0];
+          float out3 = o_frag[mma_d][4 + j * 2 + 1];
+          if (row_is_diag[j]) {
+            out0 = out0 * prefix_scale +
+                   self_scale *
+                       __half2float(
+                           value[out_base + col_mma_base + pair_base + 0]);
+            out1 = out1 * prefix_scale +
+                   self_scale *
+                       __half2float(
+                           value[out_base + col_mma_base + pair_base + 1]);
+            out2 = out2 * prefix_scale +
+                   self_scale *
+                       __half2float(
+                           value[out_base + col_mma_base + 8 + pair_base + 0]);
+            out3 = out3 * prefix_scale +
+                   self_scale *
+                       __half2float(
+                           value[out_base + col_mma_base + 8 + pair_base + 1]);
+          }
+          output[out_base + col_mma_base + pair_base + 0] =
+              __float2half_rn(out0 * inv_d);
+          output[out_base + col_mma_base + pair_base + 1] =
+              __float2half_rn(out1 * inv_d);
+          output[out_base + col_mma_base + 8 + pair_base + 0] =
+              __float2half_rn(out2 * inv_d);
+          output[out_base + col_mma_base + 8 + pair_base + 1] =
+              __float2half_rn(out3 * inv_d);
+        }
+      }
+    }
+  }
+#else
+  (void)query;
+  (void)key;
+  (void)value;
+  (void)segment_offsets;
+  (void)segment_rules;
+  (void)output;
+  (void)diag_prefix_lse;
+  (void)max_request_len;
+  (void)num_heads;
+  (void)num_segments;
+  (void)sm_scale_log2e;
+#endif
+}
+
+template <int HeadDim, int WarpsPerBlock, int StaticNumSegments = 0>
+__global__
+__launch_bounds__(WarpsPerBlock * 32) void mtgr_ragged_segment_diag_merge_kernel(
+    const half* __restrict__ query,
+    const half* __restrict__ key,
+    const half* __restrict__ value,
+    const int32_t* __restrict__ segment_offsets,
+    const int32_t* __restrict__ segment_rules,
+    const int32_t* __restrict__ row_to_batch,
+    const float* __restrict__ diag_prefix_lse,
+    half* __restrict__ output,
+    int total_len,
+    int num_heads,
+    int num_segments,
+    float sm_scale_log2e) {
+  constexpr int kLaneElems = HeadDim / 32;
+  static_assert(HeadDim % 32 == 0);
+
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int row = blockIdx.x * WarpsPerBlock + warp_id;
+  const int num_rows = total_len * num_heads;
+  if (row >= num_rows) {
+    return;
+  }
+
+  const int q_idx = row / num_heads;
+  const int head_idx = row - q_idx * num_heads;
+  const int batch_idx = row_to_batch[q_idx];
+  const int segment_stride =
+      StaticNumSegments > 0 ? StaticNumSegments + 1 : num_segments + 1;
+  const int32_t* const offsets_row =
+      segment_offsets + static_cast<int64_t>(batch_idx) * segment_stride;
+  const int batch_q_start = offsets_row[0];
+  const int local_q_idx = q_idx - batch_q_start;
+
+  int seg_id = 0;
+  (void)mtgr_visible_end_for_segmented_no_match<StaticNumSegments>(
+      local_q_idx, offsets_row, segment_rules, num_segments, &seg_id);
+  if (segment_rules[seg_id] != 2) {
+    return;
+  }
+
+  const int dim_base = lane * kLaneElems;
+  const int64_t base =
+      (static_cast<int64_t>(q_idx) * num_heads + head_idx) * HeadDim + dim_base;
+  float q_frag[kLaneElems];
+  float dot_lane = 0.0f;
+#pragma unroll
+  for (int i = 0; i + 1 < kLaneElems; i += 2) {
+    const half2 q2 = *reinterpret_cast<const half2*>(query + base + i);
+    const half2 k2 = *reinterpret_cast<const half2*>(key + base + i);
+    const float2 qf = __half22float2(q2);
+    const float2 kf = __half22float2(k2);
+    q_frag[i] = qf.x;
+    q_frag[i + 1] = qf.y;
+    dot_lane += qf.x * kf.x + qf.y * kf.y;
+  }
+  if constexpr ((kLaneElems & 1) != 0) {
+    q_frag[kLaneElems - 1] = __half2float(query[base + kLaneElems - 1]);
+    dot_lane +=
+        q_frag[kLaneElems - 1] * __half2float(key[base + kLaneElems - 1]);
+  }
+  dot_lane = warp_reduce_sum(dot_lane);
+
+  const float prefix_lse =
+      diag_prefix_lse[(static_cast<int64_t>(q_idx) * num_heads + head_idx)];
+  const float self_lse = dot_lane * sm_scale_log2e;
+  const float new_m = fmaxf(prefix_lse, self_lse);
+  const float prefix_w = exp2f(prefix_lse - new_m);
+  const float self_w = exp2f(self_lse - new_m);
+  const float inv_d = 1.0f / (prefix_w + self_w);
+
+#pragma unroll
+  for (int i = 0; i < kLaneElems; ++i) {
+    const float prefix_o = __half2float(output[base + i]);
+    const float self_v = __half2float(value[base + i]);
+    output[base + i] =
+        __float2half_rn((prefix_o * prefix_w + self_v * self_w) * inv_d);
+  }
+}
+
 template <int HeadDim, int NumMmaKV>
 __global__
 __launch_bounds__(4 * kWarpSize) void mtgr_fused_partial_rt_attention_batch4_q64_regfrag_kernel(
@@ -3576,6 +4380,48 @@ void launch_mtgr_fused_no_match_attention_batched_fallback_kernel(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <int HeadDim, int StaticNumSegments = 0>
+void launch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    const torch::Tensor& target_seq_starts_i32,
+    const torch::Tensor& target_lens_i32,
+    double sm_scale,
+    torch::Tensor output_snd,
+    torch::Tensor target_hcr_lse_sh1) {
+  constexpr int kWarpsPerBlock = 4;
+  const int total_len = static_cast<int>(query_snd.size(0));
+  const int num_heads = static_cast<int>(query_snd.size(1));
+  const int num_rows = total_len * num_heads;
+  const int num_segments = static_cast<int>(segment_rules_i32.size(0));
+  const dim3 block(kWarpsPerBlock * 32);
+  const dim3 grid((num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+      HeadDim,
+      kWarpsPerBlock,
+      StaticNumSegments><<<grid, block, 0, stream>>>(
+      reinterpret_cast<const half*>(query_snd.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(key_snd.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(value_snd.data_ptr<at::Half>()),
+      segment_offsets_i32.data_ptr<int32_t>(),
+      segment_rules_i32.data_ptr<int32_t>(),
+      row_to_batch_i32.data_ptr<int32_t>(),
+      target_seq_starts_i32.data_ptr<int32_t>(),
+      target_lens_i32.data_ptr<int32_t>(),
+      reinterpret_cast<half*>(output_snd.data_ptr<at::Half>()),
+      target_hcr_lse_sh1.data_ptr<float>(),
+      total_len,
+      num_heads,
+      num_segments,
+      static_cast<float>(sm_scale) * kLog2E);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <int HeadDim, int NumMmaKV>
 void launch_mtgr_fused_no_match_attention_batch4_q64_regfrag_impl(
     const torch::Tensor& query_snd,
@@ -3627,6 +4473,607 @@ void launch_mtgr_fused_no_match_attention_batch4_q64_regfrag_impl(
           num_heads,
           static_cast<float>(sm_scale) * kLog2E);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int HeadDim>
+void dispatch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    const torch::Tensor& target_seq_starts_i32,
+    const torch::Tensor& target_lens_i32,
+    double sm_scale,
+    torch::Tensor output_snd,
+    torch::Tensor target_hcr_lse_sh1) {
+  switch (segment_rules_i32.size(0)) {
+    case 2:
+      launch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          HeadDim,
+          2>(query_snd,
+             key_snd,
+             value_snd,
+             segment_offsets_i32,
+             segment_rules_i32,
+             row_to_batch_i32,
+             target_seq_starts_i32,
+             target_lens_i32,
+             sm_scale,
+             output_snd,
+             target_hcr_lse_sh1);
+      return;
+    case 3:
+      launch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          HeadDim,
+          3>(query_snd,
+             key_snd,
+             value_snd,
+             segment_offsets_i32,
+             segment_rules_i32,
+             row_to_batch_i32,
+             target_seq_starts_i32,
+             target_lens_i32,
+             sm_scale,
+             output_snd,
+             target_hcr_lse_sh1);
+      return;
+    case 4:
+      launch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          HeadDim,
+          4>(query_snd,
+             key_snd,
+             value_snd,
+             segment_offsets_i32,
+             segment_rules_i32,
+             row_to_batch_i32,
+             target_seq_starts_i32,
+             target_lens_i32,
+             sm_scale,
+             output_snd,
+             target_hcr_lse_sh1);
+      return;
+    case 5:
+      launch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          HeadDim,
+          5>(query_snd,
+             key_snd,
+             value_snd,
+             segment_offsets_i32,
+             segment_rules_i32,
+             row_to_batch_i32,
+             target_seq_starts_i32,
+             target_lens_i32,
+             sm_scale,
+             output_snd,
+             target_hcr_lse_sh1);
+      return;
+    case 6:
+      launch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          HeadDim,
+          6>(query_snd,
+             key_snd,
+             value_snd,
+             segment_offsets_i32,
+             segment_rules_i32,
+             row_to_batch_i32,
+             target_seq_starts_i32,
+             target_lens_i32,
+             sm_scale,
+             output_snd,
+             target_hcr_lse_sh1);
+      return;
+    case 7:
+      launch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          HeadDim,
+          7>(query_snd,
+             key_snd,
+             value_snd,
+             segment_offsets_i32,
+             segment_rules_i32,
+             row_to_batch_i32,
+             target_seq_starts_i32,
+             target_lens_i32,
+             sm_scale,
+             output_snd,
+             target_hcr_lse_sh1);
+      return;
+    case 8:
+      launch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          HeadDim,
+          8>(query_snd,
+             key_snd,
+             value_snd,
+             segment_offsets_i32,
+             segment_rules_i32,
+             row_to_batch_i32,
+             target_seq_starts_i32,
+             target_lens_i32,
+             sm_scale,
+             output_snd,
+             target_hcr_lse_sh1);
+      return;
+    default:
+      launch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          HeadDim>(query_snd,
+                   key_snd,
+                   value_snd,
+                   segment_offsets_i32,
+                   segment_rules_i32,
+                   row_to_batch_i32,
+                   target_seq_starts_i32,
+                   target_lens_i32,
+                   sm_scale,
+                   output_snd,
+                   target_hcr_lse_sh1);
+      return;
+  }
+}
+
+template <int HeadDim, int StaticNumSegments = 0>
+void launch_mtgr_ragged_segment_diag_merge_kernel(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    const torch::Tensor& diag_prefix_lse,
+    double sm_scale,
+    torch::Tensor output_snd) {
+  constexpr int kWarpsPerBlock = 4;
+  const int total_len = static_cast<int>(query_snd.size(0));
+  const int num_heads = static_cast<int>(query_snd.size(1));
+  const int num_rows = total_len * num_heads;
+  const int num_segments = static_cast<int>(segment_rules_i32.size(0));
+  const dim3 block(kWarpsPerBlock * 32);
+  const dim3 grid((num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  mtgr_ragged_segment_diag_merge_kernel<HeadDim,
+                                        kWarpsPerBlock,
+                                        StaticNumSegments>
+      <<<grid, block, 0, stream>>>(
+          reinterpret_cast<const half*>(query_snd.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(key_snd.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(value_snd.data_ptr<at::Half>()),
+          segment_offsets_i32.data_ptr<int32_t>(),
+          segment_rules_i32.data_ptr<int32_t>(),
+          row_to_batch_i32.data_ptr<int32_t>(),
+          diag_prefix_lse.data_ptr<float>(),
+          reinterpret_cast<half*>(output_snd.data_ptr<at::Half>()),
+          total_len,
+          num_heads,
+          num_segments,
+          static_cast<float>(sm_scale) * kLog2E);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int HeadDim,
+          int NumMmaKV,
+          int StaticNumSegments = 0,
+          bool InlineDiagMerge = true>
+void launch_mtgr_ragged_segment_attention_q64_regfrag_impl(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    int64_t max_request_len,
+    double sm_scale,
+    torch::Tensor output_snd) {
+  constexpr int kQueriesPerBlock = 64;
+  constexpr int kWarpsPerBlock = 4;
+  constexpr int kKvTile = NumMmaKV * 16;
+  constexpr int kUpcastStride = HeadDim / 8;
+  constexpr size_t kDynSharedBytes =
+      2 * kKvTile * kUpcastStride * sizeof(b128_t);
+  (void)row_to_batch_i32;
+  const int num_heads = static_cast<int>(query_snd.size(1));
+  const int num_segments = static_cast<int>(segment_rules_i32.size(0));
+  const int batch_size = static_cast<int>(segment_offsets_i32.size(0));
+  torch::Tensor diag_prefix_lse;
+  if constexpr (!InlineDiagMerge) {
+    diag_prefix_lse = torch::empty({query_snd.size(0), query_snd.size(1)},
+                                   torch::TensorOptions()
+                                       .dtype(torch::kFloat32)
+                                       .device(query_snd.device()));
+  }
+  const dim3 block(kWarpsPerBlock * kWarpSize);
+  const dim3 prefix_grid(
+      (static_cast<int>(max_request_len) + kQueriesPerBlock - 1) /
+          kQueriesPerBlock,
+      num_heads,
+      static_cast<unsigned int>(batch_size));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  cudaFuncSetAttribute(
+      mtgr_ragged_segment_attention_q64_regfrag_prefix_kernel<HeadDim,
+                                                              NumMmaKV,
+                                                              StaticNumSegments,
+                                                              InlineDiagMerge>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(kDynSharedBytes));
+  mtgr_ragged_segment_attention_q64_regfrag_prefix_kernel<HeadDim,
+                                                          NumMmaKV,
+                                                          StaticNumSegments,
+                                                          InlineDiagMerge>
+      <<<prefix_grid, block, kDynSharedBytes, stream>>>(
+          reinterpret_cast<const half*>(query_snd.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(key_snd.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(value_snd.data_ptr<at::Half>()),
+          segment_offsets_i32.data_ptr<int32_t>(),
+          segment_rules_i32.data_ptr<int32_t>(),
+          reinterpret_cast<half*>(output_snd.data_ptr<at::Half>()),
+          InlineDiagMerge ? nullptr : diag_prefix_lse.data_ptr<float>(),
+          static_cast<int>(max_request_len),
+          num_heads,
+          num_segments,
+          static_cast<float>(sm_scale) * kLog2E);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if constexpr (!InlineDiagMerge) {
+    launch_mtgr_ragged_segment_diag_merge_kernel<HeadDim, StaticNumSegments>(
+        query_snd,
+        key_snd,
+        value_snd,
+        segment_offsets_i32,
+        segment_rules_i32,
+        row_to_batch_i32,
+        diag_prefix_lse,
+        sm_scale,
+        output_snd);
+    c10::cuda::CUDACachingAllocator::recordStream(
+        diag_prefix_lse.storage().data_ptr(), at::cuda::getCurrentCUDAStream());
+  }
+}
+
+template <int HeadDim, int StaticNumSegments = 0>
+void dispatch_mtgr_ragged_segment_attention_q64_regfrag_kernel_static(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    int64_t max_request_len,
+    double sm_scale,
+    torch::Tensor output_snd) {
+  if constexpr (HeadDim == 64) {
+    if (use_mtgr_sm90_hd64_q64_regfrag_kv96_experimental()) {
+      launch_mtgr_ragged_segment_attention_q64_regfrag_impl<64,
+                                                            6,
+                                                            StaticNumSegments>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          max_request_len,
+          sm_scale,
+          output_snd);
+      return;
+    }
+    if (use_mtgr_sm90_hd64_q64_regfrag_kv64_experimental() ||
+        use_mtgr_sm90_hd64_q64_regfrag_experimental()) {
+      launch_mtgr_ragged_segment_attention_q64_regfrag_impl<64,
+                                                            4,
+                                                            StaticNumSegments>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          max_request_len,
+          sm_scale,
+          output_snd);
+      return;
+    }
+    launch_mtgr_ragged_segment_attention_q64_regfrag_impl<64,
+                                                          8,
+                                                          StaticNumSegments>(
+        query_snd,
+        key_snd,
+        value_snd,
+        segment_offsets_i32,
+        segment_rules_i32,
+        row_to_batch_i32,
+        max_request_len,
+        sm_scale,
+        output_snd);
+    return;
+  }
+
+  if constexpr (HeadDim == 128) {
+    const int default_num_mma_kv =
+        select_mtgr_hd128_q64_regfrag_num_mma_kv_continuous(
+            query_snd.size(1), max_request_len, max_request_len);
+    if (use_mtgr_sm90_q64_regfrag_kv96_experimental() ||
+        default_num_mma_kv == 6) {
+      if (use_mtgr_ragged_hd128_q64_regfrag_split_diag_experimental()) {
+        launch_mtgr_ragged_segment_attention_q64_regfrag_impl<128,
+                                                              6,
+                                                              StaticNumSegments,
+                                                              false>(
+            query_snd,
+            key_snd,
+            value_snd,
+            segment_offsets_i32,
+            segment_rules_i32,
+            row_to_batch_i32,
+            max_request_len,
+            sm_scale,
+            output_snd);
+        return;
+      }
+      launch_mtgr_ragged_segment_attention_q64_regfrag_impl<128,
+                                                            6,
+                                                            StaticNumSegments>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          max_request_len,
+          sm_scale,
+          output_snd);
+      return;
+    }
+    if (use_mtgr_sm90_q64_regfrag_kv80_experimental() ||
+        default_num_mma_kv == 5) {
+      if (use_mtgr_ragged_hd128_q64_regfrag_split_diag_experimental()) {
+        launch_mtgr_ragged_segment_attention_q64_regfrag_impl<128,
+                                                              5,
+                                                              StaticNumSegments,
+                                                              false>(
+            query_snd,
+            key_snd,
+            value_snd,
+            segment_offsets_i32,
+            segment_rules_i32,
+            row_to_batch_i32,
+            max_request_len,
+            sm_scale,
+            output_snd);
+        return;
+      }
+      launch_mtgr_ragged_segment_attention_q64_regfrag_impl<128,
+                                                            5,
+                                                            StaticNumSegments>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          max_request_len,
+          sm_scale,
+          output_snd);
+      return;
+    }
+    if (use_mtgr_ragged_hd128_q64_regfrag_split_diag_experimental()) {
+      launch_mtgr_ragged_segment_attention_q64_regfrag_impl<128,
+                                                            4,
+                                                            StaticNumSegments,
+                                                            false>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          max_request_len,
+          sm_scale,
+          output_snd);
+      return;
+    }
+    launch_mtgr_ragged_segment_attention_q64_regfrag_impl<128,
+                                                          4,
+                                                          StaticNumSegments>(
+        query_snd,
+        key_snd,
+        value_snd,
+        segment_offsets_i32,
+        segment_rules_i32,
+        row_to_batch_i32,
+        max_request_len,
+        sm_scale,
+        output_snd);
+    return;
+  }
+}
+
+template <int HeadDim>
+void dispatch_mtgr_ragged_segment_attention_q64_regfrag_kernel(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    int64_t max_request_len,
+    double sm_scale,
+    torch::Tensor output_snd) {
+  switch (segment_rules_i32.size(0)) {
+    case 4:
+      dispatch_mtgr_ragged_segment_attention_q64_regfrag_kernel_static<HeadDim,
+                                                                       4>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          max_request_len,
+          sm_scale,
+          output_snd);
+      return;
+    case 5:
+      dispatch_mtgr_ragged_segment_attention_q64_regfrag_kernel_static<HeadDim,
+                                                                       5>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          max_request_len,
+          sm_scale,
+          output_snd);
+      return;
+    default:
+      break;
+  }
+  dispatch_mtgr_ragged_segment_attention_q64_regfrag_kernel_static<HeadDim>(
+      query_snd,
+      key_snd,
+      value_snd,
+      segment_offsets_i32,
+      segment_rules_i32,
+      row_to_batch_i32,
+      max_request_len,
+      sm_scale,
+      output_snd);
+}
+
+template <int HeadDim, int StaticNumSegments = 0>
+void launch_mtgr_ragged_segment_attention_batched_kernel(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    double sm_scale,
+    torch::Tensor output_snd) {
+  constexpr int kWarpsPerBlock = 4;
+  const int total_len = static_cast<int>(query_snd.size(0));
+  const int num_heads = static_cast<int>(query_snd.size(1));
+  const int num_rows = total_len * num_heads;
+  const int num_segments = static_cast<int>(segment_rules_i32.size(0));
+  const dim3 block(kWarpsPerBlock * 32);
+  const dim3 grid((num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  mtgr_ragged_segment_attention_batched_kernel<HeadDim,
+                                               kWarpsPerBlock,
+                                               StaticNumSegments>
+      <<<grid, block, 0, stream>>>(
+          reinterpret_cast<const half*>(query_snd.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(key_snd.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(value_snd.data_ptr<at::Half>()),
+          segment_offsets_i32.data_ptr<int32_t>(),
+          segment_rules_i32.data_ptr<int32_t>(),
+          row_to_batch_i32.data_ptr<int32_t>(),
+          reinterpret_cast<half*>(output_snd.data_ptr<at::Half>()),
+          total_len,
+          num_heads,
+          num_segments,
+          static_cast<float>(sm_scale) * kLog2E);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int HeadDim>
+void dispatch_mtgr_ragged_segment_attention_batched_kernel(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    double sm_scale,
+    torch::Tensor output_snd) {
+  switch (segment_rules_i32.size(0)) {
+    case 2:
+      launch_mtgr_ragged_segment_attention_batched_kernel<HeadDim, 2>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    case 3:
+      launch_mtgr_ragged_segment_attention_batched_kernel<HeadDim, 3>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    case 4:
+      launch_mtgr_ragged_segment_attention_batched_kernel<HeadDim, 4>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    case 5:
+      launch_mtgr_ragged_segment_attention_batched_kernel<HeadDim, 5>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    case 6:
+      launch_mtgr_ragged_segment_attention_batched_kernel<HeadDim, 6>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    case 7:
+      launch_mtgr_ragged_segment_attention_batched_kernel<HeadDim, 7>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    case 8:
+      launch_mtgr_ragged_segment_attention_batched_kernel<HeadDim, 8>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    default:
+      launch_mtgr_ragged_segment_attention_batched_kernel<HeadDim>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+  }
 }
 
 template <int HeadDim>
@@ -4694,6 +6141,253 @@ void mtgr_fused_no_match_attention_batched_cuda(
       return;
     default:
       CHECK(false) << "Unsupported head dim for batched fused no_match: "
+                   << query_snd.size(2);
+  }
+}
+
+void mtgr_fused_segmented_no_match_attention_batched_cuda(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    const torch::Tensor& target_seq_starts_i32,
+    const torch::Tensor& target_lens_i32,
+    double sm_scale,
+    torch::Tensor output_snd,
+    torch::Tensor target_hcr_lse_sh1) {
+  CHECK(query_snd.defined());
+  CHECK(key_snd.defined());
+  CHECK(value_snd.defined());
+  CHECK(segment_offsets_i32.defined());
+  CHECK(segment_rules_i32.defined());
+  CHECK(row_to_batch_i32.defined());
+  CHECK(target_seq_starts_i32.defined());
+  CHECK(target_lens_i32.defined());
+  CHECK(output_snd.defined());
+  CHECK(target_hcr_lse_sh1.defined());
+  CHECK(query_snd.is_cuda());
+  CHECK(key_snd.is_cuda());
+  CHECK(value_snd.is_cuda());
+  CHECK(segment_offsets_i32.is_cuda());
+  CHECK(segment_rules_i32.is_cuda());
+  CHECK(row_to_batch_i32.is_cuda());
+  CHECK(target_seq_starts_i32.is_cuda());
+  CHECK(target_lens_i32.is_cuda());
+  CHECK(output_snd.is_cuda());
+  CHECK(target_hcr_lse_sh1.is_cuda());
+  CHECK(query_snd.is_contiguous());
+  CHECK(key_snd.is_contiguous());
+  CHECK(value_snd.is_contiguous());
+  CHECK(segment_offsets_i32.is_contiguous());
+  CHECK(segment_rules_i32.is_contiguous());
+  CHECK(row_to_batch_i32.is_contiguous());
+  CHECK(target_seq_starts_i32.is_contiguous());
+  CHECK(target_lens_i32.is_contiguous());
+  CHECK(output_snd.is_contiguous());
+  CHECK(target_hcr_lse_sh1.is_contiguous());
+  CHECK_EQ(query_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(key_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(value_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(segment_offsets_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(segment_rules_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(row_to_batch_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(target_seq_starts_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(target_lens_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(output_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(target_hcr_lse_sh1.scalar_type(), torch::kFloat32);
+  CHECK_EQ(query_snd.dim(), 3);
+  CHECK_EQ(key_snd.dim(), 3);
+  CHECK_EQ(value_snd.dim(), 3);
+  CHECK_EQ(segment_offsets_i32.dim(), 2);
+  CHECK_EQ(segment_rules_i32.dim(), 1);
+  CHECK_EQ(row_to_batch_i32.dim(), 1);
+  CHECK_EQ(target_seq_starts_i32.dim(), 1);
+  CHECK_EQ(target_lens_i32.dim(), 1);
+  CHECK_EQ(output_snd.dim(), 3);
+  CHECK_EQ(target_hcr_lse_sh1.dim(), 3);
+  CHECK_EQ(query_snd.sizes(), key_snd.sizes());
+  CHECK_EQ(query_snd.sizes(), value_snd.sizes());
+  CHECK_EQ(query_snd.sizes(), output_snd.sizes());
+  CHECK_EQ(row_to_batch_i32.size(0), query_snd.size(0));
+  CHECK_EQ(segment_offsets_i32.size(0), target_seq_starts_i32.size(0));
+  CHECK_EQ(segment_offsets_i32.size(0), target_lens_i32.size(0));
+  CHECK_EQ(segment_offsets_i32.size(1), segment_rules_i32.size(0) + 1);
+  CHECK_EQ(target_hcr_lse_sh1.size(1), query_snd.size(1));
+  CHECK_EQ(target_hcr_lse_sh1.size(2), 1);
+  CHECK_GT(segment_rules_i32.size(0), 1);
+  CHECK_GT(sm_scale, 0.0);
+
+  c10::cuda::CUDAGuard guard(query_snd.device());
+  switch (query_snd.size(2)) {
+    case 32:
+      dispatch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          32>(query_snd,
+              key_snd,
+              value_snd,
+              segment_offsets_i32,
+              segment_rules_i32,
+              row_to_batch_i32,
+              target_seq_starts_i32,
+              target_lens_i32,
+              sm_scale,
+              output_snd,
+              target_hcr_lse_sh1);
+      return;
+    case 64:
+      dispatch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          64>(query_snd,
+              key_snd,
+              value_snd,
+              segment_offsets_i32,
+              segment_rules_i32,
+              row_to_batch_i32,
+              target_seq_starts_i32,
+              target_lens_i32,
+              sm_scale,
+              output_snd,
+              target_hcr_lse_sh1);
+      return;
+    case 128:
+      dispatch_mtgr_fused_segmented_no_match_attention_batched_fallback_kernel<
+          128>(query_snd,
+               key_snd,
+               value_snd,
+               segment_offsets_i32,
+               segment_rules_i32,
+               row_to_batch_i32,
+               target_seq_starts_i32,
+               target_lens_i32,
+               sm_scale,
+               output_snd,
+               target_hcr_lse_sh1);
+      return;
+    default:
+      CHECK(false) << "Unsupported head dim for segmented fused no_match: "
+                   << query_snd.size(2);
+  }
+}
+
+void mtgr_ragged_segment_attention_batched_cuda(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& row_to_batch_i32,
+    int64_t max_request_len,
+    double sm_scale,
+    torch::Tensor output_snd) {
+  CHECK(query_snd.defined());
+  CHECK(key_snd.defined());
+  CHECK(value_snd.defined());
+  CHECK(segment_offsets_i32.defined());
+  CHECK(segment_rules_i32.defined());
+  CHECK(row_to_batch_i32.defined());
+  CHECK(output_snd.defined());
+  CHECK(query_snd.is_cuda());
+  CHECK(key_snd.is_cuda());
+  CHECK(value_snd.is_cuda());
+  CHECK(segment_offsets_i32.is_cuda());
+  CHECK(segment_rules_i32.is_cuda());
+  CHECK(row_to_batch_i32.is_cuda());
+  CHECK(output_snd.is_cuda());
+  CHECK(query_snd.is_contiguous());
+  CHECK(key_snd.is_contiguous());
+  CHECK(value_snd.is_contiguous());
+  CHECK(segment_offsets_i32.is_contiguous());
+  CHECK(segment_rules_i32.is_contiguous());
+  CHECK(row_to_batch_i32.is_contiguous());
+  CHECK(output_snd.is_contiguous());
+  CHECK_EQ(query_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(key_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(value_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(segment_offsets_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(segment_rules_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(row_to_batch_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(output_snd.scalar_type(), torch::kFloat16);
+  CHECK_EQ(query_snd.dim(), 3);
+  CHECK_EQ(key_snd.dim(), 3);
+  CHECK_EQ(value_snd.dim(), 3);
+  CHECK_EQ(segment_offsets_i32.dim(), 2);
+  CHECK_EQ(segment_rules_i32.dim(), 1);
+  CHECK_EQ(row_to_batch_i32.dim(), 1);
+  CHECK_EQ(output_snd.dim(), 3);
+  CHECK_EQ(query_snd.sizes(), key_snd.sizes());
+  CHECK_EQ(query_snd.sizes(), value_snd.sizes());
+  CHECK_EQ(query_snd.sizes(), output_snd.sizes());
+  CHECK_EQ(row_to_batch_i32.size(0), query_snd.size(0));
+  CHECK_GT(segment_offsets_i32.size(0), 0);
+  CHECK_EQ(segment_offsets_i32.size(1), segment_rules_i32.size(0) + 1);
+  CHECK_GT(segment_rules_i32.size(0), 1);
+  CHECK_GT(max_request_len, 0);
+  CHECK_LE(max_request_len, query_snd.size(0));
+  CHECK_GT(sm_scale, 0.0);
+
+  c10::cuda::CUDAGuard guard(query_snd.device());
+  switch (query_snd.size(2)) {
+    case 32:
+      dispatch_mtgr_ragged_segment_attention_batched_kernel<32>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    case 64:
+      if (at::cuda::getCurrentDeviceProperties()->major >= 8) {
+        dispatch_mtgr_ragged_segment_attention_q64_regfrag_kernel<64>(
+            query_snd,
+            key_snd,
+            value_snd,
+            segment_offsets_i32,
+            segment_rules_i32,
+            row_to_batch_i32,
+            max_request_len,
+            sm_scale,
+            output_snd);
+        return;
+      }
+      dispatch_mtgr_ragged_segment_attention_batched_kernel<64>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    case 128:
+      if (at::cuda::getCurrentDeviceProperties()->major >= 8) {
+        dispatch_mtgr_ragged_segment_attention_q64_regfrag_kernel<128>(
+            query_snd,
+            key_snd,
+            value_snd,
+            segment_offsets_i32,
+            segment_rules_i32,
+            row_to_batch_i32,
+            max_request_len,
+            sm_scale,
+            output_snd);
+        return;
+      }
+      dispatch_mtgr_ragged_segment_attention_batched_kernel<128>(
+          query_snd,
+          key_snd,
+          value_snd,
+          segment_offsets_i32,
+          segment_rules_i32,
+          row_to_batch_i32,
+          sm_scale,
+          output_snd);
+      return;
+    default:
+      CHECK(false) << "Unsupported head dim for ragged segment attention: "
                    << query_snd.size(2);
   }
 }
