@@ -399,7 +399,7 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
                      .contiguous();
 
     for (int i = 0; i < warmup; ++i) {
-      (void)run_ragged_segment_attention_batched_for_test(
+      (void)run_stable_ragged_segment_attention_batched_for_test(
           query, key, value, segment_lens, segment_rules, scale);
     }
     CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -407,7 +407,7 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
     MTGRAttentionTestMetrics avg;
     for (int i = 0; i < repeat; ++i) {
       MTGRAttentionTestMetrics metrics;
-      auto output = run_ragged_segment_attention_batched_for_test(
+      auto output = run_stable_ragged_segment_attention_batched_for_test(
           query, key, value, segment_lens, segment_rules, scale, &metrics);
       CHECK(torch::isfinite(output).all().item<bool>());
 
@@ -2111,11 +2111,16 @@ struct MultiBatchProbeSequence {
   MTGRAttentionTestShape shape;
   torch::Tensor full_key_bsnd;
   torch::Tensor full_value_bsnd;
+  torch::Tensor full_query;
+  torch::Tensor full_key;
+  torch::Tensor full_value;
   torch::Tensor query;
   torch::Tensor key;
   torch::Tensor value;
   xllm::layer::AttentionMetadata metadata;
+  xllm::layer::AttentionMetadata full_metadata;
   xllm::KVCache one_cache;
+  xllm::KVCache full_one_cache;
   xllm::KVCache fused_cache;
   std::unique_ptr<LayerMTGRAttentionImpl> one_stage;
   std::unique_ptr<LayerMTGRAttentionImpl> fused;
@@ -2259,6 +2264,7 @@ struct TrueFusedBatchSetup {
 enum class TrueBatchBaseBackend {
   kWrapperFused,
   kOneStage,
+  kOneStageFullNoPrefix,
 };
 
 std::string encode_probe_shape_local_key(const MTGRAttentionTestShape& shape) {
@@ -2441,7 +2447,7 @@ TrueFusedBatchSetup make_true_fused_batch_setup(
                                       full_keys,
                                       full_values,
                                       setup.packed_query.device(),
-                                      torch::kFloat16,
+                                      torch::kBFloat16,
                                       kBlockSize);
     setup.metadata = std::move(partial_setup.metadata);
     setup.kv_cache = std::move(partial_setup.kv_cache);
@@ -2468,6 +2474,18 @@ torch::Tensor run_true_batch_base_once(MultiBatchProbeSequence* seq,
     *base_device_ms += metrics.device_total_ms;
     return output;
   }
+  if (base_backend == TrueBatchBaseBackend::kOneStageFullNoPrefix) {
+    auto output = std::get<0>(seq->one_stage->forward(seq->full_metadata,
+                                                      seq->full_query,
+                                                      seq->full_key,
+                                                      seq->full_value,
+                                                      seq->full_one_cache));
+    const auto metrics = seq->one_stage->last_metrics();
+    *base_mask_build_ms += metrics.mask_build_ms;
+    *base_device_ms += metrics.device_total_ms;
+    return output.narrow(0, seq->shape.matched_prefix, seq->shape.local_len())
+        .contiguous();
+  }
 
   auto output = std::get<0>(seq->fused->forward(
       seq->metadata, seq->query, seq->key, seq->value, seq->fused_cache));
@@ -2477,7 +2495,7 @@ torch::Tensor run_true_batch_base_once(MultiBatchProbeSequence* seq,
 
 MultiBatchProbeSequence make_probe_sequence(const MTGRAttentionTestShape& shape,
                                             const torch::Device& device) {
-  auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device);
+  auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
   const int64_t total = shape.total_len();
   const int64_t local = shape.local_len();
   const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
@@ -2493,6 +2511,12 @@ MultiBatchProbeSequence make_probe_sequence(const MTGRAttentionTestShape& shape,
   seq.shape = shape;
   seq.full_key_bsnd = full_key.contiguous();
   seq.full_value_bsnd = full_value.contiguous();
+  seq.full_query = full_query.select(0, 0).contiguous().view(
+      {total, shape.heads * shape.head_dim});
+  seq.full_key = full_key.select(0, 0).contiguous().view(
+      {total, shape.kv_heads * shape.head_dim});
+  seq.full_value = full_value.select(0, 0).contiguous().view(
+      {total, shape.kv_heads * shape.head_dim});
   seq.query = full_query.select(0, 0)
                   .narrow(0, shape.matched_prefix, local)
                   .contiguous()
@@ -2506,10 +2530,16 @@ MultiBatchProbeSequence make_probe_sequence(const MTGRAttentionTestShape& shape,
                   .contiguous()
                   .view({local, shape.kv_heads * shape.head_dim});
   seq.metadata = make_mtgr_attention_metadata(shape, device, kBlockSize);
+  MTGRAttentionTestShape full_shape = shape;
+  full_shape.matched_prefix = 0;
+  seq.full_metadata =
+      make_mtgr_attention_metadata(full_shape, device, kBlockSize);
   seq.one_cache =
-      make_mtgr_kv_cache(shape, device, torch::kFloat16, kBlockSize);
+      make_mtgr_kv_cache(shape, device, torch::kBFloat16, kBlockSize);
+  seq.full_one_cache =
+      make_mtgr_kv_cache(full_shape, device, torch::kBFloat16, kBlockSize);
   seq.fused_cache =
-      make_mtgr_kv_cache(shape, device, torch::kFloat16, kBlockSize);
+      make_mtgr_kv_cache(shape, device, torch::kBFloat16, kBlockSize);
   prefill_mtgr_matched_prefix_cache(
       full_key, full_value, shape, kBlockSize, seq.one_cache);
   prefill_mtgr_matched_prefix_cache(
@@ -2743,7 +2773,7 @@ MultiBatchProbeMetrics run_true_fused_partial_batch_vs_one_stage(
   CHECK(!batch->empty());
   CHECK_GT(batch->front().shape.matched_prefix, 0);
   return run_true_fused_batch_impl(
-      batch, warmup, repeat, TrueBatchBaseBackend::kOneStage);
+      batch, warmup, repeat, TrueBatchBaseBackend::kOneStageFullNoPrefix);
 }
 
 std::vector<std::vector<int64_t>> build_four_segment_lens_from_shapes(
@@ -2798,7 +2828,7 @@ FourSegmentVsRaggedMetrics run_four_segment_vs_ragged_batch(
                                                  packed_setup.packed_key,
                                                  packed_setup.packed_value,
                                                  packed_setup.kv_cache));
-    (void)run_ragged_segment_attention_batched_for_test(
+    (void)run_stable_ragged_segment_attention_batched_for_test(
         query_snd, key_snd, value_snd, segment_lens, segment_rules, scale);
   }
   CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -2824,13 +2854,13 @@ FourSegmentVsRaggedMetrics run_four_segment_vs_ragged_batch(
 
     MTGRAttentionTestMetrics ragged_metrics;
     last_ragged_output =
-        run_ragged_segment_attention_batched_for_test(query_snd,
-                                                      key_snd,
-                                                      value_snd,
-                                                      segment_lens,
-                                                      segment_rules,
-                                                      scale,
-                                                      &ragged_metrics);
+        run_stable_ragged_segment_attention_batched_for_test(query_snd,
+                                                             key_snd,
+                                                             value_snd,
+                                                             segment_lens,
+                                                             segment_rules,
+                                                             scale,
+                                                             &ragged_metrics);
     avg.ragged_device_ms += ragged_metrics.device_total_ms;
     avg.ragged_wall_ms += ragged_metrics.wall_total_ms;
     avg.ragged_exec_ms += ragged_metrics.stages.empty()
@@ -2897,7 +2927,7 @@ OneStageVsRaggedMetrics run_one_stage_vs_ragged_batch(
                                      &ignored_mask_build_ms,
                                      &ignored_device_ms);
     }
-    (void)run_ragged_segment_attention_batched_for_test(
+    (void)run_stable_ragged_segment_attention_batched_for_test(
         query_snd, key_snd, value_snd, segment_lens, segment_rules, scale);
   }
   CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -2926,13 +2956,13 @@ OneStageVsRaggedMetrics run_one_stage_vs_ragged_batch(
 
     MTGRAttentionTestMetrics ragged_metrics;
     last_ragged_output =
-        run_ragged_segment_attention_batched_for_test(query_snd,
-                                                      key_snd,
-                                                      value_snd,
-                                                      segment_lens,
-                                                      segment_rules,
-                                                      scale,
-                                                      &ragged_metrics);
+        run_stable_ragged_segment_attention_batched_for_test(query_snd,
+                                                             key_snd,
+                                                             value_snd,
+                                                             segment_lens,
+                                                             segment_rules,
+                                                             scale,
+                                                             &ragged_metrics);
 
     avg.one_stage_mask_build_ms += one_stage_mask_build_ms;
     avg.one_stage_device_ms += one_stage_device_ms;
@@ -3451,7 +3481,10 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
       if (speedup_dev < 1.0) {
         ++regressions;
       }
-      if (!(avg.diff_max_abs < 1.0e-3) || !(avg.diff_mean_abs < 1.0e-5)) {
+      constexpr double kBf16PartialMaxAbs = 1.0e-2;
+      constexpr double kBf16PartialMeanAbs = 5.0e-3;
+      if (!(avg.diff_max_abs < kBf16PartialMaxAbs) ||
+          !(avg.diff_mean_abs < kBf16PartialMeanAbs)) {
         ++precision_regressions;
       }
       total_wrapper_device += avg.base_device_total_ms;
@@ -3485,8 +3518,8 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
                    row.str().c_str());
       std::fflush(stderr);
 
-      EXPECT_LT(avg.diff_max_abs, 1.0e-3);
-      EXPECT_LT(avg.diff_mean_abs, 1.0e-5);
+      EXPECT_LT(avg.diff_max_abs, kBf16PartialMaxAbs);
+      EXPECT_LT(avg.diff_mean_abs, kBf16PartialMeanAbs);
     }
 
     const double inv = 1.0 / static_cast<double>(group_count);
@@ -3851,6 +3884,8 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
                repeat,
                seed,
                csv_path.c_str());
+  constexpr double kBf16PartialMaxAbs = 1.0e-2;
+  constexpr double kBf16PartialMeanAbs = 5.0e-3;
 
   for (int batch_size : batch_sizes) {
     CHECK_GT(batch_size, 0);
@@ -3895,7 +3930,8 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
       if (speedup_dev < 1.0) {
         ++regressions;
       }
-      if (!(avg.diff_max_abs < 1.0e-3) || !(avg.diff_mean_abs < 1.0e-5)) {
+      if (!(avg.diff_max_abs < kBf16PartialMaxAbs) ||
+          !(avg.diff_mean_abs < kBf16PartialMeanAbs)) {
         ++precision_regressions;
       }
 
@@ -3934,8 +3970,8 @@ TEST_F(MTGRAttentionOneVsMultiStagePerfTest,
           row.str().c_str());
       std::fflush(stderr);
 
-      EXPECT_LT(avg.diff_max_abs, 1.0e-3);
-      EXPECT_LT(avg.diff_mean_abs, 1.0e-5);
+      EXPECT_LT(avg.diff_max_abs, kBf16PartialMaxAbs);
+      EXPECT_LT(avg.diff_mean_abs, kBf16PartialMeanAbs);
     }
 
     const double inv = 1.0 / static_cast<double>(groups_per_batch);

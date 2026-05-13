@@ -29,7 +29,9 @@ namespace xllm::kernel::cuda::test {
 
 enum class MTGRAttentionTestBackend {
   kOneStage,
+  // Historical stable four-segment wrapper path.
   kMultiStage,
+  // Historical fused no-match specialization.
   kFusedNoMatch,
 };
 
@@ -136,7 +138,7 @@ std::vector<MTGRAttentionTestShape> build_mtgr_sweep_shapes(bool full_sweep,
 int env_int(const char* name, int default_value);
 bool env_flag_enabled(const char* name, bool default_value);
 
-torch::Tensor run_fused_segmented_no_match_batched_for_test(
+torch::Tensor run_four_segment_no_match_batched_for_test(
     const torch::Tensor& query_snd,
     const torch::Tensor& key_snd,
     const torch::Tensor& value_snd,
@@ -145,7 +147,7 @@ torch::Tensor run_fused_segmented_no_match_batched_for_test(
     double sm_scale,
     MTGRAttentionTestMetrics* metrics = nullptr);
 
-torch::Tensor run_ragged_segment_attention_batched_for_test(
+torch::Tensor run_stable_ragged_segment_attention_batched_for_test(
     const torch::Tensor& query_snd,
     const torch::Tensor& key_snd,
     const torch::Tensor& value_snd,

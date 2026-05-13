@@ -106,6 +106,7 @@ cc_library(
     tests/mtgr_fused_attention_kernel.cu
     tests/mtgr_full_attention_kernel.cu
     tests/mtgr_flashinfer_mask_kernel.cu
+    tests/mtgr_ragged_hopper_attention_kernel.cu
   DEPS
     :cuda_kernels
     :flags

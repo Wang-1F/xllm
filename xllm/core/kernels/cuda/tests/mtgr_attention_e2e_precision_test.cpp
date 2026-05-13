@@ -178,6 +178,72 @@ torch::Tensor run_ragged_segment_reference(
   return output;
 }
 
+torch::Tensor run_mtgr_torch_mask_reference(
+    const torch::Tensor& full_query_bshd,
+    const torch::Tensor& full_key_bshd,
+    const torch::Tensor& full_value_bshd,
+    const MTGRAttentionTestShape& shape,
+    double sm_scale) {
+  CHECK_EQ(full_query_bshd.dim(), 4);
+  CHECK_EQ(full_key_bshd.dim(), 4);
+  CHECK_EQ(full_value_bshd.dim(), 4);
+  CHECK_EQ(full_query_bshd.size(0), 1);
+  CHECK_EQ(full_key_bshd.size(0), 1);
+  CHECK_EQ(full_value_bshd.size(0), 1);
+  CHECK_EQ(full_query_bshd.size(1), shape.total_len());
+  CHECK_EQ(full_key_bshd.size(1), shape.total_len());
+  CHECK_EQ(full_value_bshd.size(1), shape.total_len());
+
+  auto query = full_query_bshd.select(0, 0).to(torch::kFloat32);
+  auto key = full_key_bshd.select(0, 0).to(torch::kFloat32);
+  auto value = full_value_bshd.select(0, 0).to(torch::kFloat32);
+  auto output = torch::empty({shape.local_len(), shape.heads, shape.head_dim},
+                             query.options());
+
+  const int64_t total = shape.total_len();
+  const int64_t matched = shape.matched_prefix;
+  const int64_t live_begin = matched;
+  const int64_t target_begin = shape.history + shape.context + shape.realtime;
+  CHECK_GE(matched, 0);
+  CHECK_LT(matched, target_begin);
+
+  std::vector<int64_t> offsets;
+  std::vector<int64_t> rules;
+  if (matched == 0) {
+    offsets = {
+        0, shape.history, shape.history + shape.context, target_begin, total};
+    rules = {0, 1, 0, 2};
+  } else {
+    CHECK_GE(matched, shape.history + shape.context);
+    offsets = {0, target_begin, total};
+    rules = {0, 2};
+  }
+
+  for (int64_t q_local = 0; q_local < shape.local_len(); ++q_local) {
+    const int64_t q_global = live_begin + q_local;
+    int64_t seg_id = 0;
+    for (; seg_id < static_cast<int64_t>(rules.size()); ++seg_id) {
+      if (q_global < offsets[seg_id + 1]) {
+        break;
+      }
+    }
+    CHECK_LT(seg_id, static_cast<int64_t>(rules.size()));
+    const int64_t visible_end = segmented_visible_end(q_global, offsets, rules);
+    auto k_attn = key.narrow(0, 0, visible_end);
+    auto v_attn = value.narrow(0, 0, visible_end);
+    if (rules[seg_id] == 2) {
+      k_attn = torch::cat({k_attn, key.narrow(0, q_global, 1)}, 0);
+      v_attn = torch::cat({v_attn, value.narrow(0, q_global, 1)}, 0);
+    }
+    auto q_row = query.select(0, q_global);
+    auto scores =
+        (k_attn * q_row.unsqueeze(0)).sum(-1) * static_cast<float>(sm_scale);
+    auto probs = torch::softmax(scores, 0);
+    output.select(0, q_local).copy_((probs.unsqueeze(-1) * v_attn).sum(0));
+  }
+  return output;
+}
+
 class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
  protected:
   void maybe_print_history_prefix_reference(const char* name,
@@ -318,7 +384,7 @@ class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
       const char* name,
       MTGRAttentionTestShape shape,
       xllm::layer::MTGRAttentionBackend candidate_backend) {
-    auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device_);
     const int64_t total = shape.total_len();
     const int64_t local = shape.local_len();
     const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
@@ -345,9 +411,9 @@ class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
 
     auto metadata = make_mtgr_attention_metadata(shape, device_, kBlockSize);
     auto one_cache =
-        make_mtgr_kv_cache(shape, device_, torch::kFloat16, kBlockSize);
+        make_mtgr_kv_cache(shape, device_, torch::kBFloat16, kBlockSize);
     auto multi_cache =
-        make_mtgr_kv_cache(shape, device_, torch::kFloat16, kBlockSize);
+        make_mtgr_kv_cache(shape, device_, torch::kBFloat16, kBlockSize);
     prefill_mtgr_matched_prefix_cache(
         full_key, full_value, shape, kBlockSize, one_cache);
     prefill_mtgr_matched_prefix_cache(
@@ -411,7 +477,7 @@ class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
     CHECK(!shapes.empty());
     const auto& ref = shapes.front();
     const float scale = 1.0f / std::sqrt(static_cast<float>(ref.head_dim));
-    auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device_);
     const bool all_no_match =
         std::all_of(shapes.begin(), shapes.end(), [](const auto& shape) {
           return shape.matched_prefix == 0;
@@ -436,12 +502,6 @@ class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
     full_values.reserve(shapes.size());
     baseline_outputs.reserve(shapes.size());
 
-    xllm::layer::MTGRAttentionImpl one_stage(
-        ref.heads,
-        ref.head_dim,
-        scale,
-        ref.kv_heads,
-        xllm::layer::MTGRAttentionBackend::kOneStage);
     for (const auto& shape : shapes) {
       CHECK_EQ(shape.heads, ref.heads);
       CHECK_EQ(shape.kv_heads, ref.kv_heads);
@@ -469,13 +529,14 @@ class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
                        .contiguous()
                        .view({local, shape.kv_heads * shape.head_dim});
 
-      auto metadata = make_mtgr_attention_metadata(shape, device_, kBlockSize);
-      auto one_cache =
-          make_mtgr_kv_cache(shape, device_, torch::kFloat16, kBlockSize);
-      prefill_mtgr_matched_prefix_cache(
-          full_key, full_value, shape, kBlockSize, one_cache);
-      baseline_outputs.push_back(std::get<0>(
-          one_stage.forward(metadata, query, key, value, one_cache)));
+      baseline_outputs.push_back(
+          run_mtgr_torch_mask_reference(full_query,
+                                        full_key,
+                                        full_value,
+                                        shape,
+                                        static_cast<double>(scale))
+              .view({local, shape.heads * shape.head_dim})
+              .to(torch::kBFloat16));
       packed_queries.push_back(query);
       packed_keys.push_back(key);
       packed_values.push_back(value);
@@ -502,8 +563,12 @@ class MTGRAttentionE2EPrecisionTest : public ::testing::Test {
       fused_output = std::get<0>(fused.forward(
           batch_metadata, packed_query, packed_key, packed_value, empty_cache));
     } else {
-      auto batch_setup = make_mtgr_partial_batch_setup(
-          shapes, full_keys, full_values, device_, torch::kFloat16, kBlockSize);
+      auto batch_setup = make_mtgr_partial_batch_setup(shapes,
+                                                       full_keys,
+                                                       full_values,
+                                                       device_,
+                                                       torch::kBFloat16,
+                                                       kBlockSize);
       fused_output = std::get<0>(fused.forward(batch_setup.metadata,
                                                packed_query,
                                                packed_key,
@@ -659,7 +724,7 @@ TEST_F(MTGRAttentionE2EPrecisionTest,
   auto value = torch::randn({total_tokens, heads, head_dim}, opts) * 0.05;
 
   MTGRAttentionTestMetrics metrics;
-  auto fused = run_fused_segmented_no_match_batched_for_test(
+  auto fused = run_four_segment_no_match_batched_for_test(
       query, key, value, segment_lens, segment_rules, scale, &metrics);
   auto reference = run_ragged_segment_reference(
       query, key, value, segment_lens, segment_rules, scale);
@@ -712,7 +777,7 @@ TEST_F(MTGRAttentionE2EPrecisionTest,
   auto value = torch::randn({total_tokens, heads, head_dim}, opts) * 0.05;
 
   MTGRAttentionTestMetrics metrics;
-  auto fused = run_ragged_segment_attention_batched_for_test(
+  auto fused = run_stable_ragged_segment_attention_batched_for_test(
       query, key, value, segment_lens, segment_rules, scale, &metrics);
   auto reference = run_ragged_segment_reference(
       query, key, value, segment_lens, segment_rules, scale);
