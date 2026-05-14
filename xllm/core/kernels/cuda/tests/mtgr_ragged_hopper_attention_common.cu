@@ -1323,6 +1323,7 @@ template <int HeadDim,
           bool UseTma,
           bool DedicatedProducer,
           bool UseUnifiedSources,
+          bool AllowMixedRequests,
           class TmaKey,
           class TmaValue>
 __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
@@ -1535,8 +1536,11 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
                                : total_live_q)
                         : offsets_row[num_segments];
   const int q_live_len = q_packed_end - q_packed_start;
-  const int matched_prefix =
+  const int raw_matched_prefix =
       UseUnifiedSources ? static_cast<int>(matched_prefix_lens[batch_idx]) : 0;
+  const bool request_uses_cache =
+      UseUnifiedSources && (!AllowMixedRequests || raw_matched_prefix > 0);
+  const int matched_prefix = request_uses_cache ? raw_matched_prefix : 0;
   const int q_block_start_live = q_tile_id * kHopperWgmmaQueriesPerCta;
   const int q_block_start_local = matched_prefix + q_block_start_live;
   const bool block_all_query_rows_valid =
@@ -1547,7 +1551,7 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
     return;
   }
   const int32_t* block_table_row =
-      UseUnifiedSources
+      request_uses_cache
           ? block_table + static_cast<int64_t>(batch_idx) * block_table_stride
           : nullptr;
 
@@ -1611,7 +1615,7 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
       UseUnifiedSources ? max(block_max_visible_end - matched_prefix, 0)
                         : block_max_visible_end;
   const int prefix_tile_count =
-      UseUnifiedSources ? (matched_prefix + KvTile - 1) / KvTile : 0;
+      request_uses_cache ? (matched_prefix + KvTile - 1) / KvTile : 0;
   const int live_tile_count = (live_max_visible_end + KvTile - 1) / KvTile;
   const int block_tile_count =
       UseUnifiedSources ? prefix_tile_count + live_tile_count : live_tile_count;
@@ -1864,10 +1868,11 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
 
     const bool use_direct_tma_tile = loaded_k_with_tma && loaded_v_with_tma;
     const int prefix_rows =
-        UseUnifiedSources
+        request_uses_cache
             ? min(max(matched_prefix - kv_tile_start, 0), valid_rows)
             : 0;
-    const bool tile_all_prefix = UseUnifiedSources && prefix_rows == valid_rows;
+    const bool tile_all_prefix =
+        request_uses_cache && prefix_rows == valid_rows;
     const bool tile_all_live = !UseUnifiedSources || prefix_rows == 0;
     const bool prefix_tile_crosses_block =
         tile_all_prefix && block_size > 0 &&
@@ -1955,14 +1960,15 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
     }
     if (!is_producer_warp) {
       if constexpr (!kCanSkipManualKvStage) {
-        const bool can_vectorize_manual_tile = pure_tile_uses_linear_base &&
-                                               !loaded_k_with_tma &&
-                                               !loaded_v_with_tma;
+        const bool full_kv_tile = valid_rows == KvTile;
+        const bool can_vectorize_manual_tile =
+            pure_tile_uses_linear_base && !loaded_k_with_tma &&
+            !loaded_v_with_tma && full_kv_tile;
         const bool can_u128_store_manual_tile =
             can_vectorize_manual_tile && KvTile != 80 && KvTile != 96;
-        const bool can_vectorize_decoded_tile = !pure_tile_uses_linear_base &&
-                                                !loaded_k_with_tma &&
-                                                !loaded_v_with_tma;
+        const bool can_vectorize_decoded_tile =
+            !pure_tile_uses_linear_base && !loaded_k_with_tma &&
+            !loaded_v_with_tma && full_kv_tile;
         if (can_u128_store_manual_tile) {
           const auto* pure_key_src =
               tile_all_prefix ? key_cache_wgmma : key_wgmma;
@@ -2221,15 +2227,15 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
           }
         }
       } else if (!use_direct_tma_tile) {
-        const bool can_vectorize_manual_tile = pure_tile_uses_linear_base &&
-                                               !loaded_k_with_tma &&
-                                               !loaded_v_with_tma;
-        const bool can_u128_store_manual_tile = can_vectorize_manual_tile &&
-                                                valid_rows == KvTile &&
-                                                KvTile != 80 && KvTile != 96;
-        const bool can_vectorize_decoded_tile = !pure_tile_uses_linear_base &&
-                                                !loaded_k_with_tma &&
-                                                !loaded_v_with_tma;
+        const bool full_kv_tile = valid_rows == KvTile;
+        const bool can_vectorize_manual_tile =
+            pure_tile_uses_linear_base && !loaded_k_with_tma &&
+            !loaded_v_with_tma && full_kv_tile;
+        const bool can_u128_store_manual_tile =
+            can_vectorize_manual_tile && KvTile != 80 && KvTile != 96;
+        const bool can_vectorize_decoded_tile =
+            !pure_tile_uses_linear_base && !loaded_k_with_tma &&
+            !loaded_v_with_tma && full_kv_tile;
         if (can_u128_store_manual_tile) {
           const auto* pure_key_src =
               tile_all_prefix ? key_cache_wgmma : key_wgmma;
@@ -2658,7 +2664,7 @@ inline int mtgr_hopper_unified_partial_hd128_kv_tile(int num_heads,
   return 128;
 }
 
-template <int HeadDim>
+template <int HeadDim, bool AllowMixedRequests>
 void launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel(
     const torch::Tensor& query_snd,
     const torch::Tensor& key_snd,
@@ -2704,6 +2710,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel(
                                                              false,
                                                              false,
                                                              true,
+                                                             AllowMixedRequests,
                                                              int,
                                                              int>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2714,6 +2721,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel(
                                                          false,
                                                          false,
                                                          true,
+                                                         AllowMixedRequests,
                                                          int,
                                                          int>
         <<<grid, block, kDynSharedBytes, stream>>>(
@@ -2892,6 +2900,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk_kernel(
             true,
             true,
             false,
+            false,
             decltype(tma_key),
             decltype(tma_value)>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2901,6 +2910,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk_kernel(
                                                          kTmaStages,
                                                          true,
                                                          true,
+                                                         false,
                                                          false,
                                                          decltype(tma_key),
                                                          decltype(tma_value)>
@@ -2943,6 +2953,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk_kernel(
             true,
             false,
             false,
+            false,
             decltype(tma_key),
             decltype(tma_value)>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2951,6 +2962,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk_kernel(
                                                          kKvTile,
                                                          kTmaStages,
                                                          true,
+                                                         false,
                                                          false,
                                                          false,
                                                          decltype(tma_key),
@@ -3045,27 +3057,15 @@ void check_mtgr_ragged_segment_attention_hopper_common_args(
   CHECK_GT(sm_scale, 0.0);
 }
 
-bool mtgr_hopper_unified_uses_cache(const torch::Tensor& key_cache,
-                                    const torch::Tensor& value_cache,
-                                    const torch::Tensor& block_table_i32) {
-  const bool any_defined =
-      key_cache.defined() || value_cache.defined() || block_table_i32.defined();
-  if (!any_defined) {
-    return false;
-  }
-  CHECK(key_cache.defined());
-  CHECK(value_cache.defined());
-  CHECK(block_table_i32.defined());
-  return true;
-}
-
 void check_mtgr_ragged_segment_attention_hopper_unified_args(
     const torch::Tensor& query_snd,
     const torch::Tensor& key_snd,
     const torch::Tensor& value_snd,
     const torch::Tensor& segment_offsets_i32,
     const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& q_seq_starts_i32,
     const torch::Tensor& matched_prefix_lens_i32,
+    int64_t match_mode,
     const torch::Tensor& key_cache,
     const torch::Tensor& value_cache,
     const torch::Tensor& block_table_i32,
@@ -3078,6 +3078,7 @@ void check_mtgr_ragged_segment_attention_hopper_unified_args(
   CHECK(value_snd.defined());
   CHECK(segment_offsets_i32.defined());
   CHECK(segment_rules_i32.defined());
+  CHECK(q_seq_starts_i32.defined());
   CHECK(matched_prefix_lens_i32.defined());
   CHECK(output_snd.defined());
   CHECK(query_snd.is_cuda());
@@ -3085,12 +3086,14 @@ void check_mtgr_ragged_segment_attention_hopper_unified_args(
   CHECK(value_snd.is_cuda());
   CHECK(segment_offsets_i32.is_cuda());
   CHECK(segment_rules_i32.is_cuda());
+  CHECK(q_seq_starts_i32.is_cuda());
   CHECK(matched_prefix_lens_i32.is_cuda());
   CHECK(output_snd.is_cuda());
   CHECK_EQ(key_snd.get_device(), query_snd.get_device());
   CHECK_EQ(value_snd.get_device(), query_snd.get_device());
   CHECK_EQ(segment_offsets_i32.get_device(), query_snd.get_device());
   CHECK_EQ(segment_rules_i32.get_device(), query_snd.get_device());
+  CHECK_EQ(q_seq_starts_i32.get_device(), query_snd.get_device());
   CHECK_EQ(matched_prefix_lens_i32.get_device(), query_snd.get_device());
   CHECK_EQ(output_snd.get_device(), query_snd.get_device());
   CHECK(query_snd.is_contiguous());
@@ -3098,6 +3101,7 @@ void check_mtgr_ragged_segment_attention_hopper_unified_args(
   CHECK(value_snd.is_contiguous());
   CHECK(segment_offsets_i32.is_contiguous());
   CHECK(segment_rules_i32.is_contiguous());
+  CHECK(q_seq_starts_i32.is_contiguous());
   CHECK(matched_prefix_lens_i32.is_contiguous());
   CHECK(output_snd.is_contiguous());
   CHECK_EQ(query_snd.scalar_type(), torch::kBFloat16);
@@ -3105,6 +3109,7 @@ void check_mtgr_ragged_segment_attention_hopper_unified_args(
   CHECK_EQ(value_snd.scalar_type(), torch::kBFloat16);
   CHECK_EQ(segment_offsets_i32.scalar_type(), torch::kInt32);
   CHECK_EQ(segment_rules_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(q_seq_starts_i32.scalar_type(), torch::kInt32);
   CHECK_EQ(matched_prefix_lens_i32.scalar_type(), torch::kInt32);
   CHECK_EQ(output_snd.scalar_type(), torch::kBFloat16);
   CHECK_EQ(query_snd.dim(), 3);
@@ -3112,6 +3117,7 @@ void check_mtgr_ragged_segment_attention_hopper_unified_args(
   CHECK_EQ(value_snd.dim(), 3);
   CHECK_EQ(segment_offsets_i32.dim(), 2);
   CHECK_EQ(segment_rules_i32.dim(), 1);
+  CHECK_EQ(q_seq_starts_i32.dim(), 1);
   CHECK_EQ(matched_prefix_lens_i32.dim(), 1);
   CHECK_EQ(output_snd.dim(), 3);
   CHECK_EQ(query_snd.sizes(), key_snd.sizes());
@@ -3121,13 +3127,13 @@ void check_mtgr_ragged_segment_attention_hopper_unified_args(
   CHECK_GT(query_snd.size(1), 0);
   CHECK_GT(query_snd.size(2), 0);
   CHECK_EQ(segment_offsets_i32.size(1), segment_rules_i32.size(0) + 1);
+  CHECK_EQ(q_seq_starts_i32.size(0), segment_offsets_i32.size(0));
   CHECK_EQ(matched_prefix_lens_i32.size(0), segment_offsets_i32.size(0));
   CHECK_GT(block_size, 0);
   CHECK_GT(max_request_len, 0);
   CHECK_GT(sm_scale, 0.0);
 
-  if (!mtgr_hopper_unified_uses_cache(
-          key_cache, value_cache, block_table_i32)) {
+  if (match_mode == 0) {
     return;
   }
 
@@ -3173,7 +3179,8 @@ torch::Tensor mtgr_hopper_build_unified_q_seq_starts(
   return q_seq_starts_i32;
 }
 
-void dispatch_mtgr_ragged_segment_attention_hopper_unified_reference(
+template <bool AllowMixedRequests>
+void dispatch_mtgr_ragged_segment_attention_hopper_unified_impl(
     const torch::Tensor& query_snd,
     const torch::Tensor& key_snd,
     const torch::Tensor& value_snd,
@@ -3196,43 +3203,109 @@ void dispatch_mtgr_ragged_segment_attention_hopper_unified_reference(
 
   switch (query_snd.size(2)) {
     case 64:
-      launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel<64>(
-          query_snd,
-          key_snd,
-          value_snd,
-          key_cache,
-          value_cache,
-          segment_offsets_i32,
-          segment_rules_i32,
-          q_seq_starts_i32,
-          matched_prefix_lens_i32,
-          block_table_i32,
-          block_size,
-          max_request_len,
-          sm_scale,
-          output_snd);
+      launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel<
+          64,
+          AllowMixedRequests>(query_snd,
+                              key_snd,
+                              value_snd,
+                              key_cache,
+                              value_cache,
+                              segment_offsets_i32,
+                              segment_rules_i32,
+                              q_seq_starts_i32,
+                              matched_prefix_lens_i32,
+                              block_table_i32,
+                              block_size,
+                              max_request_len,
+                              sm_scale,
+                              output_snd);
       return;
     case 128:
-      launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel<128>(
-          query_snd,
-          key_snd,
-          value_snd,
-          key_cache,
-          value_cache,
-          segment_offsets_i32,
-          segment_rules_i32,
-          q_seq_starts_i32,
-          matched_prefix_lens_i32,
-          block_table_i32,
-          block_size,
-          max_request_len,
-          sm_scale,
-          output_snd);
+      launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel<
+          128,
+          AllowMixedRequests>(query_snd,
+                              key_snd,
+                              value_snd,
+                              key_cache,
+                              value_cache,
+                              segment_offsets_i32,
+                              segment_rules_i32,
+                              q_seq_starts_i32,
+                              matched_prefix_lens_i32,
+                              block_table_i32,
+                              block_size,
+                              max_request_len,
+                              sm_scale,
+                              output_snd);
       return;
     default:
       CHECK(false) << "Unsupported head dim for Hopper unified research path: "
                    << query_snd.size(2);
   }
+}
+
+void dispatch_mtgr_ragged_segment_attention_hopper_unified_partial_only(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& key_cache,
+    const torch::Tensor& value_cache,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& q_seq_starts_i32,
+    const torch::Tensor& matched_prefix_lens_i32,
+    const torch::Tensor& block_table_i32,
+    int64_t block_size,
+    int64_t max_request_len,
+    double sm_scale,
+    torch::Tensor output_snd) {
+  dispatch_mtgr_ragged_segment_attention_hopper_unified_impl<false>(
+      query_snd,
+      key_snd,
+      value_snd,
+      key_cache,
+      value_cache,
+      segment_offsets_i32,
+      segment_rules_i32,
+      q_seq_starts_i32,
+      matched_prefix_lens_i32,
+      block_table_i32,
+      block_size,
+      max_request_len,
+      sm_scale,
+      output_snd);
+}
+
+void dispatch_mtgr_ragged_segment_attention_hopper_unified_mixed(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& key_cache,
+    const torch::Tensor& value_cache,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& q_seq_starts_i32,
+    const torch::Tensor& matched_prefix_lens_i32,
+    const torch::Tensor& block_table_i32,
+    int64_t block_size,
+    int64_t max_request_len,
+    double sm_scale,
+    torch::Tensor output_snd) {
+  dispatch_mtgr_ragged_segment_attention_hopper_unified_impl<true>(
+      query_snd,
+      key_snd,
+      value_snd,
+      key_cache,
+      value_cache,
+      segment_offsets_i32,
+      segment_rules_i32,
+      q_seq_starts_i32,
+      matched_prefix_lens_i32,
+      block_table_i32,
+      block_size,
+      max_request_len,
+      sm_scale,
+      output_snd);
 }
 
 void dispatch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk(

@@ -104,7 +104,7 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
       int warmup,
       int repeat,
       LayerMTGRAttentionBackend candidate_backend) {
-    auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device_);
     const int64_t total = shape.total_len();
     const int64_t local = shape.local_len();
     const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
@@ -131,9 +131,9 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
 
     auto metadata = make_mtgr_attention_metadata(shape, device_, kBlockSize);
     auto one_cache =
-        make_mtgr_kv_cache(shape, device_, torch::kFloat16, kBlockSize);
+        make_mtgr_kv_cache(shape, device_, torch::kBFloat16, kBlockSize);
     auto multi_cache =
-        make_mtgr_kv_cache(shape, device_, torch::kFloat16, kBlockSize);
+        make_mtgr_kv_cache(shape, device_, torch::kBFloat16, kBlockSize);
     prefill_mtgr_matched_prefix_cache(
         full_key, full_value, shape, kBlockSize, one_cache);
     prefill_mtgr_matched_prefix_cache(
@@ -220,7 +220,7 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
       const MTGRAttentionTestShape& shape,
       int warmup,
       int repeat) {
-    auto opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device_);
     const int64_t total = shape.total_len();
     const int64_t local = shape.local_len();
     const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
@@ -247,7 +247,7 @@ class MTGRAttentionOneVsMultiStagePerfTest : public ::testing::Test {
 
     auto metadata = make_mtgr_attention_metadata(shape, device_, kBlockSize);
     auto kv_cache =
-        make_mtgr_kv_cache(shape, device_, torch::kFloat16, kBlockSize);
+        make_mtgr_kv_cache(shape, device_, torch::kBFloat16, kBlockSize);
 
     LayerMTGRAttentionImpl fused(shape.heads,
                                  shape.head_dim,

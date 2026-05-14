@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "layers/cuda/mtgr_attention.h"
 #include "mtgr_attenion_test.h"
+#include "mtgr_attention_torch_reference_test.h"
 
 namespace xllm::kernel::cuda::test {
 namespace {
@@ -184,64 +185,8 @@ torch::Tensor run_mtgr_torch_mask_reference(
     const torch::Tensor& full_value_bshd,
     const MTGRAttentionTestShape& shape,
     double sm_scale) {
-  CHECK_EQ(full_query_bshd.dim(), 4);
-  CHECK_EQ(full_key_bshd.dim(), 4);
-  CHECK_EQ(full_value_bshd.dim(), 4);
-  CHECK_EQ(full_query_bshd.size(0), 1);
-  CHECK_EQ(full_key_bshd.size(0), 1);
-  CHECK_EQ(full_value_bshd.size(0), 1);
-  CHECK_EQ(full_query_bshd.size(1), shape.total_len());
-  CHECK_EQ(full_key_bshd.size(1), shape.total_len());
-  CHECK_EQ(full_value_bshd.size(1), shape.total_len());
-
-  auto query = full_query_bshd.select(0, 0).to(torch::kFloat32);
-  auto key = full_key_bshd.select(0, 0).to(torch::kFloat32);
-  auto value = full_value_bshd.select(0, 0).to(torch::kFloat32);
-  auto output = torch::empty({shape.local_len(), shape.heads, shape.head_dim},
-                             query.options());
-
-  const int64_t total = shape.total_len();
-  const int64_t matched = shape.matched_prefix;
-  const int64_t live_begin = matched;
-  const int64_t target_begin = shape.history + shape.context + shape.realtime;
-  CHECK_GE(matched, 0);
-  CHECK_LT(matched, target_begin);
-
-  std::vector<int64_t> offsets;
-  std::vector<int64_t> rules;
-  if (matched == 0) {
-    offsets = {
-        0, shape.history, shape.history + shape.context, target_begin, total};
-    rules = {0, 1, 0, 2};
-  } else {
-    CHECK_GE(matched, shape.history + shape.context);
-    offsets = {0, target_begin, total};
-    rules = {0, 2};
-  }
-
-  for (int64_t q_local = 0; q_local < shape.local_len(); ++q_local) {
-    const int64_t q_global = live_begin + q_local;
-    int64_t seg_id = 0;
-    for (; seg_id < static_cast<int64_t>(rules.size()); ++seg_id) {
-      if (q_global < offsets[seg_id + 1]) {
-        break;
-      }
-    }
-    CHECK_LT(seg_id, static_cast<int64_t>(rules.size()));
-    const int64_t visible_end = segmented_visible_end(q_global, offsets, rules);
-    auto k_attn = key.narrow(0, 0, visible_end);
-    auto v_attn = value.narrow(0, 0, visible_end);
-    if (rules[seg_id] == 2) {
-      k_attn = torch::cat({k_attn, key.narrow(0, q_global, 1)}, 0);
-      v_attn = torch::cat({v_attn, value.narrow(0, q_global, 1)}, 0);
-    }
-    auto q_row = query.select(0, q_global);
-    auto scores =
-        (k_attn * q_row.unsqueeze(0)).sum(-1) * static_cast<float>(sm_scale);
-    auto probs = torch::softmax(scores, 0);
-    output.select(0, q_local).copy_((probs.unsqueeze(-1) * v_attn).sum(0));
-  }
-  return output;
+  return run_mtgr_torch_mask_attention_reference(
+      full_query_bshd, full_key_bshd, full_value_bshd, shape, sm_scale);
 }
 
 class MTGRAttentionE2EPrecisionTest : public ::testing::Test {

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <cstdint>
 #if defined(USE_CUDA) || defined(USE_MUSA)
 #include <tvm/ffi/container/array.h>
 namespace ffi = tvm::ffi;
@@ -27,6 +28,12 @@ namespace ffi = tvm::ffi;
 #include <string>
 
 namespace xllm::layer {
+
+enum class MTGRMatchMode : int8_t {
+  kNoMatchOnly = 0,
+  kPartialOnly = 1,
+  kMixed = 2,
+};
 
 #if defined(USE_CUDA) || defined(USE_MUSA)
 struct PlanInfo {
@@ -155,6 +162,23 @@ struct AttentionMetadata {
   torch::Tensor genrec_real_time_lens;
   torch::Tensor genrec_target_lens;
   torch::Tensor genrec_matched_prefix_lens;
+
+  // MTGR kernel-ready segmented prefill metadata. These tensors let attention
+  // implementations launch without rebuilding segment layout in the hot path.
+  // Shape: [batch_size, num_segments + 1]. Type: int32 device tensor.
+  torch::Tensor mtgr_segment_offsets_i32;
+  // Shape: [num_segments]. Type: int32 device tensor. Rule semantics:
+  // 0=causal, 1=full, 2=diag.
+  torch::Tensor mtgr_segment_rules_i32;
+  // Shape: [batch_size]. Type: int32 device tensor. Physical packed Q/K/V
+  // start per request.
+  torch::Tensor mtgr_q_seq_starts_i32;
+  // Shape: [batch_size]. Type: int32 device tensor. Logical prefix length
+  // served from paged KV cache; 0 means no_match.
+  torch::Tensor mtgr_matched_prefix_lens_i32;
+  // MTGR dispatch mode. no_match-only uses the dense-live fast path; partial
+  // and mixed use the paged-prefix + live-suffix path.
+  MTGRMatchMode mtgr_match_mode = MTGRMatchMode::kNoMatchOnly;
 
 #if defined(USE_NPU)
   // for npu

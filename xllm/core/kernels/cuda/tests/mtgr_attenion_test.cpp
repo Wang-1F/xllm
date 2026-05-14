@@ -213,7 +213,9 @@ void mtgr_ragged_segment_attention_hopper_unified_research_cuda(
     const torch::Tensor& value_snd,
     const torch::Tensor& segment_offsets_i32,
     const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& q_seq_starts_i32,
     const torch::Tensor& matched_prefix_lens_i32,
+    int64_t match_mode,
     const torch::Tensor& key_cache,
     const torch::Tensor& value_cache,
     const torch::Tensor& block_table_i32,
@@ -1615,7 +1617,7 @@ build_four_segment_partial_batch_layout_uncached(
 
   const int64_t batch_size = static_cast<int64_t>(layout.q_seq_lens.size());
   layout.batch_size = batch_size;
-  layout.segment_rules = {0, 2};
+  layout.segment_rules = {0, 1, 0, 2};
   CHECK_EQ(kv_seq_lens_host.size(), layout.q_seq_lens.size());
   CHECK_EQ(history_lens_host.size(), layout.q_seq_lens.size());
   CHECK_EQ(context_lens_host.size(), layout.q_seq_lens.size());
@@ -1655,8 +1657,10 @@ build_four_segment_partial_batch_layout_uncached(
 
     layout.q_seq_starts.push_back(layout.total_q);
     layout.segment_offsets.push_back(0);
-    layout.segment_offsets.push_back(matched + realtime_unmatched);
-    layout.segment_offsets.push_back(matched + realtime_unmatched + t);
+    layout.segment_offsets.push_back(h);
+    layout.segment_offsets.push_back(h + c);
+    layout.segment_offsets.push_back(h + c + r);
+    layout.segment_offsets.push_back(h + c + r + t);
     layout.realtime_unmatched_lens.push_back(realtime_unmatched);
     layout.target_seq_starts.push_back(layout.total_target);
     layout.total_q += q_len;
@@ -2186,7 +2190,9 @@ torch::Tensor run_fused_no_match_batched(const torch::Tensor& query,
       value,
       layout.segment_offsets_i32,
       layout.segment_rules_i32,
+      layout.q_seq_starts_i32,
       matched_prefix_lens_i32,
+      /*match_mode=*/0,
       torch::Tensor(),
       torch::Tensor(),
       torch::Tensor(),
@@ -2403,7 +2409,9 @@ torch::Tensor run_four_segment_partial_rt_batched(
       value,
       layout.segment_offsets_i32,
       layout.segment_rules_i32,
+      layout.q_seq_starts_i32,
       layout.matched_prefix_lens_i32,
+      /*match_mode=*/1,
       key_cache,
       value_cache,
       layout.block_table_i32,
@@ -2818,13 +2826,27 @@ xllm::layer::AttentionMetadata make_mtgr_attention_metadata(
   const auto block_table_host = make_block_table_host(block_count);
   const auto slot_mapping_host = build_slot_mapping_host(
       block_table_host, block_size, shape.matched_prefix, shape.local_len());
+  const std::vector<int32_t> segment_offsets = {
+      0,
+      static_cast<int32_t>(shape.history),
+      static_cast<int32_t>(shape.history + shape.context),
+      static_cast<int32_t>(shape.history + shape.context + shape.realtime),
+      static_cast<int32_t>(shape.total_len())};
+  const std::vector<int32_t> segment_rules = {0, 1, 0, 2};
 
   xllm::layer::AttentionMetadata metadata;
   auto len_opts =
       torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+  auto i32_dev_opts =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
   metadata.is_dummy = false;
   metadata.is_prefill = true;
   metadata.is_chunked_prefill = false;
+  metadata.mtgr_match_mode = shape.matched_prefix == 0
+                                 ? xllm::layer::MTGRMatchMode::kNoMatchOnly
+                                 : xllm::layer::MTGRMatchMode::kPartialOnly;
+  metadata.max_query_len = shape.local_len();
+  metadata.max_seq_len = shape.local_len();
   metadata.q_seq_lens = torch::tensor({shape.local_len()}, len_opts);
   metadata.kv_seq_lens = torch::tensor({shape.local_len()}, len_opts);
   metadata.genrec_history_lens = torch::tensor({shape.history}, len_opts);
@@ -2842,6 +2864,14 @@ xllm::layer::AttentionMetadata make_mtgr_attention_metadata(
       torch::tensor(slot_mapping_host,
                     torch::TensorOptions().dtype(torch::kInt64).device(device))
           .contiguous();
+  metadata.mtgr_segment_offsets_i32 =
+      torch::tensor(segment_offsets, i32_dev_opts).view({1, 5}).contiguous();
+  metadata.mtgr_segment_rules_i32 =
+      torch::tensor(segment_rules, i32_dev_opts).contiguous();
+  metadata.mtgr_q_seq_starts_i32 =
+      torch::tensor({0}, i32_dev_opts).contiguous();
+  metadata.mtgr_matched_prefix_lens_i32 =
+      torch::tensor({shape.matched_prefix}, i32_dev_opts).contiguous();
   return metadata;
 }
 
@@ -2860,6 +2890,9 @@ xllm::layer::AttentionMetadata make_mtgr_attention_metadata(
   std::vector<int64_t> realtime_lens;
   std::vector<int64_t> target_lens;
   std::vector<int64_t> matched_prefix_lens;
+  std::vector<int32_t> segment_offsets;
+  std::vector<int32_t> q_seq_starts;
+  std::vector<int32_t> matched_prefix_lens_i32;
   q_seq_lens.reserve(shapes.size());
   kv_seq_lens.reserve(shapes.size());
   history_lens.reserve(shapes.size());
@@ -2867,7 +2900,12 @@ xllm::layer::AttentionMetadata make_mtgr_attention_metadata(
   realtime_lens.reserve(shapes.size());
   target_lens.reserve(shapes.size());
   matched_prefix_lens.reserve(shapes.size());
+  segment_offsets.reserve(shapes.size() * 5);
+  q_seq_starts.reserve(shapes.size());
+  matched_prefix_lens_i32.reserve(shapes.size());
 
+  int64_t total_q = 0;
+  int64_t max_query_len = 0;
   for (const auto& shape : shapes) {
     CHECK_GE(shape.matched_prefix, 0);
     CHECK_LT(shape.matched_prefix,
@@ -2879,14 +2917,42 @@ xllm::layer::AttentionMetadata make_mtgr_attention_metadata(
     realtime_lens.push_back(shape.realtime);
     target_lens.push_back(shape.target);
     matched_prefix_lens.push_back(shape.matched_prefix);
+    q_seq_starts.push_back(static_cast<int32_t>(total_q));
+    matched_prefix_lens_i32.push_back(
+        static_cast<int32_t>(shape.matched_prefix));
+    segment_offsets.push_back(0);
+    segment_offsets.push_back(static_cast<int32_t>(shape.history));
+    segment_offsets.push_back(
+        static_cast<int32_t>(shape.history + shape.context));
+    segment_offsets.push_back(
+        static_cast<int32_t>(shape.history + shape.context + shape.realtime));
+    segment_offsets.push_back(static_cast<int32_t>(shape.total_len()));
+    total_q += shape.local_len();
+    max_query_len = std::max(max_query_len, shape.local_len());
   }
 
   xllm::layer::AttentionMetadata metadata;
   auto len_opts =
       torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+  auto i32_dev_opts =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
   metadata.is_dummy = false;
   metadata.is_prefill = true;
   metadata.is_chunked_prefill = false;
+  const bool all_no_match =
+      std::all_of(matched_prefix_lens.begin(),
+                  matched_prefix_lens.end(),
+                  [](int64_t matched) { return matched == 0; });
+  const bool all_partial =
+      std::all_of(matched_prefix_lens.begin(),
+                  matched_prefix_lens.end(),
+                  [](int64_t matched) { return matched > 0; });
+  metadata.mtgr_match_mode =
+      all_no_match ? xllm::layer::MTGRMatchMode::kNoMatchOnly
+                   : (all_partial ? xllm::layer::MTGRMatchMode::kPartialOnly
+                                  : xllm::layer::MTGRMatchMode::kMixed);
+  metadata.max_query_len = max_query_len;
+  metadata.max_seq_len = max_query_len;
   metadata.q_seq_lens = torch::tensor(q_seq_lens, len_opts).contiguous();
   metadata.kv_seq_lens = torch::tensor(kv_seq_lens, len_opts).contiguous();
   metadata.genrec_history_lens =
@@ -2899,6 +2965,16 @@ xllm::layer::AttentionMetadata make_mtgr_attention_metadata(
       torch::tensor(target_lens, len_opts).contiguous();
   metadata.genrec_matched_prefix_lens =
       torch::tensor(matched_prefix_lens, len_opts).contiguous();
+  metadata.mtgr_segment_offsets_i32 =
+      torch::tensor(segment_offsets, i32_dev_opts)
+          .view({static_cast<int64_t>(shapes.size()), 5})
+          .contiguous();
+  metadata.mtgr_segment_rules_i32 =
+      torch::tensor({0, 1, 0, 2}, i32_dev_opts).contiguous();
+  metadata.mtgr_q_seq_starts_i32 =
+      torch::tensor(q_seq_starts, i32_dev_opts).contiguous();
+  metadata.mtgr_matched_prefix_lens_i32 =
+      torch::tensor(matched_prefix_lens_i32, i32_dev_opts).contiguous();
   return metadata;
 }
 
@@ -2975,10 +3051,12 @@ MTGRPartialBatchSetup make_mtgr_partial_batch_setup(
     CHECK_EQ(shape.heads, ref.heads);
     CHECK_EQ(shape.kv_heads, ref.kv_heads);
     CHECK_EQ(shape.head_dim, ref.head_dim);
-    CHECK_GT(shape.matched_prefix, 0);
-    CHECK_GE(shape.matched_prefix, shape.history + shape.context);
-    CHECK_LT(shape.matched_prefix,
-             shape.history + shape.context + shape.realtime);
+    CHECK_GE(shape.matched_prefix, 0);
+    if (shape.matched_prefix > 0) {
+      CHECK_GE(shape.matched_prefix, shape.history + shape.context);
+      CHECK_LT(shape.matched_prefix,
+               shape.history + shape.context + shape.realtime);
+    }
     CHECK(full_key_bsnd[i].defined());
     CHECK(full_value_bsnd[i].defined());
     CHECK_EQ(full_key_bsnd[i].dim(), 4);
@@ -3040,6 +3118,9 @@ MTGRPartialBatchSetup make_mtgr_partial_batch_setup(
 
   for (size_t i = 0; i < shapes.size(); ++i) {
     const auto& shape = shapes[i];
+    if (shape.matched_prefix == 0) {
+      continue;
+    }
     const auto prefix_slots_host = build_slot_mapping_host(
         block_rows[i], block_size, 0, shape.matched_prefix);
     auto prefix_slots =
