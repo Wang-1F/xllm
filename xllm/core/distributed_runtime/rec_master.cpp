@@ -49,11 +49,8 @@ constexpr const char* kOneRecSparseEmbeddingName = "sparse_embedding";
 constexpr const char* kOneRecDecoderContextEmbeddingName =
     "decoder_context_embedding";
 constexpr const char* kMtgrInputEmbeddingName = "input_embedding";
-constexpr const char* kMtgrSegmentOffsetsName = "mtgr_segment_offsets_i32";
-constexpr const char* kMtgrSegmentRulesName = "mtgr_segment_rules_i32";
-constexpr const char* kMtgrQSeqStartsName = "mtgr_q_seq_starts_i32";
-constexpr const char* kMtgrMatchedPrefixLensName =
-    "mtgr_matched_prefix_lens_i32";
+constexpr const char* kMtgrSegmentOffsetsName = "segment_offsets";
+constexpr const char* kMtgrSegmentRulesName = "segment_rules";
 std::atomic<uint64_t> g_mtgr_prompt_token_salt{1};
 
 std::string format_tensor_shape(const proto::InferInputTensor& tensor) {
@@ -130,8 +127,8 @@ std::vector<int32_t> build_mtgr_prompt_tokens(
     return result;
   }
 
-  // MTGR only allows prefix-cache reuse before the final segment. Make the
-  // final segment request-unique so cached KV never skips the required live
+  // MTGR only allows prefix-cache reuse before the target segment. Make the
+  // target segment request-unique so cached KV never skips the required target
   // forward.
   for (int32_t pos = cacheable_prefix_len; pos < total_seq_len; ++pos) {
     result[pos] = make_mtgr_non_cacheable_token(unique_salt, pos);
@@ -181,44 +178,6 @@ bool validate_mtgr_embedding_tensor(const proto::InferInputTensor& tensor,
     return false;
   }
   return true;
-}
-
-std::optional<torch::Tensor> parse_mtgr_int_vector_tensor(
-    const proto::InferInputTensor& tensor,
-    OutputCallback callback) {
-  if (!tensor.has_contents()) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "MTGR metadata tensor '" + tensor.name() +
-                            "' has no contents");
-    return std::nullopt;
-  }
-  if (tensor.data_type() != proto::DataType::INT32 &&
-      tensor.data_type() != proto::DataType::INT64) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "MTGR metadata tensor '" + tensor.name() +
-                            "' must use INT32 or INT64, got " +
-                            proto::DataType_Name(tensor.data_type()));
-    return std::nullopt;
-  }
-
-  torch::Tensor value;
-  try {
-    value = util::convert_rec_tensor_to_torch(tensor).to(torch::kCPU).contiguous();
-  } catch (const std::exception& e) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "Failed to parse MTGR metadata tensor '" + tensor.name() +
-                            "': " + std::string(e.what()));
-    return std::nullopt;
-  }
-  if (value.dim() != 1 && !(value.dim() == 2 && value.size(0) == 1)) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "MTGR metadata tensor '" + tensor.name() +
-                            "' must be 1-D or [1, N], got " +
-                            format_tensor_shape(tensor));
-    return std::nullopt;
-  }
-  value = value.reshape({-1}).contiguous();
-  return value.scalar_type() == torch::kInt32 ? value : value.to(torch::kInt32);
 }
 
 bool process_onerec_inputs(
@@ -470,10 +429,8 @@ bool process_mtgr_inputs(
     local_prompt_tokens->assign(prompt_tokens->begin(), prompt_tokens->end());
   }
 
-  torch::Tensor segment_offsets_i32;
-  torch::Tensor segment_rules_i32;
-  torch::Tensor q_seq_starts_i32;
-  torch::Tensor matched_prefix_lens_i32;
+  std::optional<torch::Tensor> segment_offsets_i32;
+  std::optional<torch::Tensor> segment_rules_i32;
 
   for (const auto& tensor : input_tensors.value()) {
     const auto& tensor_name = tensor.name();
@@ -504,34 +461,31 @@ bool process_mtgr_inputs(
       continue;
     }
 
-    auto assign_metadata = [&](torch::Tensor* dst) -> bool {
-      if (dst->defined()) {
+    auto assign_i32_tensor = [&](std::optional<torch::Tensor>* dst) -> bool {
+      if (dst->has_value()) {
         CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                             "Duplicate MTGR input tensor: " + tensor_name);
         return false;
       }
-      auto value = parse_mtgr_int_vector_tensor(tensor, callback);
-      if (!value.has_value()) {
+      try {
+        *dst = util::convert_rec_tensor_to_torch(tensor)
+                   .to(torch::kInt32)
+                   .contiguous();
+      } catch (const std::exception& e) {
+        CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                            "Failed to parse MTGR tensor '" + tensor_name +
+                                "': " + std::string(e.what()));
         return false;
       }
-      *dst = value.value();
       return true;
     };
 
     if (tensor_name == kMtgrSegmentOffsetsName) {
-      if (!assign_metadata(&segment_offsets_i32)) {
+      if (!assign_i32_tensor(&segment_offsets_i32)) {
         return false;
       }
     } else if (tensor_name == kMtgrSegmentRulesName) {
-      if (!assign_metadata(&segment_rules_i32)) {
-        return false;
-      }
-    } else if (tensor_name == kMtgrQSeqStartsName) {
-      if (!assign_metadata(&q_seq_starts_i32)) {
-        return false;
-      }
-    } else if (tensor_name == kMtgrMatchedPrefixLensName) {
-      if (!assign_metadata(&matched_prefix_lens_i32)) {
+      if (!assign_i32_tensor(&segment_rules_i32)) {
         return false;
       }
     } else {
@@ -546,79 +500,57 @@ bool process_mtgr_inputs(
                         "MTGR input_tensors must include 'input_embedding'");
     return false;
   }
-  if (!segment_offsets_i32.defined() || !segment_rules_i32.defined()) {
+
+  if (!segment_offsets_i32.has_value() || !segment_rules_i32.has_value()) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "MTGR input_tensors must include "
-                        "mtgr_segment_offsets_i32 and mtgr_segment_rules_i32");
+                        "MTGR input_tensors must include segment_offsets and segment_rules");
     return false;
   }
 
   const int32_t total_seq_len = static_cast<int32_t>(input_embedding->size(0));
-  if (segment_offsets_i32.numel() < 2) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "MTGR mtgr_segment_offsets_i32 must contain at least one segment");
+  auto offsets = segment_offsets_i32.value();
+  auto rules = segment_rules_i32.value();
+  if (offsets.dim() == 2 && offsets.size(0) == 1) {
+    offsets = offsets.view({offsets.size(1)});
+  }
+  if (rules.dim() == 2 && rules.size(0) == 1) {
+    rules = rules.view({rules.size(1)});
+  }
+  if (offsets.dim() != 1 || rules.dim() != 1 || offsets.size(0) < 2 ||
+      rules.size(0) + 1 != offsets.size(0)) {
+    CALLBACK_WITH_ERROR(
+        StatusCode::INVALID_ARGUMENT,
+        "MTGR segment_offsets must be [num_segments+1] or [1,num_segments+1], and segment_rules must be [num_segments]");
     return false;
   }
-  if (segment_rules_i32.numel() + 1 != segment_offsets_i32.numel()) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "MTGR mtgr_segment_offsets_i32 / mtgr_segment_rules_i32 shape mismatch");
+  auto offsets_cpu = offsets.cpu();
+  auto rules_cpu = rules.cpu();
+  const auto* offsets_ptr = offsets_cpu.data_ptr<int32_t>();
+  const auto* rules_ptr = rules_cpu.data_ptr<int32_t>();
+  if (offsets_ptr[0] != 0 ||
+      offsets_ptr[offsets_cpu.size(0) - 1] != total_seq_len) {
+    CALLBACK_WITH_ERROR(
+        StatusCode::INVALID_ARGUMENT,
+        "MTGR segment_offsets must start at 0 and end at input_embedding length");
     return false;
   }
-  if (segment_offsets_i32[0].item<int32_t>() != 0) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "MTGR mtgr_segment_offsets_i32 must start at 0");
-    return false;
-  }
-  for (int64_t idx = 1; idx < segment_offsets_i32.numel(); ++idx) {
-    if (segment_offsets_i32[idx - 1].item<int32_t>() >
-        segment_offsets_i32[idx].item<int32_t>()) {
+  for (int64_t i = 1; i < offsets_cpu.size(0); ++i) {
+    if (offsets_ptr[i] < offsets_ptr[i - 1]) {
       CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "MTGR mtgr_segment_offsets_i32 must be monotonic");
+                          "MTGR segment_offsets must be nondecreasing");
       return false;
     }
   }
-  if (segment_offsets_i32[segment_offsets_i32.numel() - 1].item<int32_t>() !=
-      total_seq_len) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "MTGR mtgr_segment_offsets_i32 total length must match input_embedding length");
-    return false;
-  }
-  const int32_t cache_reuse_boundary =
-      segment_offsets_i32[segment_offsets_i32.numel() - 2].item<int32_t>();
-  if (cache_reuse_boundary >= total_seq_len) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "MTGR final segment must contain at least one token");
-    return false;
-  }
-
-  if (q_seq_starts_i32.defined()) {
-    if (q_seq_starts_i32.numel() != 1) {
+  for (int64_t i = 0; i < rules_cpu.size(0); ++i) {
+    if (rules_ptr[i] < 0 || rules_ptr[i] > 2) {
       CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "Per-request mtgr_q_seq_starts_i32 must contain exactly one value");
-      return false;
-    }
-    if (q_seq_starts_i32[0].item<int32_t>() != 0) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "Per-request mtgr_q_seq_starts_i32 must be 0 before batch packing");
-      return false;
-    }
-  } else {
-    q_seq_starts_i32 = torch::tensor({0}, torch::kInt32);
-  }
-
-  if (matched_prefix_lens_i32.defined()) {
-    if (matched_prefix_lens_i32.numel() != 1) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "Per-request mtgr_matched_prefix_lens_i32 must contain exactly one value");
-      return false;
-    }
-    const int32_t matched_prefix = matched_prefix_lens_i32[0].item<int32_t>();
-    if (matched_prefix < 0 || matched_prefix > cache_reuse_boundary) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "Per-request mtgr_matched_prefix_lens_i32 must stay within the cacheable prefix boundary");
+                          "MTGR segment_rules only supports 0=causal, 1=full, 2=diag");
       return false;
     }
   }
+  const int32_t cacheable_prefix_len = offsets_ptr[offsets_cpu.size(0) - 2];
+  segment_offsets_i32 = offsets.view({1, offsets.size(0)}).contiguous();
+  segment_rules_i32 = rules.contiguous();
 
   if (!local_prompt_tokens->empty() &&
       static_cast<int32_t>(local_prompt_tokens->size()) !=
@@ -639,25 +571,20 @@ bool process_mtgr_inputs(
   *local_prompt_tokens = rec_master_internal::build_mtgr_prompt_tokens(
       prompt_tokens_for_cache,
       total_seq_len,
-      cache_reuse_boundary,
+      cacheable_prefix_len,
       next_mtgr_prompt_token_salt());
 
   LOG(INFO) << "[MTGR_TRACE][MASTER] process_mtgr_inputs done"
             << " total_seq_len=" << total_seq_len
-            << " num_segments=" << segment_rules_i32.numel()
-            << " cache_reuse_boundary=" << cache_reuse_boundary
+            << " cacheable_prefix_len=" << cacheable_prefix_len
             << " prompt_tokens_in="
             << (prompt_tokens.has_value() ? prompt_tokens->size() : 0)
             << " prompt_tokens_out=" << local_prompt_tokens->size()
             << " embedding=" << format_torch_tensor(*input_embedding);
 
   MMDict mm_dict;
-  mm_dict[kMtgrSegmentOffsetsName] = segment_offsets_i32;
-  mm_dict[kMtgrSegmentRulesName] = segment_rules_i32;
-  mm_dict[kMtgrQSeqStartsName] = q_seq_starts_i32;
-  if (matched_prefix_lens_i32.defined()) {
-    mm_dict[kMtgrMatchedPrefixLensName] = matched_prefix_lens_i32;
-  }
+  mm_dict[kMtgrSegmentOffsetsName] = segment_offsets_i32.value();
+  mm_dict[kMtgrSegmentRulesName] = segment_rules_i32.value();
   *processed_mm_data = MMData(MMType::EMBEDDING, mm_dict);
   return true;
 }
