@@ -797,10 +797,12 @@ TEST(BatchTest, MtgrRecPrefillBuilderTrimsEmbeddingAtPrefixBoundary) {
                      {9.0f, 10.0f}});
 
   MMDict mm_dict;
-  mm_dict["history_len"] = torch::tensor({2}, torch::kInt32);
-  mm_dict["context_len"] = torch::tensor({1}, torch::kInt32);
-  mm_dict["real_time_len"] = torch::tensor({1}, torch::kInt32);
-  mm_dict["target_len"] = torch::tensor({1}, torch::kInt32);
+  mm_dict["mtgr_segment_offsets_i32"] =
+      torch::tensor({0, 2, 3, 4, 5}, torch::kInt32);
+  mm_dict["mtgr_segment_rules_i32"] =
+      torch::tensor({0, 1, 0, 2}, torch::kInt32);
+  mm_dict["mtgr_q_seq_starts_i32"] = torch::tensor({0}, torch::kInt32);
+  mm_dict["mtgr_matched_prefix_lens_i32"] = torch::tensor({4}, torch::kInt32);
   MMData mm_data(MMType::EMBEDDING, mm_dict);
 
   SequencesGroup sequence_group(
@@ -823,11 +825,14 @@ TEST(BatchTest, MtgrRecPrefillBuilderTrimsEmbeddingAtPrefixBoundary) {
 
   const auto* mtgr_params = forward_input.input_params.mtgr_params();
   ASSERT_NE(mtgr_params, nullptr);
-  EXPECT_TRUE(equal(mtgr_params->history_lens, std::vector<int32_t>{2}));
-  EXPECT_TRUE(equal(mtgr_params->context_lens, std::vector<int32_t>{1}));
-  EXPECT_TRUE(equal(mtgr_params->real_time_lens, std::vector<int32_t>{1}));
-  EXPECT_TRUE(equal(mtgr_params->target_lens, std::vector<int32_t>{1}));
-  EXPECT_TRUE(equal(mtgr_params->matched_prefix_lens, std::vector<int32_t>{4}));
+  EXPECT_TRUE(equal(mtgr_params->mtgr_segment_offsets_i32,
+                    std::vector<int32_t>{0, 2, 3, 4, 5}));
+  EXPECT_TRUE(
+      equal(mtgr_params->mtgr_segment_rules_i32, std::vector<int32_t>{0, 1, 0, 2}));
+  EXPECT_TRUE(equal(mtgr_params->mtgr_q_seq_starts_i32, std::vector<int32_t>{0}));
+  EXPECT_TRUE(equal(mtgr_params->mtgr_matched_prefix_lens_i32,
+                    std::vector<int32_t>{4}));
+  EXPECT_EQ(static_cast<int32_t>(mtgr_params->mtgr_match_mode), 1);
   EXPECT_TRUE(equal(forward_input.sampling_params.selected_token_idxes,
                     std::vector<int32_t>{0}));
 }

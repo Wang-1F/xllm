@@ -525,26 +525,29 @@ ForwardInput RecWorkerImpl::RecPrefillOnlyWorkPipeline::prepare_inputs(
             << " positions=" << format_torch_tensor(input.positions)
             << " input_embedding="
             << format_torch_tensor(input.input_params.input_embedding)
-            << " history_lens="
+            << " mtgr_segment_offsets_i32="
             << format_torch_tensor(
-                   mtgr_params != nullptr ? mtgr_params->history_lens
+                   mtgr_params != nullptr
+                       ? mtgr_params->mtgr_segment_offsets_i32
                                           : torch::Tensor())
-            << " context_lens="
+            << " mtgr_segment_rules_i32="
             << format_torch_tensor(
-                   mtgr_params != nullptr ? mtgr_params->context_lens
+                   mtgr_params != nullptr
+                       ? mtgr_params->mtgr_segment_rules_i32
                                           : torch::Tensor())
-            << " real_time_lens="
+            << " mtgr_q_seq_starts_i32="
             << format_torch_tensor(
-                   mtgr_params != nullptr ? mtgr_params->real_time_lens
+                   mtgr_params != nullptr ? mtgr_params->mtgr_q_seq_starts_i32
                                           : torch::Tensor())
-            << " target_lens="
+            << " mtgr_matched_prefix_lens_i32="
             << format_torch_tensor(
-                   mtgr_params != nullptr ? mtgr_params->target_lens
+                   mtgr_params != nullptr
+                       ? mtgr_params->mtgr_matched_prefix_lens_i32
                                           : torch::Tensor())
-            << " matched_prefix_lens="
-            << format_torch_tensor(
-                   mtgr_params != nullptr ? mtgr_params->matched_prefix_lens
-                                          : torch::Tensor());
+            << " mtgr_match_mode="
+            << (mtgr_params != nullptr
+                    ? static_cast<int32_t>(mtgr_params->mtgr_match_mode)
+                    : -1);
   return input;
 }
 

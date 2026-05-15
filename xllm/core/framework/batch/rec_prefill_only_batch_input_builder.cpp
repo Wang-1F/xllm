@@ -20,16 +20,18 @@ limitations under the License.
 #include <cstdint>
 #include <sstream>
 
+#include "layers/common/attention_metadata.h"
 #include "framework/request/sequence.h"
 
 namespace xllm {
 
 namespace {
 
-constexpr const char* kMtgrHistoryLenName = "history_len";
-constexpr const char* kMtgrContextLenName = "context_len";
-constexpr const char* kMtgrRealTimeLenName = "real_time_len";
-constexpr const char* kMtgrTargetLenName = "target_len";
+constexpr const char* kMtgrSegmentOffsetsName = "mtgr_segment_offsets_i32";
+constexpr const char* kMtgrSegmentRulesName = "mtgr_segment_rules_i32";
+constexpr const char* kMtgrQSeqStartsName = "mtgr_q_seq_starts_i32";
+constexpr const char* kMtgrMatchedPrefixLensName =
+    "mtgr_matched_prefix_lens_i32";
 
 std::string format_torch_tensor(const torch::Tensor& tensor) {
   if (!tensor.defined()) {
@@ -47,22 +49,26 @@ std::string format_torch_tensor(const torch::Tensor& tensor) {
   return oss.str();
 }
 
-int32_t get_required_length(const MMData& mm_data, const char* key) {
+torch::Tensor get_required_tensor(const MMData& mm_data, const char* key) {
   auto tensor = mm_data.get<torch::Tensor>(key);
   CHECK(tensor.has_value()) << "Missing MTGR metadata tensor: " << key;
   const auto& value = tensor.value();
   CHECK(value.defined()) << "MTGR metadata tensor is undefined: " << key;
-  CHECK_EQ(value.numel(), 1) << "MTGR metadata tensor must contain one value: "
-                             << key;
-  if (value.scalar_type() == torch::kInt32) {
-    return value.reshape({-1})[0].item<int32_t>();
-  }
-  if (value.scalar_type() == torch::kInt64) {
-    return static_cast<int32_t>(value.reshape({-1})[0].item<int64_t>());
-  }
-  LOG(FATAL) << "Unsupported MTGR metadata tensor dtype for " << key << ": "
-             << value.scalar_type();
-  return 0;
+  return value;
+}
+
+torch::Tensor normalize_int_vector_tensor(const torch::Tensor& tensor,
+                                          const char* key) {
+  CHECK(tensor.defined()) << "MTGR metadata tensor is undefined: " << key;
+  CHECK(tensor.dim() == 1 || (tensor.dim() == 2 && tensor.size(0) == 1))
+      << "MTGR metadata tensor must be 1-D or [1, N]: " << key
+      << ", got " << tensor.sizes();
+  CHECK(tensor.scalar_type() == torch::kInt32 ||
+        tensor.scalar_type() == torch::kInt64)
+      << "MTGR metadata tensor must use int32/int64: " << key
+      << ", got " << tensor.scalar_type();
+  auto flat = tensor.reshape({-1}).to(torch::kCPU).contiguous();
+  return flat.scalar_type() == torch::kInt32 ? flat : flat.to(torch::kInt32);
 }
 
 }  // namespace
@@ -92,11 +98,14 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
   std::vector<uint32_t> effective_allowed_max_tokens;
   std::vector<torch::Tensor> trimmed_embeddings;
   std::vector<MMData> mm_data_vec;
-  std::vector<int32_t> history_lens;
-  std::vector<int32_t> context_lens;
-  std::vector<int32_t> real_time_lens;
-  std::vector<int32_t> target_lens;
-  std::vector<int32_t> matched_prefix_lens;
+  std::vector<torch::Tensor> segment_offset_rows_i32;
+  std::vector<torch::Tensor> matched_prefix_lens_i32;
+  std::vector<torch::Tensor> q_seq_starts_i32;
+  torch::Tensor batch_segment_rules_i32;
+  bool has_no_match_request = false;
+  bool has_partial_match_request = false;
+  int32_t packed_q_start = 0;
+  const auto i32_options = torch::TensorOptions().dtype(torch::kInt32);
 
   for (auto* sequence_group : sequence_groups_) {
     CHECK(sequence_group != nullptr);
@@ -113,7 +122,9 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
 
       const int32_t matched_prefix =
           static_cast<int32_t>(sequence->kv_state().kv_cache_tokens_num());
-      matched_prefix_lens.push_back(matched_prefix);
+      has_no_match_request = has_no_match_request || (matched_prefix == 0);
+      has_partial_match_request =
+          has_partial_match_request || (matched_prefix > 0);
 
       const auto& input_embedding = sequence->get_input_embedding();
       CHECK(input_embedding.defined())
@@ -124,27 +135,79 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
           << "matched_prefix exceeds input_embedding length";
       CHECK_LT(matched_prefix, input_embedding.size(0))
           << "matched_prefix must leave at least one token to compute";
+      const int32_t local_q_len =
+          static_cast<int32_t>(input_embedding.size(0) - matched_prefix);
+      q_seq_starts_i32.emplace_back(
+          torch::tensor({packed_q_start}, i32_options));
+      packed_q_start += local_q_len;
       trimmed_embeddings.emplace_back(input_embedding.narrow(
           /*dim=*/0,
           /*start=*/matched_prefix,
-          /*length=*/input_embedding.size(0) - matched_prefix));
+          /*length=*/local_q_len));
 
       const auto& mm_data = sequence->get_mm_data();
       mm_data_vec.emplace_back(mm_data);
 
-      const int32_t history = get_required_length(mm_data, kMtgrHistoryLenName);
-      const int32_t context = get_required_length(mm_data, kMtgrContextLenName);
-      const int32_t real_time =
-          get_required_length(mm_data, kMtgrRealTimeLenName);
-      const int32_t target = get_required_length(mm_data, kMtgrTargetLenName);
-      CHECK_EQ(history + context + real_time + target, input_embedding.size(0))
-          << "MTGR segment lengths must sum to input_embedding length";
-      CHECK_LE(matched_prefix, history + context + real_time)
-          << "matched_prefix must stay within [history|context|real_time]";
-      history_lens.push_back(history);
-      context_lens.push_back(context);
-      real_time_lens.push_back(real_time);
-      target_lens.push_back(target);
+      auto segment_offsets_i32_tensor = normalize_int_vector_tensor(
+          get_required_tensor(mm_data, kMtgrSegmentOffsetsName),
+          kMtgrSegmentOffsetsName);
+      auto segment_rules_i32_tensor = normalize_int_vector_tensor(
+          get_required_tensor(mm_data, kMtgrSegmentRulesName),
+          kMtgrSegmentRulesName);
+      CHECK_GE(segment_offsets_i32_tensor.numel(), 2)
+          << "MTGR segment_offsets must contain at least one segment";
+      CHECK_EQ(segment_rules_i32_tensor.numel() + 1,
+               segment_offsets_i32_tensor.numel())
+          << "MTGR segment_offsets/rules shape mismatch";
+
+      if (auto q_seq_start_tensor =
+              mm_data.get<torch::Tensor>(kMtgrQSeqStartsName);
+          q_seq_start_tensor.has_value()) {
+        auto q_seq_start_i32 = normalize_int_vector_tensor(
+            q_seq_start_tensor.value(), kMtgrQSeqStartsName);
+        CHECK_EQ(q_seq_start_i32.numel(), 1)
+            << "Per-request mtgr_q_seq_starts_i32 must contain one value";
+        CHECK_EQ(q_seq_start_i32[0].item<int32_t>(), 0)
+            << "Per-request mtgr_q_seq_starts_i32 must be 0 before batch packing";
+      }
+      if (auto matched_prefix_tensor =
+              mm_data.get<torch::Tensor>(kMtgrMatchedPrefixLensName);
+          matched_prefix_tensor.has_value()) {
+        auto matched_prefix_i32 = normalize_int_vector_tensor(
+            matched_prefix_tensor.value(), kMtgrMatchedPrefixLensName);
+        CHECK_EQ(matched_prefix_i32.numel(), 1)
+            << "Per-request mtgr_matched_prefix_lens_i32 must contain one value";
+        CHECK_EQ(matched_prefix_i32[0].item<int32_t>(), matched_prefix)
+            << "Request mtgr_matched_prefix_lens_i32 must match runtime KV prefix";
+        matched_prefix_lens_i32.emplace_back(matched_prefix_i32);
+      } else {
+        matched_prefix_lens_i32.emplace_back(
+            torch::tensor({matched_prefix}, i32_options));
+      }
+
+      if (!batch_segment_rules_i32.defined()) {
+        batch_segment_rules_i32 = segment_rules_i32_tensor;
+      } else {
+        CHECK(torch::equal(batch_segment_rules_i32, segment_rules_i32_tensor))
+            << "Current MTGR builder requires batch-shared segment_rules";
+      }
+
+      CHECK_EQ(segment_offsets_i32_tensor[0].item<int32_t>(), 0)
+          << "Per-request mtgr_segment_offsets_i32 must start at 0";
+      for (int64_t idx = 1; idx < segment_offsets_i32_tensor.numel(); ++idx) {
+        CHECK_LE(segment_offsets_i32_tensor[idx - 1].item<int32_t>(),
+                 segment_offsets_i32_tensor[idx].item<int32_t>())
+            << "Per-request mtgr_segment_offsets_i32 must be monotonic";
+      }
+      const int32_t total_seq_len =
+          segment_offsets_i32_tensor[segment_offsets_i32_tensor.numel() - 1]
+              .item<int32_t>();
+      CHECK_EQ(total_seq_len, input_embedding.size(0))
+          << "MTGR segment_offsets total length must match input_embedding length";
+      CHECK_LE(matched_prefix, total_seq_len)
+          << "matched_prefix exceeds MTGR total sequence length";
+
+      segment_offset_rows_i32.emplace_back(segment_offsets_i32_tensor);
     }
   }
 
@@ -166,12 +229,16 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
                                                            min_decoding_batch_size);
 
   auto& mtgr_params = forward_input.input_params.mutable_mtgr_params();
-  mtgr_params.history_lens = torch::tensor(history_lens, torch::kInt32);
-  mtgr_params.context_lens = torch::tensor(context_lens, torch::kInt32);
-  mtgr_params.real_time_lens = torch::tensor(real_time_lens, torch::kInt32);
-  mtgr_params.target_lens = torch::tensor(target_lens, torch::kInt32);
-  mtgr_params.matched_prefix_lens =
-      torch::tensor(matched_prefix_lens, torch::kInt32);
+  mtgr_params.mtgr_segment_offsets_i32 = torch::stack(segment_offset_rows_i32);
+  mtgr_params.mtgr_segment_rules_i32 = batch_segment_rules_i32.clone();
+  mtgr_params.mtgr_q_seq_starts_i32 = torch::cat(q_seq_starts_i32);
+  mtgr_params.mtgr_matched_prefix_lens_i32 =
+      torch::cat(matched_prefix_lens_i32);
+  mtgr_params.mtgr_match_mode =
+      has_partial_match_request
+          ? (has_no_match_request ? layer::MTGRMatchMode::kMixed
+                                  : layer::MTGRMatchMode::kPartialOnly)
+          : layer::MTGRMatchMode::kNoMatchOnly;
 
   LOG(INFO) << "[MTGR_TRACE][BATCH] batch_id=" << batch_id_
             << " sequences=" << sequences.size()
@@ -179,13 +246,16 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
             << " positions=" << format_torch_tensor(forward_input.positions)
             << " input_embedding="
             << format_torch_tensor(forward_input.input_params.input_embedding)
-            << " history_lens=" << format_torch_tensor(mtgr_params.history_lens)
-            << " context_lens=" << format_torch_tensor(mtgr_params.context_lens)
-            << " real_time_lens="
-            << format_torch_tensor(mtgr_params.real_time_lens)
-            << " target_lens=" << format_torch_tensor(mtgr_params.target_lens)
-            << " matched_prefix_lens="
-            << format_torch_tensor(mtgr_params.matched_prefix_lens);
+            << " mtgr_segment_offsets_i32="
+            << format_torch_tensor(mtgr_params.mtgr_segment_offsets_i32)
+            << " mtgr_segment_rules_i32="
+            << format_torch_tensor(mtgr_params.mtgr_segment_rules_i32)
+            << " mtgr_q_seq_starts_i32="
+            << format_torch_tensor(mtgr_params.mtgr_q_seq_starts_i32)
+            << " mtgr_matched_prefix_lens_i32="
+            << format_torch_tensor(mtgr_params.mtgr_matched_prefix_lens_i32)
+            << " mtgr_match_mode="
+            << static_cast<int32_t>(mtgr_params.mtgr_match_mode);
 
   return forward_input;
 }

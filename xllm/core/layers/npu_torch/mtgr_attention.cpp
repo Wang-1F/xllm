@@ -90,6 +90,167 @@ struct SampleSegmentMetadata {
   torch::Tensor compressed_causal_mask;
 };
 
+struct LoweredMtgrBatchMetadata {
+  torch::Tensor history_lens;
+  torch::Tensor context_lens;
+  torch::Tensor real_time_lens;
+  torch::Tensor target_lens;
+  torch::Tensor matched_prefix_lens;
+};
+
+bool has_unified_mtgr_metadata(const AttentionMetadata& attn_metadata) {
+  return attn_metadata.mtgr_segment_offsets_i32.defined() ||
+         attn_metadata.mtgr_segment_rules_i32.defined() ||
+         attn_metadata.mtgr_q_seq_starts_i32.defined() ||
+         attn_metadata.mtgr_matched_prefix_lens_i32.defined();
+}
+
+void validate_mtgr_match_mode(const torch::Tensor& matched_prefix_lens,
+                              MTGRMatchMode match_mode) {
+  CHECK_EQ(matched_prefix_lens.dim(), 1)
+      << "mtgr_matched_prefix_lens_i32 must be 1-D";
+  const int64_t batch_size = matched_prefix_lens.size(0);
+  bool has_no_match_request = false;
+  bool has_partial_match_request = false;
+  for (int64_t i = 0; i < batch_size; ++i) {
+    const int64_t matched = matched_prefix_lens[i].item<int64_t>();
+    has_no_match_request = has_no_match_request || (matched == 0);
+    has_partial_match_request = has_partial_match_request || (matched > 0);
+  }
+  const MTGRMatchMode expected_match_mode =
+      has_partial_match_request
+          ? (has_no_match_request ? MTGRMatchMode::kMixed
+                                  : MTGRMatchMode::kPartialOnly)
+          : MTGRMatchMode::kNoMatchOnly;
+  CHECK_EQ(static_cast<int32_t>(match_mode),
+           static_cast<int32_t>(expected_match_mode))
+      << "mtgr_match_mode does not match matched_prefix_lens batch composition";
+}
+
+LoweredMtgrBatchMetadata lower_unified_mtgr_to_npu_four_segment(
+    const AttentionMetadata& attn_metadata) {
+  const auto& q_seq_lens = attn_metadata.q_seq_lens;
+  const auto& kv_seq_lens = attn_metadata.kv_seq_lens;
+  const auto& segment_offsets = attn_metadata.mtgr_segment_offsets_i32;
+  const auto& segment_rules = attn_metadata.mtgr_segment_rules_i32;
+  const auto& q_seq_starts = attn_metadata.mtgr_q_seq_starts_i32;
+  const auto& matched_prefix_lens = attn_metadata.mtgr_matched_prefix_lens_i32;
+
+  CHECK(q_seq_lens.defined()) << "q_seq_lens must be defined";
+  CHECK(kv_seq_lens.defined()) << "kv_seq_lens must be defined";
+  CHECK(segment_offsets.defined()) << "mtgr_segment_offsets_i32 must be defined";
+  CHECK(segment_rules.defined()) << "mtgr_segment_rules_i32 must be defined";
+  CHECK(q_seq_starts.defined()) << "mtgr_q_seq_starts_i32 must be defined";
+  CHECK(matched_prefix_lens.defined())
+      << "mtgr_matched_prefix_lens_i32 must be defined";
+  CHECK_EQ(segment_offsets.scalar_type(), torch::kInt32)
+      << "mtgr_segment_offsets_i32 must be int32";
+  CHECK_EQ(segment_rules.scalar_type(), torch::kInt32)
+      << "mtgr_segment_rules_i32 must be int32";
+  CHECK_EQ(q_seq_starts.scalar_type(), torch::kInt32)
+      << "mtgr_q_seq_starts_i32 must be int32";
+  CHECK_EQ(matched_prefix_lens.scalar_type(), torch::kInt32)
+      << "mtgr_matched_prefix_lens_i32 must be int32";
+  CHECK_EQ(segment_offsets.dim(), 2)
+      << "mtgr_segment_offsets_i32 must be [batch_size, num_segments + 1]";
+  CHECK_EQ(segment_offsets.size(1), 5)
+      << "NPU MTGR adapter only supports 4 segments [history|context|real_time|target]";
+  CHECK_EQ(segment_rules.dim(), 1)
+      << "mtgr_segment_rules_i32 must be 1-D";
+  CHECK_EQ(segment_rules.numel(), 4)
+      << "NPU MTGR adapter only supports 4 segment rules";
+  CHECK_EQ(q_seq_starts.dim(), 1) << "mtgr_q_seq_starts_i32 must be 1-D";
+  CHECK_EQ(matched_prefix_lens.dim(), 1)
+      << "mtgr_matched_prefix_lens_i32 must be 1-D";
+
+  const int64_t batch_size = q_seq_lens.size(0);
+  CHECK_EQ(kv_seq_lens.size(0), batch_size);
+  CHECK_EQ(segment_offsets.size(0), batch_size);
+  CHECK_EQ(q_seq_starts.size(0), batch_size);
+  CHECK_EQ(matched_prefix_lens.size(0), batch_size);
+
+  CHECK_EQ(segment_rules[0].item<int64_t>(), 0)
+      << "NPU MTGR adapter expects segment_rules=[0,1,0,2]";
+  CHECK_EQ(segment_rules[1].item<int64_t>(), 1)
+      << "NPU MTGR adapter expects segment_rules=[0,1,0,2]";
+  CHECK_EQ(segment_rules[2].item<int64_t>(), 0)
+      << "NPU MTGR adapter expects segment_rules=[0,1,0,2]";
+  CHECK_EQ(segment_rules[3].item<int64_t>(), 2)
+      << "NPU MTGR adapter expects segment_rules=[0,1,0,2]";
+  validate_mtgr_match_mode(matched_prefix_lens, attn_metadata.mtgr_match_mode);
+
+  auto segment_lens =
+      (segment_offsets.slice(/*dim=*/1, /*start=*/1, /*end=*/5) -
+       segment_offsets.slice(/*dim=*/1, /*start=*/0, /*end=*/4))
+          .contiguous();
+  auto history_lens = segment_lens.select(/*dim=*/1, /*index=*/0).contiguous();
+  auto context_lens = segment_lens.select(/*dim=*/1, /*index=*/1).contiguous();
+  auto real_time_lens =
+      segment_lens.select(/*dim=*/1, /*index=*/2).contiguous();
+  auto target_lens = segment_lens.select(/*dim=*/1, /*index=*/3).contiguous();
+
+  int64_t packed_q_start = 0;
+  for (int64_t i = 0; i < batch_size; ++i) {
+    const int64_t offset0 = segment_offsets[i][0].item<int64_t>();
+    const int64_t offset1 = segment_offsets[i][1].item<int64_t>();
+    const int64_t offset2 = segment_offsets[i][2].item<int64_t>();
+    const int64_t offset3 = segment_offsets[i][3].item<int64_t>();
+    const int64_t offset4 = segment_offsets[i][4].item<int64_t>();
+    CHECK_EQ(offset0, 0) << "mtgr_segment_offsets_i32 row must start at 0";
+    CHECK_LE(offset0, offset1);
+    CHECK_LE(offset1, offset2);
+    CHECK_LE(offset2, offset3);
+    CHECK_LE(offset3, offset4);
+
+    const int64_t history = offset1 - offset0;
+    const int64_t context = offset2 - offset1;
+    const int64_t real_time = offset3 - offset2;
+    const int64_t target = offset4 - offset3;
+    const int64_t matched = matched_prefix_lens[i].item<int64_t>();
+    const int64_t q_len = q_seq_lens[i].item<int64_t>();
+    const int64_t kv_len = kv_seq_lens[i].item<int64_t>();
+    CHECK_GT(history, 0)
+        << "NPU MTGR adapter requires history segment length > 0";
+    CHECK_GE(context, 0)
+        << "NPU MTGR adapter requires context segment length >= 0";
+    CHECK_GT(real_time, 0)
+        << "NPU MTGR adapter requires real_time segment length > 0";
+    CHECK_GT(target, 0)
+        << "NPU MTGR adapter requires target segment length > 0";
+    CHECK_GE(matched, 0);
+    CHECK_LE(matched, history + context + real_time)
+        << "matched_prefix must stay within [history|context|real_time]";
+    CHECK_EQ(q_len, offset4 - matched)
+        << "trimmed MTGR q_seq_lens must equal total_len - matched_prefix";
+    CHECK_EQ(kv_len, offset4 - matched)
+        << "trimmed MTGR kv_seq_lens must equal total_len - matched_prefix";
+    CHECK_EQ(q_seq_starts[i].item<int64_t>(), packed_q_start)
+        << "mtgr_q_seq_starts_i32 must match packed trimmed-query layout";
+    if (matched > 0) {
+      CHECK_GE(matched, history + context)
+          << "Current NPU MTGR kernel only supports no-match or realtime partial match";
+      CHECK_LT(matched, history + context + real_time)
+          << "Current NPU MTGR kernel requires at least one unmatched realtime token";
+    }
+    packed_q_start += q_len;
+  }
+
+  return LoweredMtgrBatchMetadata{
+      .history_lens = history_lens,
+      .context_lens = context_lens,
+      .real_time_lens = real_time_lens,
+      .target_lens = target_lens,
+      .matched_prefix_lens = matched_prefix_lens.contiguous(),
+  };
+}
+
+LoweredMtgrBatchMetadata lower_mtgr_to_npu_four_segment(
+    const AttentionMetadata& attn_metadata) {
+  CHECK(has_unified_mtgr_metadata(attn_metadata))
+      << "MTGR attention requires unified mtgr_segment_* metadata";
+  return lower_unified_mtgr_to_npu_four_segment(attn_metadata);
+}
+
 struct AclPlan {
   uint64_t workspace_size = 0;
   aclOpExecutor* executor = nullptr;
@@ -700,7 +861,10 @@ std::pair<torch::Tensor, torch::Tensor> build_target_diagonal_attn_analytic(
   return {output, lse};
 }
 
-void fa_for_crt(const torch::Tensor& query,
+// Keep the legacy four-segment helpers in-file. The current unified MTGR
+// entry only dispatches no-match and partial-rt-match, but these paths remain
+// useful for parity, debugging, and future rollback.
+[[maybe_unused]] void fa_for_crt(const torch::Tensor& query,
                                  const torch::Tensor& key,
                                  const torch::Tensor& value,
                                  const SampleSegmentMetadata& sample_metadata,
@@ -714,8 +878,10 @@ void fa_for_crt(const torch::Tensor& query,
   const int64_t head_dim = query.size(3);
   auto stream = c10_npu::getCurrentNPUStream(query.device().index()).stream();
 
-  auto out_opts = torch::TensorOptions().dtype(query.scalar_type()).device(query.device());
-  auto lse_opts = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+  auto out_opts =
+      torch::TensorOptions().dtype(query.scalar_type()).device(query.device());
+  auto lse_opts =
+      torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
   constexpr float kSentinel = -31415.0f;
 
   auto make_out = [&](int64_t seq_len) {
@@ -736,8 +902,8 @@ void fa_for_crt(const torch::Tensor& query,
   crt_meta.sparse_param.pre_tokens = kDefaultWindow;
   crt_meta.sparse_param.next_tokens = kDefaultWindow;
 
-  AclPlan crt_plan = plan_segment_attention(
-      crt_query, crt_key, crt_value, crt_meta, crt_out, crt_lse);
+  AclPlan crt_plan =
+      plan_segment_attention(crt_query, crt_key, crt_value, crt_meta, crt_out, crt_lse);
   execute_planned_attention(crt_plan, query.device(), stream);
   destroy_planned_attention(crt_plan);
   output.slice(1, h, h + c).copy_(crt_out.slice(1, 0, c));
@@ -806,10 +972,10 @@ void fa_for_crt(const torch::Tensor& query,
 }
 
 void no_matched(const torch::Tensor& query,
-                         const torch::Tensor& key,
-                         const torch::Tensor& value,
-                         const SampleSegmentMetadata& sample_metadata,
-                         torch::Tensor& output) {
+                const torch::Tensor& key,
+                const torch::Tensor& value,
+                const SampleSegmentMetadata& sample_metadata,
+                torch::Tensor& output) {
   CHECK_EQ(query.size(0), 1);
   const int64_t h = sample_metadata.history;
   const int64_t c = sample_metadata.context;
@@ -833,7 +999,7 @@ void no_matched(const torch::Tensor& query,
     return torch::empty({1, num_heads, seq_len, 1}, lse_opts);
   };
 
-  // no_matched best path:
+  // no-match best path:
   // 1) Q=R+T, KV=H+C+R, sparse_mode=4 trapezoid;
   // 2) Q=H, KV=H, causal;
   // 3) Q=C, KV=H+C, full;
@@ -852,6 +1018,7 @@ void no_matched(const torch::Tensor& query,
   auto rt_tgt_plan = plan_segment_attention(
       rt_tgt_query, hcr_key, hcr_value, rt_tgt_meta, rt_tgt_out, rt_tgt_lse);
   execute_planned_attention(rt_tgt_plan, query.device(), stream);
+  destroy_planned_attention(rt_tgt_plan);
 
   const int64_t update_b = 1;
   const int64_t update_s = t;
@@ -859,14 +1026,16 @@ void no_matched(const torch::Tensor& query,
   const int64_t update_d = head_dim;
   const int64_t update_bsn = update_b * update_s * update_n;
   auto f32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
-  auto rt_tgt_out_flat_placeholder = torch::empty({update_bsn, update_d}, f32_opts);
-  auto rt_tgt_lse_flat_placeholder = torch::empty({update_bsn}, f32_opts);
-  auto target_out_flat_placeholder = torch::empty({update_bsn, update_d}, f32_opts);
-  auto target_lse_flat_placeholder = torch::empty({update_bsn}, f32_opts);
+  auto target_prefix_out_flat_placeholder =
+      torch::empty({update_bsn, update_d}, f32_opts);
+  auto target_prefix_lse_flat_placeholder = torch::empty({update_bsn}, f32_opts);
+  auto target_diag_out_flat_placeholder =
+      torch::empty({update_bsn, update_d}, f32_opts);
+  auto target_diag_lse_flat_placeholder = torch::empty({update_bsn}, f32_opts);
 
   auto target_update_plan = plan_attention_update_from_prepared_flats(
-      {rt_tgt_out_flat_placeholder, target_out_flat_placeholder},
-      {rt_tgt_lse_flat_placeholder, target_lse_flat_placeholder},
+      {target_prefix_out_flat_placeholder, target_diag_out_flat_placeholder},
+      {target_prefix_lse_flat_placeholder, target_diag_lse_flat_placeholder},
       update_b,
       update_s,
       update_n,
@@ -906,21 +1075,21 @@ void no_matched(const torch::Tensor& query,
     output.slice(1, h, h + c).copy_(ctx_out);
   }
 
-  rt_tgt_out_flat_placeholder.view({update_b, update_s, update_n, update_d})
+  target_prefix_out_flat_placeholder.view({update_b, update_s, update_n, update_d})
       .copy_(rt_tgt_out.narrow(1, r, t));
-  rt_tgt_lse_flat_placeholder.view({update_b, update_s, update_n})
+  target_prefix_lse_flat_placeholder.view({update_b, update_s, update_n})
       .copy_(rt_tgt_lse.narrow(2, r, t).permute({0, 2, 1, 3}).squeeze(-1));
 
   auto target_query = query.slice(1, h + c + r, h + c + r + t).contiguous();
   auto target_key = key.slice(1, h + c + r, h + c + r + t).contiguous();
   auto target_value = value.slice(1, h + c + r, h + c + r + t).contiguous();
-  auto [target_out, target_lse] =
+  auto [target_diag_out, target_diag_lse] =
       build_target_diagonal_attn_analytic(target_query, target_key, target_value);
 
-  target_out_flat_placeholder.view({update_b, update_s, update_n, update_d})
-      .copy_(target_out);
-  target_lse_flat_placeholder.view({update_b, update_s, update_n})
-      .copy_(target_lse.permute({0, 2, 1, 3}).squeeze(-1));
+  target_diag_out_flat_placeholder.view({update_b, update_s, update_n, update_d})
+      .copy_(target_diag_out);
+  target_diag_lse_flat_placeholder.view({update_b, update_s, update_n})
+      .copy_(target_diag_lse.permute({0, 2, 1, 3}).squeeze(-1));
 
   execute_planned_attention_update(target_update_plan, query.device(), stream);
   auto target_merged =
@@ -931,13 +1100,12 @@ void no_matched(const torch::Tensor& query,
                  target_update_plan.d})
           .to(target_update_plan.out_scalar_type);
 
-  destroy_planned_attention(rt_tgt_plan);
   destroy_planned_attention_update(target_update_plan);
   output.slice(1, h + c, h + c + r).copy_(rt_tgt_out.slice(1, 0, r));
   output.slice(1, h + c + r, h + c + r + t).copy_(target_merged);
 }
 
-void partial_hist_matched(
+[[maybe_unused]] void partial_hist_matched(
     const torch::Tensor& query,
     const torch::Tensor& key,
     const torch::Tensor& value,
@@ -970,7 +1138,8 @@ void partial_hist_matched(
   const int64_t num_kv_heads = key.size(2);
   const int64_t head_dim = key.size(3);
   auto stream = c10_npu::getCurrentNPUStream(query.device().index()).stream();
-  auto i32_dev_opts = torch::TensorOptions().dtype(torch::kInt32).device(query.device());
+  auto i32_dev_opts =
+      torch::TensorOptions().dtype(torch::kInt32).device(query.device());
 
   CHECK_EQ(key_cache.dim(), 4);
   CHECK_EQ(value_cache.dim(), 4);
@@ -1009,7 +1178,6 @@ void partial_hist_matched(
       value_cache.view({cache_block_count, block_size, num_kv_heads * head_dim});
   auto block_table = sample_metadata.block_table.to(i32_dev_opts.dtype()).contiguous();
 
-  // 1) history unmatched: q=[h_unmatched], kv=[full history] via PA.
   auto history_query_unmatched = query.slice(1, 0, history_unmatched).contiguous();
   auto history_out_unmatched = torch::empty_like(history_query_unmatched);
   auto hist_pa_plan = plan_paged_attention_v3(
@@ -1029,10 +1197,11 @@ void partial_hist_matched(
   destroy_planned_paged_attention(hist_pa_plan);
   output.slice(1, 0, history_unmatched).copy_(history_out_unmatched);
 
-  // 2) CRT prefix branch: q=[c+r+t], kv=[history+context] via PA.
   const int64_t num_heads = query.size(2);
-  auto out_opts = torch::TensorOptions().dtype(query.scalar_type()).device(query.device());
-  auto lse_opts = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+  auto out_opts =
+      torch::TensorOptions().dtype(query.scalar_type()).device(query.device());
+  auto lse_opts =
+      torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
   constexpr float kSentinel = -31415.0f;
   auto make_out = [&](int64_t seq_len) {
     return torch::full({1, seq_len, num_heads, head_dim}, kSentinel, out_opts);
@@ -1065,7 +1234,6 @@ void partial_hist_matched(
   output.slice(1, local_context_start, local_context_start + c)
       .copy_(crt_out.slice(1, 0, c));
 
-  // 3) RT/TGT local branch: q=[r+t], kv=[r] via FA (matches fa_for_crt fusion layout).
   auto rt_tgt_query = query.slice(1, local_rt_start, local_rt_start + r + t).contiguous();
   auto rt_key = key.slice(1, local_rt_start, local_rt_start + r).contiguous();
   auto rt_value = value.slice(1, local_rt_start, local_rt_start + r).contiguous();
@@ -1093,10 +1261,11 @@ void partial_hist_matched(
   destroy_planned_attention_update(rt_update_plan);
   output.slice(1, local_rt_start, local_rt_start + r).copy_(rt_merged);
 
-  // 4) Target self branch and final merge.
-  auto target_query = query.slice(1, local_target_start, local_target_start + t).contiguous();
+  auto target_query =
+      query.slice(1, local_target_start, local_target_start + t).contiguous();
   auto target_key = key.slice(1, local_target_start, local_target_start + t).contiguous();
-  auto target_value = value.slice(1, local_target_start, local_target_start + t).contiguous();
+  auto target_value =
+      value.slice(1, local_target_start, local_target_start + t).contiguous();
   auto target_self_out = make_out(t);
   auto target_self_lse = make_lse(t);
   SegmentAttentionMetadata self_meta;
@@ -1132,7 +1301,7 @@ void partial_hist_matched(
   output.slice(1, local_target_start, local_target_start + t).copy_(target_merged);
 }
 
-void partial_ctx_matched(
+[[maybe_unused]] void partial_ctx_matched(
     const torch::Tensor& query,
     const torch::Tensor& key,
     const torch::Tensor& value,
@@ -1171,7 +1340,8 @@ void partial_ctx_matched(
       << "slot_mapping is shorter than unmatched context length";
 
   auto stream = c10_npu::getCurrentNPUStream(query.device().index()).stream();
-  auto i32_dev_opts = torch::TensorOptions().dtype(torch::kInt32).device(query.device());
+  auto i32_dev_opts =
+      torch::TensorOptions().dtype(torch::kInt32).device(query.device());
 
   CHECK_EQ(key_cache.dim(), 4);
   CHECK_EQ(value_cache.dim(), 4);
@@ -1203,8 +1373,10 @@ void partial_ctx_matched(
       value_cache.view({cache_block_count, block_size, num_kv_heads * head_dim});
   auto block_table = sample_metadata.block_table.to(i32_dev_opts.dtype()).contiguous();
 
-  auto out_opts = torch::TensorOptions().dtype(query.scalar_type()).device(query.device());
-  auto lse_opts = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+  auto out_opts =
+      torch::TensorOptions().dtype(query.scalar_type()).device(query.device());
+  auto lse_opts =
+      torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
   constexpr float kSentinel = -31415.0f;
   auto make_out = [&](int64_t seq_len) {
     return torch::full({1, seq_len, num_heads, head_dim}, kSentinel, out_opts);
@@ -1234,7 +1406,8 @@ void partial_ctx_matched(
   destroy_planned_paged_attention(crt_pa_plan);
   output.slice(1, 0, context_unmatched).copy_(crt_out.slice(1, 0, context_unmatched));
 
-  auto rt_tgt_query = query.slice(1, local_rt_start, local_rt_start + r + t).contiguous();
+  auto rt_tgt_query =
+      query.slice(1, local_rt_start, local_rt_start + r + t).contiguous();
   auto rt_key = key.slice(1, local_rt_start, local_rt_start + r).contiguous();
   auto rt_value = value.slice(1, local_rt_start, local_rt_start + r).contiguous();
   auto rt_tgt_out = make_out(r + t);
@@ -1263,9 +1436,11 @@ void partial_ctx_matched(
   destroy_planned_attention_update(rt_update_plan);
   output.slice(1, local_rt_start, local_rt_start + r).copy_(rt_merged);
 
-  auto target_query = query.slice(1, local_target_start, local_target_start + t).contiguous();
+  auto target_query =
+      query.slice(1, local_target_start, local_target_start + t).contiguous();
   auto target_key = key.slice(1, local_target_start, local_target_start + t).contiguous();
-  auto target_value = value.slice(1, local_target_start, local_target_start + t).contiguous();
+  auto target_value =
+      value.slice(1, local_target_start, local_target_start + t).contiguous();
   auto target_self_out = make_out(t);
   auto target_self_lse = make_lse(t);
   SegmentAttentionMetadata self_meta;
@@ -1465,20 +1640,21 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> MTGRAttentionImpl::forwa
   const int64_t kv_tokens = key.size(0);
   const auto& q_seq_lens_host = attn_metadata.q_seq_lens;
   const auto& kv_seq_lens_host = attn_metadata.kv_seq_lens;
-  const auto& history_lens_host = attn_metadata.genrec_history_lens;
-  const auto& context_lens_host = attn_metadata.genrec_context_lens;
-  const auto& real_time_lens_host = attn_metadata.genrec_real_time_lens;
-  const auto& target_lens_host = attn_metadata.genrec_target_lens;
-  const auto& matched_prefix_lens_host = attn_metadata.genrec_matched_prefix_lens;
+  const auto lowered_mtgr = lower_mtgr_to_npu_four_segment(attn_metadata);
+  const auto& history_lens_host = lowered_mtgr.history_lens;
+  const auto& context_lens_host = lowered_mtgr.context_lens;
+  const auto& real_time_lens_host = lowered_mtgr.real_time_lens;
+  const auto& target_lens_host = lowered_mtgr.target_lens;
+  const auto& matched_prefix_lens_host = lowered_mtgr.matched_prefix_lens;
 
   CHECK(q_seq_lens_host.defined()) << "q_seq_lens must be defined";
   CHECK(kv_seq_lens_host.defined()) << "kv_seq_lens must be defined";
-  CHECK(history_lens_host.defined()) << "genrec_history_lens must be defined";
-  CHECK(context_lens_host.defined()) << "genrec_context_lens must be defined";
-  CHECK(real_time_lens_host.defined()) << "genrec_real_time_lens must be defined";
-  CHECK(target_lens_host.defined()) << "genrec_target_lens must be defined";
+  CHECK(history_lens_host.defined()) << "history_lens must be defined";
+  CHECK(context_lens_host.defined()) << "context_lens must be defined";
+  CHECK(real_time_lens_host.defined()) << "real_time_lens must be defined";
+  CHECK(target_lens_host.defined()) << "target_lens must be defined";
   CHECK(matched_prefix_lens_host.defined())
-      << "genrec_matched_prefix_lens must be defined";
+      << "matched_prefix_lens must be defined";
 
   const int64_t batch_size = q_seq_lens_host.size(0);
   CHECK_EQ(kv_seq_lens_host.size(0), batch_size);
@@ -1545,8 +1721,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> MTGRAttentionImpl::forwa
     const int64_t r = sample_metadata.real_time;
     const int64_t matched = sample_metadata.matched_prefix;
     CHECK_GE(matched, 0);
-    CHECK_LT(matched, h + c + r)
-        << "matched prefix must be in [0, history+context+realtime)";
+    CHECK_LE(matched, h + c + r)
+        << "matched prefix must stay within [0, history+context+realtime]";
 
     auto write_prefix_cache = [&](const SampleSegmentMetadata& metadata,
                                   int64_t prefix_cache_len,
@@ -1583,24 +1759,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> MTGRAttentionImpl::forwa
 
     if (matched == 0) {
       no_matched(query_i, key_i, value_i, sample_metadata, output_i);
-      write_prefix_cache(sample_metadata, h + c + r, "no_matched prefix writeback");
-    } else if (matched < h + c) {
-      LOG(WARNING) << "matched_prefix falls before realtime; fallback to "
-                   << "no_matched path only when full sequence is provided. matched=" << matched
-                   << ", history=" << h
-                   << ", context=" << c
-                   << ", realtime=" << r;
-
-      SampleSegmentMetadata fallback_metadata = sample_metadata;
-      fallback_metadata.matched_prefix = 0;
-      CHECK_EQ(q_len, h + c + r + fallback_metadata.target)
-          << "history/context partial fallback requires the caller to provide the "
-          << "full no-match sequence. Trimmed partial inputs cannot be converted "
-          << "to no_matched inside MTGRAttentionImpl.";
-      no_matched(query_i, key_i, value_i, fallback_metadata, output_i);
-      write_prefix_cache(
-          fallback_metadata, h + c + r, "no_matched fallback prefix writeback");
-    } else if (matched >= h + c && matched < h + c + r) {
+      write_prefix_cache(sample_metadata,
+                         h + c + r,
+                         "no_matched prefix writeback");
+    } else {
       CHECK(key_cache.defined() && value_cache.defined())
           << "KV cache is required for prefix-cache path";
       partial_rt_matched(query_i,
@@ -1610,13 +1772,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> MTGRAttentionImpl::forwa
                          value_cache,
                          sample_metadata,
                          output_i);
-    } else {
-      LOG(WARNING) << "Unsupported matched_prefix branch (context partial match), "
-                   << "fallback to full-FA path. matched=" << matched
-                   << ", history=" << h
-                   << ", context=" << c
-                   << ", realtime=" << r;
-      no_matched(query_i, key_i, value_i, sample_metadata, output_i);
     }
 
     output.narrow(0, q_offset, q_len)

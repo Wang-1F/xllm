@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,6 +38,7 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 struct AttentionMetadata;
+enum class MTGRMatchMode : int8_t;
 }  // namespace layer
 
 struct OneRecModelInputParams {
@@ -148,43 +150,44 @@ struct OneRecModelInputParams {
 };
 
 struct MtgrModelInputParams {
-  torch::Tensor history_lens;
-  torch::Tensor context_lens;
-  torch::Tensor real_time_lens;
-  torch::Tensor target_lens;
-  torch::Tensor matched_prefix_lens;
+  torch::Tensor mtgr_segment_offsets_i32;
+  torch::Tensor mtgr_segment_rules_i32;
+  torch::Tensor mtgr_q_seq_starts_i32;
+  torch::Tensor mtgr_matched_prefix_lens_i32;
+  layer::MTGRMatchMode mtgr_match_mode{};
 
   MtgrModelInputParams to(const c10::Device& device) const {
     MtgrModelInputParams result = *this;
-    result.history_lens = safe_to(history_lens, device, true);
-    result.context_lens = safe_to(context_lens, device, true);
-    result.real_time_lens = safe_to(real_time_lens, device, true);
-    result.target_lens = safe_to(target_lens, device, true);
-    result.matched_prefix_lens = safe_to(matched_prefix_lens, device, true);
+    result.mtgr_segment_offsets_i32 =
+        safe_to(mtgr_segment_offsets_i32, device, true);
+    result.mtgr_segment_rules_i32 =
+        safe_to(mtgr_segment_rules_i32, device, true);
+    result.mtgr_q_seq_starts_i32 = safe_to(mtgr_q_seq_starts_i32, device, true);
+    result.mtgr_matched_prefix_lens_i32 =
+        safe_to(mtgr_matched_prefix_lens_i32, device, true);
     return result;
   }
 
   void print() const {
-    if (history_lens.defined()) {
-      LOG(INFO) << " MtgrModelInputParams history_lens shape: "
-                << history_lens.sizes();
+    if (mtgr_segment_offsets_i32.defined()) {
+      LOG(INFO) << " MtgrModelInputParams mtgr_segment_offsets_i32 shape: "
+                << mtgr_segment_offsets_i32.sizes();
     }
-    if (context_lens.defined()) {
-      LOG(INFO) << " MtgrModelInputParams context_lens shape: "
-                << context_lens.sizes();
+    if (mtgr_segment_rules_i32.defined()) {
+      LOG(INFO) << " MtgrModelInputParams mtgr_segment_rules_i32 shape: "
+                << mtgr_segment_rules_i32.sizes();
     }
-    if (real_time_lens.defined()) {
-      LOG(INFO) << " MtgrModelInputParams real_time_lens shape: "
-                << real_time_lens.sizes();
+    if (mtgr_q_seq_starts_i32.defined()) {
+      LOG(INFO) << " MtgrModelInputParams mtgr_q_seq_starts_i32 shape: "
+                << mtgr_q_seq_starts_i32.sizes();
     }
-    if (target_lens.defined()) {
-      LOG(INFO) << " MtgrModelInputParams target_lens shape: "
-                << target_lens.sizes();
+    if (mtgr_matched_prefix_lens_i32.defined()) {
+      LOG(INFO)
+          << " MtgrModelInputParams mtgr_matched_prefix_lens_i32 shape: "
+          << mtgr_matched_prefix_lens_i32.sizes();
     }
-    if (matched_prefix_lens.defined()) {
-      LOG(INFO) << " MtgrModelInputParams matched_prefix_lens shape: "
-                << matched_prefix_lens.sizes();
-    }
+    LOG(INFO) << " MtgrModelInputParams mtgr_match_mode: "
+              << static_cast<int32_t>(mtgr_match_mode);
   }
 };
 
