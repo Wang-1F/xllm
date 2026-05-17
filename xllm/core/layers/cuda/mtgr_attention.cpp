@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "kernels/cuda/mtgr_hopper_attention_runtime.h"
 #include "kernels/cuda/tests/mtgr_attenion_test.h"
+#include "util/mtgr_nvtx.h"
 #include "util/mtgr_trace.h"
 
 namespace xllm {
@@ -117,6 +118,7 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
                            torch::Tensor& value,
                            KVCache& kv_cache) {
   if (backend_ == MTGRAttentionBackend::kFused) {
+    MTGR_NVTX_RANGE(1, "MTGR/attention/fused");
     std::optional<torch::Tensor> output_lse = std::nullopt;
     if (attn_metadata.is_dummy) {
       return {torch::empty_like(query), output_lse};
@@ -130,17 +132,22 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
                   << " match_mode="
                   << static_cast<int32_t>(attn_metadata.mtgr_match_mode)
                   << " max_seq_len=" << attn_metadata.max_seq_len;
-    auto query_snd =
-        query.view({total_q, num_heads_, head_size_}).contiguous();
-    auto key_snd = key.view({total_q, num_kv_heads_, head_size_});
-    auto value_snd = value.view({total_q, num_kv_heads_, head_size_});
-    if (num_kv_heads_ != num_heads_) {
-      const int64_t repeat_factor = num_heads_ / num_kv_heads_;
-      key_snd = key_snd.repeat_interleave(repeat_factor, 1);
-      value_snd = value_snd.repeat_interleave(repeat_factor, 1);
+    torch::Tensor query_snd;
+    torch::Tensor key_snd;
+    torch::Tensor value_snd;
+    {
+      MTGR_NVTX_RANGE(2, "MTGR/attention/prepare_qkv_snd");
+      query_snd = query.view({total_q, num_heads_, head_size_}).contiguous();
+      key_snd = key.view({total_q, num_kv_heads_, head_size_});
+      value_snd = value.view({total_q, num_kv_heads_, head_size_});
+      if (num_kv_heads_ != num_heads_) {
+        const int64_t repeat_factor = num_heads_ / num_kv_heads_;
+        key_snd = key_snd.repeat_interleave(repeat_factor, 1);
+        value_snd = value_snd.repeat_interleave(repeat_factor, 1);
+      }
+      key_snd = key_snd.contiguous();
+      value_snd = value_snd.contiguous();
     }
-    key_snd = key_snd.contiguous();
-    value_snd = value_snd.contiguous();
     auto output_snd = torch::empty_like(query_snd);
     auto key_cache = kv_cache.get_k_cache();
     auto value_cache = kv_cache.get_v_cache();
@@ -159,22 +166,25 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
                   << " matched_prefix_lens="
                   << attn_metadata.mtgr_matched_prefix_lens_i32.sizes();
 
-    kernel::cuda::mtgr_ragged_segment_attention_hopper_unified_cuda(
-        query_snd,
-        key_snd,
-        value_snd,
-        attn_metadata.mtgr_segment_offsets_i32,
-        attn_metadata.mtgr_segment_rules_i32,
-        attn_metadata.mtgr_q_seq_starts_i32,
-        attn_metadata.mtgr_matched_prefix_lens_i32,
-        static_cast<int64_t>(attn_metadata.mtgr_match_mode),
-        key_cache,
-        value_cache,
-        attn_metadata.block_table,
-        block_size,
-        attn_metadata.max_seq_len,
-        scale_,
-        output_snd);
+    {
+      MTGR_NVTX_RANGE(1, "MTGR/kernel/hopper_unified_call");
+      kernel::cuda::mtgr_ragged_segment_attention_hopper_unified_cuda(
+          query_snd,
+          key_snd,
+          value_snd,
+          attn_metadata.mtgr_segment_offsets_i32,
+          attn_metadata.mtgr_segment_rules_i32,
+          attn_metadata.mtgr_q_seq_starts_i32,
+          attn_metadata.mtgr_matched_prefix_lens_i32,
+          static_cast<int64_t>(attn_metadata.mtgr_match_mode),
+          key_cache,
+          value_cache,
+          attn_metadata.block_table,
+          block_size,
+          attn_metadata.max_seq_len,
+          scale_,
+          output_snd);
+    }
 
     last_metrics_ = MTGRAttentionMetrics{};
     MTGR_TRACE(1) << "[ATTN] mtgr_attention fused end output_shape="

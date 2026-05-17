@@ -45,6 +45,7 @@ limitations under the License.
 #include "framework/sampling/rec_sampler.h"
 #include "models/model_registry.h"
 #include "util/env_var.h"
+#include "util/mtgr_nvtx.h"
 #include "util/mtgr_trace.h"
 #include "util/timer.h"
 
@@ -490,6 +491,7 @@ void RecWorkerImpl::LlmRecWithMmDataWorkPipeline::prepare_work_before_execute(
 
 ForwardInput RecWorkerImpl::RecPrefillOnlyWorkPipeline::prepare_inputs(
     Batch& batch) {
+  MTGR_NVTX_RANGE(1, "MTGR/worker/prepare_inputs");
   MTGR_TRACE(1) << "[WORKER] prepare_inputs begin";
   ThreadPool* thread_pool =
       runtime_.worker.input_builder_thread_pool_
@@ -511,6 +513,7 @@ ForwardInput RecWorkerImpl::RecPrefillOnlyWorkPipeline::prepare_inputs(
 
 std::optional<ForwardOutput> RecWorkerImpl::RecPrefillOnlyWorkPipeline::step(
     const ForwardInput& input) {
+  MTGR_NVTX_RANGE(1, "MTGR/worker/step");
   Timer timer;
   runtime_.worker.device_.set_device();
   MTGR_TRACE(1) << "[WORKER] step begin token_ids="

@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "layers/common/attention_metadata.h"
 #include "framework/request/sequence.h"
+#include "util/mtgr_nvtx.h"
 #include "util/mtgr_trace.h"
 
 namespace xllm {
@@ -73,6 +74,7 @@ RecPrefillOnlyBatchInputBuilder::RecPrefillOnlyBatchInputBuilder(
 ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
     uint32_t num_decoding_tokens,
     uint32_t min_decoding_batch_size) {
+  MTGR_NVTX_RANGE(1, "MTGR/batch/build_rec_forward_input");
   std::vector<Sequence*> sequences;
   std::vector<uint32_t> effective_allowed_max_tokens;
   std::vector<torch::Tensor> trimmed_embeddings;
@@ -180,8 +182,12 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
                             batch_forward_type_,
                             /*cp_size=*/1,
                             thread_pool_);
-  ForwardInput forward_input =
-      builder.build_forward_input(num_decoding_tokens, min_decoding_batch_size);
+  ForwardInput forward_input;
+  {
+    MTGR_NVTX_RANGE(2, "MTGR/batch/base_build_forward_input");
+    forward_input =
+        builder.build_forward_input(num_decoding_tokens, min_decoding_batch_size);
+  }
 
   auto& mtgr_params = forward_input.input_params.mutable_mtgr_params();
   mtgr_params.mtgr_segment_offsets_i32 =

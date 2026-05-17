@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/layers/common/dense_mlp.h"
 #include "core/layers/common/qwen3_next_rms_norm.h"
 #include "core/layers/mtgr_decoder_layer.h"
+#include "core/util/mtgr_nvtx.h"
 #include "core/util/mtgr_trace.h"
 #include "models/model_registry.h"
 
@@ -85,6 +86,7 @@ class MTGRModelImpl : public torch::nn::Module {
                       const torch::Tensor& positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) {
+    MTGR_NVTX_RANGE(1, "MTGR/model/forward");
     torch::NoGradGuard no_grad;
     (void)tokens;
 
@@ -98,6 +100,7 @@ class MTGRModelImpl : public torch::nn::Module {
 
     torch::Tensor h;
     if (has_input_embedding) {
+      MTGR_NVTX_RANGE(2, "MTGR/model/use_input_embedding");
       h = input_params.input_embedding;
       if (h.device() != device_) {
         h = h.to(device_);
@@ -106,14 +109,18 @@ class MTGRModelImpl : public torch::nn::Module {
         h = h.to(dtype_);
       }
     } else {
+      MTGR_NVTX_RANGE(2, "MTGR/model/fake_embedding_lookup");
       h = fake_input_embedding_lookup(mtgr_params->mtgr_input_token_ids_i64);
     }
     MTGR_TRACE(1) << "[MODEL] hidden_states_ready shape=" << h.sizes()
                   << " dtype=" << h.scalar_type()
                   << " device=" << h.device();
 
-    auto attn_metadata = layer::AttentionMetadataBuilder::build(
-        input_params, model_args_, build_attention_mask(input_params));
+    auto attn_metadata = [&]() {
+      MTGR_NVTX_RANGE(2, "MTGR/model/build_attention_metadata");
+      return layer::AttentionMetadataBuilder::build(
+          input_params, model_args_, build_attention_mask(input_params));
+    }();
     MTGR_TRACE(2) << "[MODEL] attention_metadata mtgr_match_mode="
                   << static_cast<int32_t>(attn_metadata.mtgr_match_mode)
                   << " segment_offsets="
@@ -124,6 +131,7 @@ class MTGRModelImpl : public torch::nn::Module {
                   << attn_metadata.mtgr_matched_prefix_lens_i32.sizes()
                   << " block_table=" << attn_metadata.block_table.sizes();
     for (size_t i = 0; i < layers_.size(); ++i) {
+      MTGR_NVTX_RANGE(2, "MTGR/model/layer");
       MTGR_TRACE(2) << "[MODEL] layer_begin index=" << i
                     << " hidden_shape=" << h.sizes();
       h = layers_[i]->forward(
@@ -132,8 +140,11 @@ class MTGRModelImpl : public torch::nn::Module {
                     << " hidden_shape=" << h.sizes();
     }
 
-    h = norm_(h);
-    h = post_mlp_(h);
+    {
+      MTGR_NVTX_RANGE(2, "MTGR/model/final_norm_mlp");
+      h = norm_(h);
+      h = post_mlp_(h);
+    }
     MTGR_TRACE(1) << "[MODEL] forward end output_shape=" << h.sizes()
                   << " dtype=" << h.scalar_type();
     return ModelOutput(h);

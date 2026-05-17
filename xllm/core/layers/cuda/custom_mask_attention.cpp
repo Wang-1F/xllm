@@ -18,6 +18,7 @@ limitations under the License.
 #include <cmath>
 #include <tuple>
 
+#include "core/util/mtgr_nvtx.h"
 #include "core/util/mtgr_trace.h"
 
 namespace xllm {
@@ -90,10 +91,15 @@ torch::Tensor CustomMaskAttentionImpl::forward(
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache) {
+  MTGR_NVTX_RANGE(2, "MTGR/attention/custom_mask_forward");
   MTGR_TRACE(2) << "[ATTN] custom_mask forward begin layer=" << layer_id_
                 << " hidden_shape=" << hidden_states.sizes()
                 << " positions_shape=" << positions.sizes();
-  auto qkv = qkv_proj_->forward(hidden_states);
+  torch::Tensor qkv;
+  {
+    MTGR_NVTX_RANGE(2, "MTGR/attention/qkv_proj");
+    qkv = qkv_proj_->forward(hidden_states);
+  }
   MTGR_TRACE(2) << "[ATTN] qkv_proj done layer=" << layer_id_
                 << " qkv_shape=" << qkv.sizes();
   auto q = qkv.slice(/*dim=*/-1, 0, q_size_);
@@ -101,13 +107,16 @@ torch::Tensor CustomMaskAttentionImpl::forward(
   auto v = qkv.slice(/*dim=*/-1, q_size_ + kv_size_, q_size_ + 2 * kv_size_);
 
   const int64_t tokens = q.size(0);
-  auto q_reshaped = q.reshape({tokens, num_heads_, head_dim_});
-  auto q_normed = q_norm_->forward(q_reshaped);
-  auto k_reshaped = k.reshape({tokens, num_kv_heads_, head_dim_});
-  auto k_normed = k_norm_->forward(k_reshaped);
+  {
+    MTGR_NVTX_RANGE(2, "MTGR/attention/qk_norm");
+    auto q_reshaped = q.reshape({tokens, num_heads_, head_dim_});
+    auto q_normed = q_norm_->forward(q_reshaped);
+    auto k_reshaped = k.reshape({tokens, num_kv_heads_, head_dim_});
+    auto k_normed = k_norm_->forward(k_reshaped);
 
-  q = q_normed.view({tokens, q_size_});
-  k = k_normed.view({tokens, kv_size_});
+    q = q_normed.view({tokens, q_size_});
+    k = k_normed.view({tokens, kv_size_});
+  }
   MTGR_TRACE(2) << "[ATTN] qk_norm done layer=" << layer_id_
                 << " q_shape=" << q.sizes() << " k_shape=" << k.sizes()
                 << " v_shape=" << v.sizes();
@@ -115,10 +124,17 @@ torch::Tensor CustomMaskAttentionImpl::forward(
   // Rotary stays disabled until MTGR finalizes the position contract for
   // prefix-cache-trimmed live tokens in the production path.
   (void)positions;
-  auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
+  torch::Tensor out;
+  {
+    MTGR_NVTX_RANGE(2, "MTGR/attention/core");
+    out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
+  }
   MTGR_TRACE(2) << "[ATTN] core attention done layer=" << layer_id_
                 << " out_shape=" << out.sizes();
-  out = o_proj_->forward(out);
+  {
+    MTGR_NVTX_RANGE(2, "MTGR/attention/o_proj");
+    out = o_proj_->forward(out);
+  }
   MTGR_TRACE(2) << "[ATTN] custom_mask forward end layer=" << layer_id_
                 << " out_shape=" << out.sizes();
   return out;

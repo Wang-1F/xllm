@@ -17,6 +17,7 @@ void mtgr_ragged_segment_attention_hopper_unified_research_cuda(
     int64_t max_request_len,
     double sm_scale,
     torch::Tensor output_snd) {
+  MTGR_NVTX_RANGE(1, "MTGR/kernel/unified_entry");
   MTGR_TRACE(1) << "[KERNEL] unified_entry begin match_mode=" << match_mode
                 << " total_live_q=" << query_snd.size(0)
                 << " max_request_len=" << max_request_len
@@ -33,6 +34,7 @@ void mtgr_ragged_segment_attention_hopper_unified_research_cuda(
   // Preserve the no_match fast path: dispatch mode is explicit and does not
   // depend on whether cache tensors are defined.
   if (match_mode == 0) {
+    MTGR_NVTX_RANGE(1, "MTGR/kernel/no_match_dense_tma");
     MTGR_TRACE(1) << "[KERNEL] unified_entry route=no_match_dense_tma";
     mtgr_ragged_segment_attention_hopper_research_cuda(query_snd,
                                                        key_snd,
@@ -49,6 +51,9 @@ void mtgr_ragged_segment_attention_hopper_unified_research_cuda(
       match_mode == 2
           ? dispatch_mtgr_ragged_segment_attention_hopper_unified_mixed
           : dispatch_mtgr_ragged_segment_attention_hopper_unified_partial_only;
+  MTGR_NVTX_RANGE(1,
+                  match_mode == 2 ? "MTGR/kernel/mixed"
+                                  : "MTGR/kernel/partial_only");
   MTGR_TRACE(1) << "[KERNEL] unified_entry route="
                 << (match_mode == 2 ? "mixed" : "partial_only");
   dispatch_unified(query_snd,

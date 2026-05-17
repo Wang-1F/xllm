@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
 #include "core/framework/request/request_output.h"
+#include "core/util/mtgr_nvtx.h"
 #include "core/util/mtgr_trace.h"
 
 #ifdef likely
@@ -220,6 +221,7 @@ RecCompletionServiceImpl::RecCompletionServiceImpl(
 
 void RecCompletionServiceImpl::process_async_impl(
     std::shared_ptr<CompletionCall> call) {
+  MTGR_NVTX_RANGE(1, "MTGR/API/process_async");
   const auto& rpc_request = call->request();
 
   // check if model is supported
@@ -290,6 +292,7 @@ void RecCompletionServiceImpl::process_async_impl(
        request_id = saved_request_id,
        created_time = absl::ToUnixSeconds(absl::Now())](
           const RequestOutput& req_output) -> bool {
+        MTGR_NVTX_RANGE(2, "MTGR/API/callback");
         MTGR_TRACE(1) << "[API] callback request_id=" << request_id
                       << " finished=" << req_output.finished
                       << " cancelled=" << req_output.cancelled

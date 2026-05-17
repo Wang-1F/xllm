@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "mtgr_hopper_attention_runtime.h"
 
+#include "core/util/mtgr_nvtx.h"
+
 // Reuse the physically split Hopper research implementation while exposing a
 // production-facing wrapper symbol from a non-test TU.
 #include "tests/mtgr_ragged_hopper_attention_kernel.cu"
@@ -37,6 +39,7 @@ void mtgr_ragged_segment_attention_hopper_unified_cuda(
     int64_t max_request_len,
     double sm_scale,
     torch::Tensor output_snd) {
+  MTGR_NVTX_RANGE(1, "MTGR/kernel/runtime_wrapper");
   MTGR_TRACE(2) << "[KERNEL] runtime_wrapper begin match_mode=" << match_mode
                 << " query=" << query_snd.sizes()
                 << " key_cache=" << key_cache.sizes()

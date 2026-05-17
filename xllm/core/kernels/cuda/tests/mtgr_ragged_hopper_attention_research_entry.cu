@@ -9,6 +9,7 @@ void mtgr_ragged_segment_attention_hopper_research_cuda(
     int64_t max_request_len,
     double sm_scale,
     torch::Tensor output_snd) {
+  MTGR_NVTX_RANGE(1, "MTGR/kernel/dense_research_entry");
   MTGR_TRACE(1) << "[KERNEL] dense_research_entry begin total_q="
                 << query_snd.size(0) << " max_request_len=" << max_request_len
                 << " head_dim=" << query_snd.size(2);

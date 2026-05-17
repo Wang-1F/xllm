@@ -35,6 +35,7 @@ limitations under the License.
 #include <cute/tensor.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 
+#include "core/util/mtgr_nvtx.h"
 #include "core/util/mtgr_trace.h"
 
 #include "../../../../../third_party/cutlass/examples/88_hopper_fmha/collective/fmha_collective_softmax.hpp"
@@ -2702,6 +2703,10 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel(
     int64_t max_request_len,
     double sm_scale,
     torch::Tensor output_snd) {
+  MTGR_NVTX_RANGE(
+      2,
+      AllowMixedRequests ? "MTGR/kernel/unified_launch_mixed"
+                         : "MTGR/kernel/unified_launch_partial");
   const int total_live_q = static_cast<int>(query_snd.size(0));
   const int num_heads = static_cast<int>(query_snd.size(1));
   const int num_kv_cache_heads = static_cast<int>(key_cache.size(2));
@@ -2881,6 +2886,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk_kernel(
     int64_t max_request_len,
     double sm_scale,
     torch::Tensor output_snd) {
+  MTGR_NVTX_RANGE(2, "MTGR/kernel/dense_tma_launch");
   constexpr int kKvTile = kHopperWgmmaKvTile;
   constexpr int kTmaStages = 2;
   constexpr bool kUseDirectTmaKey = kHopperWgmmaDirectTmaKey;
@@ -3075,6 +3081,7 @@ void dispatch_mtgr_ragged_segment_attention_hopper_unified_impl(
     int64_t max_request_len,
     double sm_scale,
     torch::Tensor output_snd) {
+  MTGR_NVTX_RANGE(2, "MTGR/kernel/unified_dispatch");
   c10::cuda::CUDAGuard device_guard(query_snd.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   CHECK_GE(props->major, 9)
@@ -3202,6 +3209,7 @@ void dispatch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk(
     int64_t max_request_len,
     double sm_scale,
     torch::Tensor output_snd) {
+  MTGR_NVTX_RANGE(2, "MTGR/kernel/dense_tma_dispatch");
   c10::cuda::CUDAGuard device_guard(query_snd.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   CHECK_GE(props->major, 9)

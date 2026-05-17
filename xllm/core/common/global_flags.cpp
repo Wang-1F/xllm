@@ -551,6 +551,12 @@ DEFINE_int32(mtgr_trace_log_level,
              "request/batch/attention summaries, 2 logs tensor shapes and "
              "kernel dispatch details.");
 
+DEFINE_int32(mtgr_nvtx_level,
+             0,
+             "MTGR NVTX range level. 0 disables MTGR NVTX ranges, 1 marks "
+             "request/batch/model/attention/kernel route scopes, 2 also marks "
+             "layer-level and projection/layout sub-scopes.");
+
 // --- reasoning parser config ---
 
 DEFINE_string(reasoning_parser,

@@ -32,6 +32,7 @@ limitations under the License.
 #include "framework/request/rec_type.h"
 #include "master.h"  // For MasterStatus::WAKEUP constant
 #include "util/env_var.h"
+#include "util/mtgr_nvtx.h"
 #include "util/net.h"
 #include "util/pretty_print.h"
 #include "util/timer.h"
@@ -1090,6 +1091,7 @@ ForwardOutput RecEngine::RecPrefillOnlyEnginePipeline::step(
     return {};
   }
 
+  MTGR_NVTX_RANGE(1, "MTGR/engine/rec_prefill_step");
   MTGR_TRACE(1) << "[ENGINE] rec_prefill_step begin batches="
                 << batches.size();
   Timer timer;
@@ -1126,6 +1128,7 @@ ForwardOutput RecEngine::RecPrefillOnlyEnginePipeline::step(
 
 ForwardOutput RecEngine::RecPrefillOnlyEnginePipeline::get_model_output(
     const ForwardInput& model_inputs) {
+  MTGR_NVTX_RANGE(2, "MTGR/engine/get_model_output");
   MTGR_TRACE(1) << "[ENGINE] get_model_output begin workers="
                 << engine_.workers_.size();
   std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;

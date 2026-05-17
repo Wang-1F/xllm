@@ -36,6 +36,7 @@ limitations under the License.
 #include "rec_engine.h"
 #include "runtime/xservice_client.h"
 #include "scheduler/scheduler_factory.h"
+#include "util/mtgr_nvtx.h"
 #include "util/scope_guard.h"
 #include "util/mtgr_trace.h"
 #include "util/threadpool.h"
@@ -356,6 +357,7 @@ void process_mtgr_inputs(
     std::vector<int32_t>* local_prompt_tokens,
     torch::Tensor* input_embedding,
     MMData* processed_mm_data) {
+  MTGR_NVTX_RANGE(1, "MTGR/master/process_inputs");
   MTGR_TRACE(1) << "[MASTER] process_mtgr_inputs begin tensor_count="
                 << input_tensors->size();
 

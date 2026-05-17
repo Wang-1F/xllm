@@ -74,7 +74,8 @@ const OptionCategory kMultiStepDecodeOptions = {
     "MULTI-STEP DECODE OPTIONS",
     {"max_decode_rounds", "beam_width"}};
 
-const OptionCategory kMtgrOptions = {"MTGR OPTIONS", {"mtgr_trace_log_level"}};
+const OptionCategory kMtgrOptions = {
+    "MTGR OPTIONS", {"mtgr_trace_log_level", "mtgr_nvtx_level"}};
 
 const OptionCategory kMtpOptions = {"SPECULATIVE OPTIONS",
                                     {"draft_model",
