@@ -152,11 +152,6 @@ void Request::handle_last_token() {
 
 RequestOutput Request::generate_output(const Tokenizer& tokenizer,
                                        ThreadPool* thread_pool) {
-  LOG(INFO) << "[MTGR_TRACE][REQUEST] generate_output begin request_id="
-            << request_id_ << " seq_count=" << sequences().size()
-            << " prompt_tokens=" << state_.prompt_tokens.size()
-            << " stream=" << state_.stream
-            << " is_embeddings=" << state_.sampling_param.is_embeddings;
   // summarize statistics for all sequences
   Usage usage;
   usage.num_prompt_tokens = state_.prompt_tokens.size();
@@ -168,10 +163,6 @@ RequestOutput Request::generate_output(const Tokenizer& tokenizer,
     }
   }
   usage.num_total_tokens = usage.num_prompt_tokens + usage.num_generated_tokens;
-  LOG(INFO) << "[MTGR_TRACE][REQUEST] usage request_id=" << request_id_
-            << " prompt=" << usage.num_prompt_tokens
-            << " generated=" << usage.num_generated_tokens
-            << " total=" << usage.num_total_tokens;
 
   RequestOutput output;
   output.request_id = request_id_;
@@ -181,14 +172,7 @@ RequestOutput Request::generate_output(const Tokenizer& tokenizer,
   output.status = Status(StatusCode::OK);
   output.finished = finished();
   output.cancelled = cancelled();
-  LOG(INFO) << "[MTGR_TRACE][REQUEST] before sequences_group.generate_outputs "
-               "request_id="
-            << request_id_ << " finished=" << output.finished
-            << " cancelled=" << output.cancelled;
   sequences_group_->generate_outputs(output.outputs, tokenizer, thread_pool);
-  LOG(INFO) << "[MTGR_TRACE][REQUEST] after sequences_group.generate_outputs "
-               "request_id="
-            << request_id_ << " outputs=" << output.outputs.size();
   return output;
 }
 

@@ -171,6 +171,12 @@ torch::Dtype convert_rec_type_to_torch(proto::DataType data_type) {
     case proto::DataType::INT16:
       return torch::kInt16;
 
+    case proto::DataType::INT32:
+      return torch::kInt32;
+
+    case proto::DataType::INT64:
+      return torch::kInt64;
+
     default:
       throw std::runtime_error("Unsupported data type: " +
                                std::to_string(static_cast<int>(data_type)));

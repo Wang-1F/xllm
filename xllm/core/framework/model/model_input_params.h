@@ -154,6 +154,7 @@ struct MtgrModelInputParams {
   torch::Tensor mtgr_segment_rules_i32;
   torch::Tensor mtgr_q_seq_starts_i32;
   torch::Tensor mtgr_matched_prefix_lens_i32;
+  torch::Tensor mtgr_input_token_ids_i64;
   layer::MTGRMatchMode mtgr_match_mode{};
 
   MtgrModelInputParams to(const c10::Device& device) const {
@@ -165,29 +166,9 @@ struct MtgrModelInputParams {
     result.mtgr_q_seq_starts_i32 = safe_to(mtgr_q_seq_starts_i32, device, true);
     result.mtgr_matched_prefix_lens_i32 =
         safe_to(mtgr_matched_prefix_lens_i32, device, true);
+    result.mtgr_input_token_ids_i64 =
+        safe_to(mtgr_input_token_ids_i64, device, true);
     return result;
-  }
-
-  void print() const {
-    if (mtgr_segment_offsets_i32.defined()) {
-      LOG(INFO) << " MtgrModelInputParams mtgr_segment_offsets_i32 shape: "
-                << mtgr_segment_offsets_i32.sizes();
-    }
-    if (mtgr_segment_rules_i32.defined()) {
-      LOG(INFO) << " MtgrModelInputParams mtgr_segment_rules_i32 shape: "
-                << mtgr_segment_rules_i32.sizes();
-    }
-    if (mtgr_q_seq_starts_i32.defined()) {
-      LOG(INFO) << " MtgrModelInputParams mtgr_q_seq_starts_i32 shape: "
-                << mtgr_q_seq_starts_i32.sizes();
-    }
-    if (mtgr_matched_prefix_lens_i32.defined()) {
-      LOG(INFO)
-          << " MtgrModelInputParams mtgr_matched_prefix_lens_i32 shape: "
-          << mtgr_matched_prefix_lens_i32.sizes();
-    }
-    LOG(INFO) << " MtgrModelInputParams mtgr_match_mode: "
-              << static_cast<int32_t>(mtgr_match_mode);
   }
 };
 
@@ -495,9 +476,6 @@ struct ModelInputParams {
     if (const auto* onerec = onerec_params()) {
       LOG(INFO) << "ModelInputParams: has onerec_params";
       onerec->print();
-    } else if (const auto* mtgr = mtgr_params()) {
-      LOG(INFO) << "ModelInputParams: has mtgr_params";
-      mtgr->print();
     } else if (const auto* llmrec = llmrec_params()) {
       LOG(INFO) << "ModelInputParams: has llm_rec_multi_round_params"
                 << ", beam_width=" << llmrec->beam_width

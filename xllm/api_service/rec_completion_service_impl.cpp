@@ -21,7 +21,6 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
-#include <sstream>
 #include <string>
 
 #include "common/global_flags.h"
@@ -30,6 +29,7 @@ limitations under the License.
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
 #include "core/framework/request/request_output.h"
+#include "core/util/mtgr_trace.h"
 
 #ifdef likely
 #undef likely
@@ -44,19 +44,6 @@ limitations under the License.
 namespace xllm {
 namespace {
 constexpr const char* kRecResultTensorName = "rec_result";
-
-std::string format_infer_tensor_shape(const proto::InferInputTensor& tensor) {
-  std::ostringstream oss;
-  oss << "[";
-  for (int i = 0; i < tensor.shape_size(); ++i) {
-    if (i > 0) {
-      oss << ", ";
-    }
-    oss << tensor.shape(i);
-  }
-  oss << "]";
-  return oss.str();
-}
 
 void initialize_response(const std::string& request_id,
                          int64_t created_time,
@@ -237,6 +224,10 @@ void RecCompletionServiceImpl::process_async_impl(
 
   // check if model is supported
   const auto& model = rpc_request.model();
+  MTGR_TRACE(1) << "[API] process_async begin model=" << model
+                << " input_tensors=" << rpc_request.input_tensors_size()
+                << " token_ids=" << rpc_request.token_ids_size()
+                << " stream=" << rpc_request.stream();
   if (unlikely(!models_.contains(model))) {
     call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
     return;
@@ -280,29 +271,12 @@ void RecCompletionServiceImpl::process_async_impl(
     input_tensors = std::move(tensors);
   }
 
-  LOG(INFO) << "[MTGR_TRACE][API] request_id=" << request_params.request_id
-            << " model=" << model
-            << " has_routing=" << rpc_request.has_routing()
-            << " token_ids_size=" << rpc_request.token_ids_size()
-            << " input_tensors_size=" << rpc_request_ref.input_tensors_size()
-            << " prompt_chars=" << rpc_request_ref.prompt().size();
-  if (input_tensors.has_value()) {
-    for (size_t i = 0; i < input_tensors->size(); ++i) {
-      const auto& t = (*input_tensors)[i];
-      LOG(INFO) << "[MTGR_TRACE][API] tensor[" << i << "] name=" << t.name()
-                << " dtype=" << proto::DataType_Name(t.data_type())
-                << " shape=" << format_infer_tensor_shape(t)
-                << " has_contents=" << t.has_contents()
-                << " fp32_size=" << t.contents().fp32_contents_size()
-                << " int_size=" << t.contents().int_contents_size()
-                << " int64_size=" << t.contents().int64_contents_size()
-                << " bool_size=" << t.contents().bool_contents_size();
-    }
-  }
-
   // schedule the request
   auto saved_streaming = request_params.streaming;
   auto saved_request_id = request_params.request_id;
+  MTGR_TRACE(1) << "[API] dispatch_to_master request_id=" << saved_request_id
+                << " has_prompt_tokens=" << prompt_tokens.has_value()
+                << " has_input_tensors=" << input_tensors.has_value();
   master_->handle_request(
       std::move(rpc_request_ref.prompt()),
       std::move(prompt_tokens),
@@ -316,6 +290,11 @@ void RecCompletionServiceImpl::process_async_impl(
        request_id = saved_request_id,
        created_time = absl::ToUnixSeconds(absl::Now())](
           const RequestOutput& req_output) -> bool {
+        MTGR_TRACE(1) << "[API] callback request_id=" << request_id
+                      << " finished=" << req_output.finished
+                      << " cancelled=" << req_output.cancelled
+                      << " outputs=" << req_output.outputs.size()
+                      << " has_usage=" << req_output.usage.has_value();
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {

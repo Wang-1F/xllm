@@ -37,6 +37,10 @@ void mtgr_ragged_segment_attention_hopper_unified_cuda(
     int64_t max_request_len,
     double sm_scale,
     torch::Tensor output_snd) {
+  MTGR_TRACE(2) << "[KERNEL] runtime_wrapper begin match_mode=" << match_mode
+                << " query=" << query_snd.sizes()
+                << " key_cache=" << key_cache.sizes()
+                << " block_table=" << block_table_i32.sizes();
   mtgr_ragged_segment_attention_hopper_unified_research_cuda(query_snd,
                                                              key_snd,
                                                              value_snd,

@@ -15,13 +15,12 @@ limitations under the License.
 
 #include "mtgr_attention.h"
 
-#include <glog/logging.h>
-
 #include <memory>
 #include <utility>
 
 #include "kernels/cuda/mtgr_hopper_attention_runtime.h"
 #include "kernels/cuda/tests/mtgr_attenion_test.h"
+#include "util/mtgr_trace.h"
 
 namespace xllm {
 namespace layer {
@@ -37,7 +36,6 @@ kernel::cuda::test::MTGRAttentionTestBackend to_kernel_backend(
     case MTGRAttentionBackend::kFused:
       return kernel::cuda::test::MTGRAttentionTestBackend::kFusedNoMatch;
   }
-  CHECK(false) << "Unsupported MTGR backend";
   return kernel::cuda::test::MTGRAttentionTestBackend::kFusedNoMatch;
 }
 
@@ -118,27 +116,48 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
                            torch::Tensor& key,
                            torch::Tensor& value,
                            KVCache& kv_cache) {
-  CHECK(impl_ != nullptr)
-      << "MTGRAttentionImpl is not initialized with valid attention dims";
-  if (backend_ == MTGRAttentionBackend::kFused &&
-      attn_metadata.mtgr_segment_offsets_i32.defined()) {
+  if (backend_ == MTGRAttentionBackend::kFused) {
     std::optional<torch::Tensor> output_lse = std::nullopt;
     if (attn_metadata.is_dummy) {
       return {torch::empty_like(query), output_lse};
     }
 
     const int64_t total_q = query.size(0);
+    MTGR_TRACE(1) << "[ATTN] mtgr_attention fused begin total_q=" << total_q
+                  << " num_heads=" << num_heads_
+                  << " num_kv_heads=" << num_kv_heads_
+                  << " head_size=" << head_size_
+                  << " match_mode="
+                  << static_cast<int32_t>(attn_metadata.mtgr_match_mode)
+                  << " max_seq_len=" << attn_metadata.max_seq_len;
     auto query_snd =
         query.view({total_q, num_heads_, head_size_}).contiguous();
-    auto key_snd =
-        key.view({total_q, num_kv_heads_, head_size_}).contiguous();
-    auto value_snd =
-        value.view({total_q, num_kv_heads_, head_size_}).contiguous();
+    auto key_snd = key.view({total_q, num_kv_heads_, head_size_});
+    auto value_snd = value.view({total_q, num_kv_heads_, head_size_});
+    if (num_kv_heads_ != num_heads_) {
+      const int64_t repeat_factor = num_heads_ / num_kv_heads_;
+      key_snd = key_snd.repeat_interleave(repeat_factor, 1);
+      value_snd = value_snd.repeat_interleave(repeat_factor, 1);
+    }
+    key_snd = key_snd.contiguous();
+    value_snd = value_snd.contiguous();
     auto output_snd = torch::empty_like(query_snd);
     auto key_cache = kv_cache.get_k_cache();
     auto value_cache = kv_cache.get_v_cache();
-    const int64_t block_size =
-        key_cache.defined() && key_cache.dim() > 1 ? key_cache.size(1) : 1;
+    const int64_t block_size = key_cache.size(1);
+    MTGR_TRACE(2) << "[ATTN] mtgr_attention launch_shapes query_snd="
+                  << query_snd.sizes() << " key_snd=" << key_snd.sizes()
+                  << " value_snd=" << value_snd.sizes()
+                  << " key_cache=" << key_cache.sizes()
+                  << " value_cache=" << value_cache.sizes()
+                  << " block_table=" << attn_metadata.block_table.sizes()
+                  << " block_size=" << block_size
+                  << " segment_offsets="
+                  << attn_metadata.mtgr_segment_offsets_i32.sizes()
+                  << " q_seq_starts="
+                  << attn_metadata.mtgr_q_seq_starts_i32.sizes()
+                  << " matched_prefix_lens="
+                  << attn_metadata.mtgr_matched_prefix_lens_i32.sizes();
 
     kernel::cuda::mtgr_ragged_segment_attention_hopper_unified_cuda(
         query_snd,
@@ -158,6 +177,8 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
         output_snd);
 
     last_metrics_ = MTGRAttentionMetrics{};
+    MTGR_TRACE(1) << "[ATTN] mtgr_attention fused end output_shape="
+                  << output_snd.sizes();
     return {output_snd.view({total_q, num_heads_ * head_size_}).contiguous(),
             output_lse};
   }

@@ -545,6 +545,12 @@ DEFINE_bool(
     "When enabled, missing per-token logprobs are filled with the final "
     "beam logprob.");
 
+DEFINE_int32(mtgr_trace_log_level,
+             0,
+             "MTGR trace log level. 0 disables MTGR trace logs, 1 logs "
+             "request/batch/attention summaries, 2 logs tensor shapes and "
+             "kernel dispatch details.");
+
 // --- reasoning parser config ---
 
 DEFINE_string(reasoning_parser,

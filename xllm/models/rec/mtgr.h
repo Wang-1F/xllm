@@ -19,7 +19,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
-#include <sstream>
+#include <cmath>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/layers/common/dense_mlp.h"
 #include "core/layers/common/qwen3_next_rms_norm.h"
 #include "core/layers/mtgr_decoder_layer.h"
+#include "core/util/mtgr_trace.h"
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -87,59 +88,54 @@ class MTGRModelImpl : public torch::nn::Module {
     torch::NoGradGuard no_grad;
     (void)tokens;
 
-    auto format_torch_tensor = [](const torch::Tensor& tensor) -> std::string {
-      if (!tensor.defined()) {
-        return "undefined";
-      }
-      std::ostringstream oss;
-      oss << "shape=[";
-      for (int64_t i = 0; i < tensor.dim(); ++i) {
-        if (i > 0) {
-          oss << ", ";
-        }
-        oss << tensor.size(i);
-      }
-      oss << "], dtype=" << tensor.scalar_type()
-          << ", device=" << tensor.device();
-      return oss.str();
-    };
-
     auto local_positions = positions;
-    CHECK(input_params.input_embedding.defined())
-        << "MTGR requires input_params.input_embedding as hidden_states input.";
+    const auto* mtgr_params = input_params.mtgr_params();
+    const bool has_input_embedding = input_params.input_embedding.defined();
+    MTGR_TRACE(1) << "[MODEL] forward begin input_mode="
+                  << (has_input_embedding ? "input_embedding" : "token_ids")
+                  << " positions_shape=" << positions.sizes()
+                  << " kv_layers=" << kv_caches.size();
 
-    LOG(INFO) << "[MTGR_TRACE][MODEL] forward begin positions="
-              << format_torch_tensor(local_positions)
-              << " input_embedding="
-              << format_torch_tensor(input_params.input_embedding)
-              << " kv_caches=" << kv_caches.size();
-
-    torch::Tensor h = input_params.input_embedding;
-    if (h.device() != device_) {
-      h = h.to(device_);
+    torch::Tensor h;
+    if (has_input_embedding) {
+      h = input_params.input_embedding;
+      if (h.device() != device_) {
+        h = h.to(device_);
+      }
+      if (h.dtype() != dtype_) {
+        h = h.to(dtype_);
+      }
+    } else {
+      h = fake_input_embedding_lookup(mtgr_params->mtgr_input_token_ids_i64);
     }
-    if (h.dtype() != dtype_) {
-      h = h.to(dtype_);
-    }
+    MTGR_TRACE(1) << "[MODEL] hidden_states_ready shape=" << h.sizes()
+                  << " dtype=" << h.scalar_type()
+                  << " device=" << h.device();
 
     auto attn_metadata = layer::AttentionMetadataBuilder::build(
         input_params, model_args_, build_attention_mask(input_params));
-    LOG(INFO) << "[MTGR_TRACE][MODEL] attn_metadata built hidden=" 
-              << format_torch_tensor(h);
+    MTGR_TRACE(2) << "[MODEL] attention_metadata mtgr_match_mode="
+                  << static_cast<int32_t>(attn_metadata.mtgr_match_mode)
+                  << " segment_offsets="
+                  << attn_metadata.mtgr_segment_offsets_i32.sizes()
+                  << " q_seq_starts="
+                  << attn_metadata.mtgr_q_seq_starts_i32.sizes()
+                  << " matched_prefix_lens="
+                  << attn_metadata.mtgr_matched_prefix_lens_i32.sizes()
+                  << " block_table=" << attn_metadata.block_table.sizes();
     for (size_t i = 0; i < layers_.size(); ++i) {
-      LOG(INFO) << "[MTGR_TRACE][MODEL] layer[" << i
-                << "] input=" << format_torch_tensor(h);
+      MTGR_TRACE(2) << "[MODEL] layer_begin index=" << i
+                    << " hidden_shape=" << h.sizes();
       h = layers_[i]->forward(
           h, local_positions, attn_metadata, kv_caches[i], input_params);
-      LOG(INFO) << "[MTGR_TRACE][MODEL] layer[" << i
-                << "] output=" << format_torch_tensor(h);
+      MTGR_TRACE(2) << "[MODEL] layer_end index=" << i
+                    << " hidden_shape=" << h.sizes();
     }
 
     h = norm_(h);
-    LOG(INFO) << "[MTGR_TRACE][MODEL] after norm=" << format_torch_tensor(h);
     h = post_mlp_(h);
-    LOG(INFO) << "[MTGR_TRACE][MODEL] after post_mlp="
-              << format_torch_tensor(h);
+    MTGR_TRACE(1) << "[MODEL] forward end output_shape=" << h.sizes()
+                  << " dtype=" << h.scalar_type();
     return ModelOutput(h);
   }
 
@@ -157,6 +153,17 @@ class MTGRModelImpl : public torch::nn::Module {
   }
 
  private:
+  torch::Tensor fake_input_embedding_lookup(const torch::Tensor& token_ids) {
+    auto ids = token_ids.to(device_).to(torch::kFloat32).reshape({-1, 1});
+    auto dims = torch::arange(
+                    model_args_.hidden_size(),
+                    torch::TensorOptions().dtype(torch::kFloat32).device(device_))
+                    .reshape({1, -1});
+    const float scale =
+        1.0f / std::sqrt(static_cast<float>(model_args_.hidden_size()));
+    return (torch::sin(ids * 0.017f + dims * 0.013f) * scale).to(dtype_);
+  }
+
   torch::Tensor build_attention_mask(const ModelInputParams& input_params) {
     max_seq_len_ = std::max(input_params.kv_max_seq_len, max_seq_len_);
     if (!FLAGS_enable_chunked_prefill) {

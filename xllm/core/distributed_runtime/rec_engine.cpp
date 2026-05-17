@@ -22,7 +22,6 @@ limitations under the License.
 #include <functional>
 #include <map>
 #include <memory>
-#include <sstream>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -36,29 +35,10 @@ limitations under the License.
 #include "util/net.h"
 #include "util/pretty_print.h"
 #include "util/timer.h"
+#include "util/mtgr_trace.h"
 #include "util/utils.h"
 
 namespace xllm {
-
-namespace {
-
-std::string format_torch_tensor(const torch::Tensor& tensor) {
-  if (!tensor.defined()) {
-    return "undefined";
-  }
-  std::ostringstream oss;
-  oss << "shape=[";
-  for (int64_t i = 0; i < tensor.dim(); ++i) {
-    if (i > 0) {
-      oss << ", ";
-    }
-    oss << tensor.size(i);
-  }
-  oss << "], dtype=" << tensor.scalar_type() << ", device=" << tensor.device();
-  return oss.str();
-}
-
-}  // namespace
 
 // ============================================================
 // RecEngine Implementation
@@ -1110,13 +1090,16 @@ ForwardOutput RecEngine::RecPrefillOnlyEnginePipeline::step(
     return {};
   }
 
+  MTGR_TRACE(1) << "[ENGINE] rec_prefill_step begin batches="
+                << batches.size();
   Timer timer;
   auto forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
-  LOG(INFO) << "[MTGR_TRACE][ENGINE] step prepare_inputs token_ids="
-            << format_torch_tensor(forward_inputs.token_ids)
-            << " positions=" << format_torch_tensor(forward_inputs.positions)
-            << " input_embedding="
-            << format_torch_tensor(forward_inputs.input_params.input_embedding);
+  MTGR_TRACE(1) << "[ENGINE] prepare_inputs done token_ids="
+                << mtgr_trace_tensor_shape(forward_inputs.token_ids)
+                << " positions="
+                << mtgr_trace_tensor_shape(forward_inputs.positions)
+                << " has_mtgr_params="
+                << forward_inputs.input_params.has_mtgr_params();
   COUNTER_ADD(prepare_input_latency_microseconds, timer.elapsed_microseconds());
 
   if (!forward_inputs.token_ids.defined()) {
@@ -1124,28 +1107,27 @@ ForwardOutput RecEngine::RecPrefillOnlyEnginePipeline::step(
   }
 
   timer.reset();
-  LOG(INFO) << "[MTGR_TRACE][ENGINE] step get_model_output begin";
   auto output = get_model_output(forward_inputs);
-  LOG(INFO) << "[MTGR_TRACE][ENGINE] step get_model_output done embedding="
-            << format_torch_tensor(output.embedding);
+  MTGR_TRACE(1) << "[ENGINE] model_output done next_tokens="
+                << mtgr_trace_tensor_shape(output.sample_output.next_tokens)
+                << " embeddings="
+                << mtgr_trace_tensor_shape(output.sample_output.embeddings);
   COUNTER_ADD(rec_first_token_latency_microseconds,
               timer.elapsed_microseconds());
 
   timer.reset();
-  LOG(INFO) << "[MTGR_TRACE][ENGINE] process_sample_output begin";
   batches[0].process_sample_output(output.sample_output, false);
-  LOG(INFO) << "[MTGR_TRACE][ENGINE] process_sample_output done";
   COUNTER_ADD(rec_sampling_latency_microseconds, timer.elapsed_microseconds());
 
   batches[0].finish();
-  LOG(INFO) << "[MTGR_TRACE][ENGINE] batch finish done";
+  MTGR_TRACE(1) << "[ENGINE] rec_prefill_step end";
   return output;
 }
 
 ForwardOutput RecEngine::RecPrefillOnlyEnginePipeline::get_model_output(
     const ForwardInput& model_inputs) {
-  LOG(INFO) << "[MTGR_TRACE][ENGINE] dispatch worker step_async count="
-            << engine_.workers_.size();
+  MTGR_TRACE(1) << "[ENGINE] get_model_output begin workers="
+                << engine_.workers_.size();
   std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;
   futures.reserve(engine_.workers_.size());
   for (auto& worker : engine_.workers_) {
@@ -1160,10 +1142,13 @@ ForwardOutput RecEngine::RecPrefillOnlyEnginePipeline::get_model_output(
     }
     CHECK(results[i].value().has_value())
         << "Worker " << i << " failed to execute model and returned no output.";
+    MTGR_TRACE(2) << "[ENGINE] worker_result index=" << i
+                  << " has_value=" << results[i].value().has_value();
   }
 
   auto forward_output = results.front().value();
   CHECK(forward_output.has_value()) << "Failed to execute model";
+  MTGR_TRACE(1) << "[ENGINE] get_model_output end";
   return forward_output.value();
 }
 

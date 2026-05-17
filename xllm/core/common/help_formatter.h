@@ -74,6 +74,8 @@ const OptionCategory kMultiStepDecodeOptions = {
     "MULTI-STEP DECODE OPTIONS",
     {"max_decode_rounds", "beam_width"}};
 
+const OptionCategory kMtgrOptions = {"MTGR OPTIONS", {"mtgr_trace_log_level"}};
+
 const OptionCategory kMtpOptions = {"SPECULATIVE OPTIONS",
                                     {"draft_model",
                                      "draft_devices",
@@ -115,6 +117,7 @@ const std::vector<OptionCategory> kOptionCategories = {
     kMoeModelOptions,
     kDisaggregatedPrefillDecodeOptions,
     kMultiStepDecodeOptions,
+    kMtgrOptions,
     kMtpOptions,
     kXllmServiceOptions,
     kBeamSearchOptions,

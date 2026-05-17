@@ -20,10 +20,10 @@ limitations under the License.
 #include <algorithm>
 #include <cstdint>
 #include <optional>
-#include <sstream>
 
 #include "layers/common/attention_metadata.h"
 #include "framework/request/sequence.h"
+#include "util/mtgr_trace.h"
 
 namespace xllm {
 
@@ -31,30 +31,23 @@ namespace {
 
 constexpr const char* kMtgrSegmentOffsetsName = "segment_offsets";
 constexpr const char* kMtgrSegmentRulesName = "segment_rules";
+constexpr const char* kMtgrTokenIdsName = "token_ids";
 
-std::string format_torch_tensor(const torch::Tensor& tensor) {
-  if (!tensor.defined()) {
-    return "undefined";
-  }
-  std::ostringstream oss;
-  oss << "shape=[";
-  for (int64_t i = 0; i < tensor.dim(); ++i) {
-    if (i > 0) {
-      oss << ", ";
-    }
-    oss << tensor.size(i);
-  }
-  oss << "], dtype=" << tensor.scalar_type() << ", device=" << tensor.device();
-  return oss.str();
+torch::Tensor get_i32_tensor(const MMData& mm_data, const char* key) {
+  return mm_data.get<torch::Tensor>(key)
+      .value()
+      .to(torch::kInt32)
+      .cpu()
+      .contiguous();
 }
 
-std::optional<torch::Tensor> get_optional_i32_tensor(const MMData& mm_data,
+std::optional<torch::Tensor> get_optional_i64_tensor(const MMData& mm_data,
                                                      const char* key) {
   auto tensor = mm_data.get<torch::Tensor>(key);
-  if (!tensor.has_value() || !tensor.value().defined()) {
+  if (!tensor.has_value()) {
     return std::nullopt;
   }
-  return tensor.value().to(torch::kInt32).cpu().contiguous();
+  return tensor.value().to(torch::kInt64).cpu().contiguous();
 }
 
 }  // namespace
@@ -83,6 +76,7 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
   std::vector<Sequence*> sequences;
   std::vector<uint32_t> effective_allowed_max_tokens;
   std::vector<torch::Tensor> trimmed_embeddings;
+  std::vector<torch::Tensor> trimmed_token_ids_i64;
   std::vector<MMData> mm_data_vec;
   std::vector<torch::Tensor> segment_offset_rows_i32;
   std::vector<torch::Tensor> matched_prefix_lens_i32;
@@ -94,10 +88,8 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
   const auto i32_options = torch::TensorOptions().dtype(torch::kInt32);
 
   for (auto* sequence_group : sequence_groups_) {
-    CHECK(sequence_group != nullptr);
     for (const auto& seq_ptr : sequence_group->sequences()) {
       auto* sequence = seq_ptr.get();
-      CHECK(sequence != nullptr);
       sequences.push_back(sequence);
 
       const uint32_t fallback_budget = sequence->num_need_compute_tokens();
@@ -112,59 +104,64 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
       has_partial_match_request =
           has_partial_match_request || (matched_prefix > 0);
 
-      const auto& input_embedding = sequence->get_input_embedding();
-      CHECK(input_embedding.defined())
-          << "MTGR requires per-sequence input_embedding";
-      CHECK_EQ(input_embedding.dim(), 2)
-          << "MTGR input_embedding must be 2-D [seq_len, hidden]";
-      CHECK_LE(matched_prefix, input_embedding.size(0))
-          << "matched_prefix exceeds input_embedding length";
-      CHECK_LT(matched_prefix, input_embedding.size(0))
-          << "matched_prefix must leave at least one token to compute";
-      const int32_t local_q_len =
-          static_cast<int32_t>(input_embedding.size(0) - matched_prefix);
-      q_seq_starts_i32.emplace_back(torch::tensor({packed_q_start}, i32_options));
-      packed_q_start += local_q_len;
-      trimmed_embeddings.emplace_back(input_embedding.narrow(
-          /*dim=*/0,
-          /*start=*/matched_prefix,
-          /*length=*/local_q_len));
-
       const auto& mm_data = sequence->get_mm_data();
       mm_data_vec.emplace_back(mm_data);
+      auto input_token_ids_i64 =
+          get_optional_i64_tensor(mm_data, kMtgrTokenIdsName);
+      const auto& input_embedding = sequence->get_input_embedding();
+      const bool uses_embedding = input_embedding.defined();
 
-      auto segment_offsets =
-          get_optional_i32_tensor(mm_data, kMtgrSegmentOffsetsName);
-      auto segment_rules =
-          get_optional_i32_tensor(mm_data, kMtgrSegmentRulesName);
-      CHECK(segment_offsets.has_value())
-          << "MTGR segmented protocol requires segment_offsets";
-      CHECK(segment_rules.has_value())
-          << "MTGR segmented protocol requires segment_rules";
-      auto offsets = segment_offsets.value();
+      int64_t total_input_len = 0;
+      if (uses_embedding) {
+        total_input_len = input_embedding.size(0);
+      } else {
+        auto token_ids = input_token_ids_i64.value();
+        if (token_ids.dim() == 2 && token_ids.size(0) == 1) {
+          token_ids = token_ids.view({token_ids.size(1)}).contiguous();
+        }
+        total_input_len = token_ids.size(0);
+        input_token_ids_i64 = token_ids;
+      }
+      const int32_t local_q_len =
+          static_cast<int32_t>(total_input_len - matched_prefix);
+      q_seq_starts_i32.emplace_back(
+          torch::tensor({packed_q_start}, i32_options));
+      MTGR_TRACE(1) << "[BATCH] seq_idx=" << sequences.size() - 1
+                    << " input_mode="
+                    << (uses_embedding ? "input_embedding" : "token_ids")
+                    << " total_input_len=" << total_input_len
+                    << " matched_prefix=" << matched_prefix
+                    << " local_q_len=" << local_q_len
+                    << " q_start=" << packed_q_start;
+      packed_q_start += local_q_len;
+      if (uses_embedding) {
+        trimmed_embeddings.emplace_back(input_embedding.narrow(
+            /*dim=*/0,
+            /*start=*/matched_prefix,
+            /*length=*/local_q_len));
+      } else {
+        trimmed_token_ids_i64.emplace_back(input_token_ids_i64->narrow(
+            /*dim=*/0,
+            /*start=*/matched_prefix,
+            /*length=*/local_q_len));
+      }
+
+      auto offsets = get_i32_tensor(mm_data, kMtgrSegmentOffsetsName);
       if (offsets.dim() == 2 && offsets.size(0) == 1) {
         offsets = offsets.view({offsets.size(1)}).contiguous();
       }
-      auto rules = segment_rules.value();
+      auto rules = get_i32_tensor(mm_data, kMtgrSegmentRulesName);
       if (rules.dim() == 2 && rules.size(0) == 1) {
         rules = rules.view({rules.size(1)}).contiguous();
       }
-      CHECK_EQ(offsets.dim(), 1);
-      CHECK_EQ(rules.dim(), 1);
-      CHECK_EQ(offsets.size(0), rules.size(0) + 1);
-      CHECK_EQ(offsets[offsets.size(0) - 1].item<int32_t>(),
-               input_embedding.size(0))
-          << "MTGR segment_offsets last value must equal input length";
-      CHECK_LE(matched_prefix, offsets[offsets.size(0) - 2].item<int32_t>())
-          << "matched_prefix must stay before the final target segment";
+      MTGR_TRACE(2) << "[BATCH] seq_idx=" << sequences.size() - 1
+                    << " segment_offsets_shape=" << offsets.sizes()
+                    << " segment_rules_shape=" << rules.sizes();
       segment_offset_rows_i32.emplace_back(offsets);
       matched_prefix_lens_i32.emplace_back(
           torch::tensor({matched_prefix}, i32_options));
       if (!batch_segment_rules_i32.defined()) {
         batch_segment_rules_i32 = rules;
-      } else {
-        CHECK(torch::equal(batch_segment_rules_i32, rules))
-            << "MTGR batch currently requires identical segment_rules";
       }
     }
   }
@@ -183,8 +180,8 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
                             batch_forward_type_,
                             /*cp_size=*/1,
                             thread_pool_);
-  ForwardInput forward_input = builder.build_forward_input(num_decoding_tokens,
-                                                           min_decoding_batch_size);
+  ForwardInput forward_input =
+      builder.build_forward_input(num_decoding_tokens, min_decoding_batch_size);
 
   auto& mtgr_params = forward_input.input_params.mutable_mtgr_params();
   mtgr_params.mtgr_segment_offsets_i32 =
@@ -193,28 +190,29 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
   mtgr_params.mtgr_q_seq_starts_i32 = torch::cat(q_seq_starts_i32).contiguous();
   mtgr_params.mtgr_matched_prefix_lens_i32 =
       torch::cat(matched_prefix_lens_i32).contiguous();
+  if (!trimmed_token_ids_i64.empty()) {
+    mtgr_params.mtgr_input_token_ids_i64 =
+        torch::cat(trimmed_token_ids_i64).contiguous();
+  }
   mtgr_params.mtgr_match_mode =
       has_partial_match_request
           ? (has_no_match_request ? layer::MTGRMatchMode::kMixed
                                   : layer::MTGRMatchMode::kPartialOnly)
           : layer::MTGRMatchMode::kNoMatchOnly;
-
-  LOG(INFO) << "[MTGR_TRACE][BATCH] batch_id=" << batch_id_
-            << " sequences=" << sequences.size()
-            << " token_ids=" << format_torch_tensor(forward_input.token_ids)
-            << " positions=" << format_torch_tensor(forward_input.positions)
-            << " input_embedding="
-            << format_torch_tensor(forward_input.input_params.input_embedding)
-            << " mtgr_segment_offsets_i32="
-            << format_torch_tensor(mtgr_params.mtgr_segment_offsets_i32)
-            << " mtgr_segment_rules_i32="
-            << format_torch_tensor(mtgr_params.mtgr_segment_rules_i32)
-            << " mtgr_q_seq_starts_i32="
-            << format_torch_tensor(mtgr_params.mtgr_q_seq_starts_i32)
-            << " mtgr_matched_prefix_lens_i32="
-            << format_torch_tensor(mtgr_params.mtgr_matched_prefix_lens_i32)
-            << " mtgr_match_mode="
-            << static_cast<int32_t>(mtgr_params.mtgr_match_mode);
+  MTGR_TRACE(1) << "[BATCH] build_rec_forward_input end batch_size="
+                << sequences.size() << " total_live_q=" << packed_q_start
+                << " match_mode="
+                << static_cast<int32_t>(mtgr_params.mtgr_match_mode)
+                << " has_no_match=" << has_no_match_request
+                << " has_partial=" << has_partial_match_request;
+  MTGR_TRACE(2) << "[BATCH] mtgr_params segment_offsets="
+                << mtgr_params.mtgr_segment_offsets_i32.sizes()
+                << " segment_rules="
+                << mtgr_params.mtgr_segment_rules_i32.sizes()
+                << " q_seq_starts="
+                << mtgr_params.mtgr_q_seq_starts_i32.sizes()
+                << " matched_prefix_lens="
+                << mtgr_params.mtgr_matched_prefix_lens_i32.sizes();
 
   return forward_input;
 }

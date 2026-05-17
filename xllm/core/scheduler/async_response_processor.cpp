@@ -88,21 +88,10 @@ void AsyncResponseProcessor::process_completed_request(
     // update the metrics for the request
     HISTOGRAM_OBSERVE(end_2_end_latency_milliseconds,
                       static_cast<int64_t>(end_2_end_latency_seconds * 1000.0));
-    LOG(INFO) << "[MTGR_TRACE][RESP] generate_output begin request_id="
-              << request->request_id();
     RequestOutput req_output =
         request->generate_output(*tokenizer_, &generate_output_threadpool_);
-    LOG(INFO) << "[MTGR_TRACE][RESP] generate_output done request_id="
-              << request->request_id()
-              << " outputs=" << req_output.outputs.size()
-              << " finished=" << req_output.finished
-              << " cancelled=" << req_output.cancelled;
     request->log_statistic(end_2_end_latency_seconds);
-    LOG(INFO) << "[MTGR_TRACE][RESP] output_func begin request_id="
-              << request->request_id();
     request->state().output_func(req_output);
-    LOG(INFO) << "[MTGR_TRACE][RESP] output_func done request_id="
-              << request->request_id();
   };
   if (request->state().response_thread_id < 0) {
     request->state().response_thread_id =

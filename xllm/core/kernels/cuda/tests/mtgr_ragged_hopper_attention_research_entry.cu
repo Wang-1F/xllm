@@ -9,14 +9,14 @@ void mtgr_ragged_segment_attention_hopper_research_cuda(
     int64_t max_request_len,
     double sm_scale,
     torch::Tensor output_snd) {
-  check_mtgr_ragged_segment_attention_hopper_common_args(query_snd,
-                                                         key_snd,
-                                                         value_snd,
-                                                         segment_offsets_i32,
-                                                         segment_rules_i32,
-                                                         output_snd,
-                                                         max_request_len,
-                                                         sm_scale);
+  MTGR_TRACE(1) << "[KERNEL] dense_research_entry begin total_q="
+                << query_snd.size(0) << " max_request_len=" << max_request_len
+                << " head_dim=" << query_snd.size(2);
+  MTGR_TRACE(2) << "[KERNEL] dense_research_entry shapes query="
+                << query_snd.sizes() << " key=" << key_snd.sizes()
+                << " value=" << value_snd.sizes()
+                << " segment_offsets=" << segment_offsets_i32.sizes()
+                << " segment_rules=" << segment_rules_i32.sizes();
   dispatch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk(
       query_snd,
       key_snd,

@@ -35,6 +35,8 @@ limitations under the License.
 #include <cute/tensor.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 
+#include "core/util/mtgr_trace.h"
+
 #include "../../../../../third_party/cutlass/examples/88_hopper_fmha/collective/fmha_collective_softmax.hpp"
 #include "../../../../../third_party/cutlass/examples/88_hopper_fmha/collective/fmha_common.hpp"
 
@@ -1348,6 +1350,7 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
     int total_live_q,
     int max_request_len,
     int num_heads,
+    int num_kv_cache_heads,
     int num_segments,
     int block_table_stride,
     int block_size,
@@ -1523,6 +1526,16 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
                            : static_cast<int>(blockIdx.y);
   const int64_t kv_token_stride = static_cast<int64_t>(num_heads) * HeadDim;
   const int64_t head_offset = static_cast<int64_t>(head_idx) * HeadDim;
+  const int cache_num_heads =
+      num_kv_cache_heads > 0 ? num_kv_cache_heads : num_heads;
+  const int cache_repeat_factor =
+      cache_num_heads == num_heads ? 1 : num_heads / cache_num_heads;
+  const int cache_head_idx =
+      cache_repeat_factor == 1 ? head_idx : head_idx / cache_repeat_factor;
+  const int64_t cache_kv_token_stride =
+      static_cast<int64_t>(cache_num_heads) * HeadDim;
+  const int64_t cache_head_offset =
+      static_cast<int64_t>(cache_head_idx) * HeadDim;
   const int q_tile_id = static_cast<int>(blockIdx.x);
   const int segment_stride = num_segments + 1;
   const int32_t* offsets_row =
@@ -1917,14 +1930,16 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
       }
       pure_tile_base =
           (static_cast<int64_t>(physical_block) * block_size + block_offset) *
-              kv_token_stride +
-          head_offset;
+              cache_kv_token_stride +
+          cache_head_offset;
     } else if (tile_all_live) {
       pure_tile_base = static_cast<int64_t>(q_packed_start + kv_tile_start -
                                             matched_prefix) *
                            kv_token_stride +
                        head_offset;
     }
+    const int64_t pure_tile_token_stride =
+        tile_all_prefix ? cache_kv_token_stride : kv_token_stride;
     constexpr int kVecElems =
         sizeof(MtgrHopperVec128) / sizeof(MtgrHopperWgmmaElement);
     static_assert(HeadDim % kVecElems == 0);
@@ -1952,7 +1967,10 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
         } else {
           token_idx = static_cast<int64_t>(seq_start + kv_local_idx);
         }
-        kv_row_base_state[row] = token_idx * kv_token_stride + head_offset;
+        kv_row_base_state[row] =
+            row < prefix_rows
+                ? token_idx * cache_kv_token_stride + cache_head_offset
+                : token_idx * kv_token_stride + head_offset;
       }
     }
     if (need_row_base_decode) {
@@ -1979,7 +1997,8 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
           static_assert(HeadDim % kU128Elems == 0);
           constexpr int kU128Rows = HeadDim / kU128Elems;
           const int kU128Cells = kU128Rows * valid_rows;
-          const int64_t kv_token_stride_u128 = kv_token_stride / kU128Elems;
+          const int64_t kv_token_stride_u128 =
+              pure_tile_token_stride / kU128Elems;
           const auto* pure_key_u128 =
               reinterpret_cast<const MtgrHopperCuteU128*>(pure_key_src +
                                                           pure_tile_base);
@@ -2100,7 +2119,7 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
             const int dim = vec_idx * kVecElems;
             const int64_t kv_base =
                 pure_tile_base +
-                static_cast<int64_t>(tile_row) * kv_token_stride + dim;
+                static_cast<int64_t>(tile_row) * pure_tile_token_stride + dim;
             const MtgrHopperVec128 k_vec =
                 *reinterpret_cast<const MtgrHopperVec128*>(pure_key_src +
                                                            kv_base);
@@ -2180,7 +2199,8 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
               const int64_t kv_base =
                   pure_tile_uses_linear_base
                       ? pure_tile_base +
-                            static_cast<int64_t>(tile_row) * kv_token_stride +
+                            static_cast<int64_t>(tile_row) *
+                                pure_tile_token_stride +
                             dim
                       : kv_row_base_state[tile_row] + dim;
               if (loaded_k_with_tma) {
@@ -2246,7 +2266,8 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
           static_assert(HeadDim % kU128Elems == 0);
           constexpr int kU128Rows = HeadDim / kU128Elems;
           constexpr int kU128Cells = kU128Rows * KvTile;
-          const int64_t kv_token_stride_u128 = kv_token_stride / kU128Elems;
+          const int64_t kv_token_stride_u128 =
+              pure_tile_token_stride / kU128Elems;
           const auto* pure_key_u128 =
               reinterpret_cast<const MtgrHopperCuteU128*>(pure_key_src +
                                                           pure_tile_base);
@@ -2279,7 +2300,7 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
             const int dim = vec_idx * kVecElems;
             const int64_t kv_base =
                 pure_tile_base +
-                static_cast<int64_t>(tile_row) * kv_token_stride + dim;
+                static_cast<int64_t>(tile_row) * pure_tile_token_stride + dim;
             const MtgrHopperVec128 k_vec =
                 *reinterpret_cast<const MtgrHopperVec128*>(pure_key_src +
                                                            kv_base);
@@ -2343,7 +2364,8 @@ __global__ void mtgr_ragged_segment_attention_hopper_wgmma_qk_kernel(
               const int64_t kv_base =
                   pure_tile_uses_linear_base
                       ? pure_tile_base +
-                            static_cast<int64_t>(tile_row) * kv_token_stride +
+                            static_cast<int64_t>(tile_row) *
+                                pure_tile_token_stride +
                             dim
                       : kv_row_base_state[tile_row] + dim;
               if (!loaded_k_with_tma) {
@@ -2682,6 +2704,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel(
     torch::Tensor output_snd) {
   const int total_live_q = static_cast<int>(query_snd.size(0));
   const int num_heads = static_cast<int>(query_snd.size(1));
+  const int num_kv_cache_heads = static_cast<int>(key_cache.size(2));
   const int batch_size = static_cast<int>(segment_offsets_i32.size(0));
   const int num_segments = static_cast<int>(segment_rules_i32.size(0));
   int max_live_q_per_batch = static_cast<int>(max_request_len);
@@ -2689,7 +2712,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel(
     max_live_q_per_batch = total_live_q;
   }
   int matched_prefix_est = 0;
-  if (batch_size == 1 && block_table_i32.defined() && block_size > 0) {
+  if (batch_size == 1 && block_size > 0) {
     const int block_count = static_cast<int>(block_table_i32.size(1));
     matched_prefix_est = max(
         block_count * static_cast<int>(block_size) - max_live_q_per_batch, 0);
@@ -2699,6 +2722,24 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel(
       kHopperWgmmaQueriesPerCta;
   const dim3 block(kHopperWgmmaThreadsPerBlock);
   const dim3 grid(q_tiles_per_head, num_heads, batch_size);
+  MTGR_TRACE(1) << "[KERNEL] unified_launch head_dim=" << HeadDim
+                << " allow_mixed=" << AllowMixedRequests
+                << " total_live_q=" << total_live_q
+                << " batch_size=" << batch_size
+                << " num_heads=" << num_heads
+                << " num_kv_cache_heads=" << num_kv_cache_heads
+                << " max_live_q_per_batch=" << max_live_q_per_batch
+                << " block_size=" << block_size
+                << " q_tiles_per_head=" << q_tiles_per_head;
+  MTGR_TRACE(2) << "[KERNEL] unified_launch shapes query="
+                << query_snd.sizes() << " key=" << key_snd.sizes()
+                << " value=" << value_snd.sizes()
+                << " key_cache=" << key_cache.sizes()
+                << " value_cache=" << value_cache.sizes()
+                << " segment_offsets=" << segment_offsets_i32.sizes()
+                << " q_seq_starts=" << q_seq_starts_i32.sizes()
+                << " matched_prefix_lens=" << matched_prefix_lens_i32.sizes()
+                << " block_table=" << block_table_i32.sizes();
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   auto launch_impl = [&]<int kKvTile>() {
     constexpr size_t kDynSharedBytes =
@@ -2752,6 +2793,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel(
             total_live_q,
             static_cast<int>(max_request_len),
             num_heads,
+            num_kv_cache_heads,
             num_segments,
             static_cast<int>(block_table_i32.size(1)),
             static_cast<int>(block_size),
@@ -2762,6 +2804,9 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_qk_unified_kernel(
   } else {
     const int hd128_kv_tile = mtgr_hopper_unified_partial_hd128_kv_tile(
         num_heads, batch_size, max_live_q_per_batch, matched_prefix_est);
+    MTGR_TRACE(1) << "[KERNEL] unified_launch hd128_kv_tile="
+                  << hd128_kv_tile
+                  << " matched_prefix_est=" << matched_prefix_est;
     if (hd128_kv_tile == 128) {
       launch_impl.template operator()<128>();
     } else if (hd128_kv_tile == 80) {
@@ -2890,6 +2935,17 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk_kernel(
     }
   }();
   const dim3 grid(q_tiles_per_head, num_heads, batch_size);
+  MTGR_TRACE(1) << "[KERNEL] dense_tma_launch head_dim=" << HeadDim
+                << " batch_size=" << batch_size
+                << " num_heads=" << num_heads
+                << " max_request_len=" << max_request_len
+                << " q_tiles_per_head=" << q_tiles_per_head
+                << " producer_warp=" << use_producer_warp;
+  MTGR_TRACE(2) << "[KERNEL] dense_tma_launch shapes query="
+                << query_snd.sizes() << " key=" << key_snd.sizes()
+                << " value=" << value_snd.sizes()
+                << " segment_offsets=" << segment_offsets_i32.sizes()
+                << " segment_rules=" << segment_rules_i32.sizes();
 
   if (use_producer_warp) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -2939,6 +2995,7 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk_kernel(
             total_len,
             0,
             static_cast<int>(max_request_len),
+            num_heads,
             num_heads,
             num_segments,
             0,
@@ -2993,190 +3050,13 @@ void launch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk_kernel(
             0,
             static_cast<int>(max_request_len),
             num_heads,
+            num_heads,
             num_segments,
             0,
             0,
             static_cast<float>(sm_scale) * kHopperLog2E);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-void check_mtgr_ragged_segment_attention_hopper_common_args(
-    const torch::Tensor& query_snd,
-    const torch::Tensor& key_snd,
-    const torch::Tensor& value_snd,
-    const torch::Tensor& segment_offsets_i32,
-    const torch::Tensor& segment_rules_i32,
-    torch::Tensor output_snd,
-    int64_t max_request_len,
-    double sm_scale) {
-  CHECK(query_snd.defined());
-  CHECK(key_snd.defined());
-  CHECK(value_snd.defined());
-  CHECK(segment_offsets_i32.defined());
-  CHECK(segment_rules_i32.defined());
-  CHECK(output_snd.defined());
-  CHECK(query_snd.is_cuda());
-  CHECK(key_snd.is_cuda());
-  CHECK(value_snd.is_cuda());
-  CHECK(segment_offsets_i32.is_cuda());
-  CHECK(segment_rules_i32.is_cuda());
-  CHECK(output_snd.is_cuda());
-  CHECK_EQ(key_snd.get_device(), query_snd.get_device());
-  CHECK_EQ(value_snd.get_device(), query_snd.get_device());
-  CHECK_EQ(segment_offsets_i32.get_device(), query_snd.get_device());
-  CHECK_EQ(segment_rules_i32.get_device(), query_snd.get_device());
-  CHECK_EQ(output_snd.get_device(), query_snd.get_device());
-  CHECK(query_snd.is_contiguous());
-  CHECK(key_snd.is_contiguous());
-  CHECK(value_snd.is_contiguous());
-  CHECK(segment_offsets_i32.is_contiguous());
-  CHECK(segment_rules_i32.is_contiguous());
-  CHECK(output_snd.is_contiguous());
-  CHECK_EQ(query_snd.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(key_snd.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(value_snd.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(segment_offsets_i32.scalar_type(), torch::kInt32);
-  CHECK_EQ(segment_rules_i32.scalar_type(), torch::kInt32);
-  CHECK_EQ(output_snd.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(query_snd.dim(), 3);
-  CHECK_EQ(key_snd.dim(), 3);
-  CHECK_EQ(value_snd.dim(), 3);
-  CHECK_EQ(segment_offsets_i32.dim(), 2);
-  CHECK_EQ(segment_rules_i32.dim(), 1);
-  CHECK_EQ(output_snd.dim(), 3);
-  CHECK_EQ(query_snd.sizes(), key_snd.sizes());
-  CHECK_EQ(query_snd.sizes(), value_snd.sizes());
-  CHECK_EQ(query_snd.sizes(), output_snd.sizes());
-  CHECK_GT(query_snd.size(0), 0);
-  CHECK_GT(segment_offsets_i32.size(0), 0);
-  CHECK_EQ(segment_offsets_i32.size(1), segment_rules_i32.size(0) + 1);
-  CHECK_GT(segment_rules_i32.size(0), 1);
-  CHECK_GT(max_request_len, 0);
-  CHECK_LE(max_request_len, query_snd.size(0));
-  CHECK_GT(sm_scale, 0.0);
-}
-
-void check_mtgr_ragged_segment_attention_hopper_unified_args(
-    const torch::Tensor& query_snd,
-    const torch::Tensor& key_snd,
-    const torch::Tensor& value_snd,
-    const torch::Tensor& segment_offsets_i32,
-    const torch::Tensor& segment_rules_i32,
-    const torch::Tensor& q_seq_starts_i32,
-    const torch::Tensor& matched_prefix_lens_i32,
-    int64_t match_mode,
-    const torch::Tensor& key_cache,
-    const torch::Tensor& value_cache,
-    const torch::Tensor& block_table_i32,
-    int64_t block_size,
-    int64_t max_request_len,
-    double sm_scale,
-    torch::Tensor output_snd) {
-  CHECK(query_snd.defined());
-  CHECK(key_snd.defined());
-  CHECK(value_snd.defined());
-  CHECK(segment_offsets_i32.defined());
-  CHECK(segment_rules_i32.defined());
-  CHECK(q_seq_starts_i32.defined());
-  CHECK(matched_prefix_lens_i32.defined());
-  CHECK(output_snd.defined());
-  CHECK(query_snd.is_cuda());
-  CHECK(key_snd.is_cuda());
-  CHECK(value_snd.is_cuda());
-  CHECK(segment_offsets_i32.is_cuda());
-  CHECK(segment_rules_i32.is_cuda());
-  CHECK(q_seq_starts_i32.is_cuda());
-  CHECK(matched_prefix_lens_i32.is_cuda());
-  CHECK(output_snd.is_cuda());
-  CHECK_EQ(key_snd.get_device(), query_snd.get_device());
-  CHECK_EQ(value_snd.get_device(), query_snd.get_device());
-  CHECK_EQ(segment_offsets_i32.get_device(), query_snd.get_device());
-  CHECK_EQ(segment_rules_i32.get_device(), query_snd.get_device());
-  CHECK_EQ(q_seq_starts_i32.get_device(), query_snd.get_device());
-  CHECK_EQ(matched_prefix_lens_i32.get_device(), query_snd.get_device());
-  CHECK_EQ(output_snd.get_device(), query_snd.get_device());
-  CHECK(query_snd.is_contiguous());
-  CHECK(key_snd.is_contiguous());
-  CHECK(value_snd.is_contiguous());
-  CHECK(segment_offsets_i32.is_contiguous());
-  CHECK(segment_rules_i32.is_contiguous());
-  CHECK(q_seq_starts_i32.is_contiguous());
-  CHECK(matched_prefix_lens_i32.is_contiguous());
-  CHECK(output_snd.is_contiguous());
-  CHECK_EQ(query_snd.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(key_snd.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(value_snd.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(segment_offsets_i32.scalar_type(), torch::kInt32);
-  CHECK_EQ(segment_rules_i32.scalar_type(), torch::kInt32);
-  CHECK_EQ(q_seq_starts_i32.scalar_type(), torch::kInt32);
-  CHECK_EQ(matched_prefix_lens_i32.scalar_type(), torch::kInt32);
-  CHECK_EQ(output_snd.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(query_snd.dim(), 3);
-  CHECK_EQ(key_snd.dim(), 3);
-  CHECK_EQ(value_snd.dim(), 3);
-  CHECK_EQ(segment_offsets_i32.dim(), 2);
-  CHECK_EQ(segment_rules_i32.dim(), 1);
-  CHECK_EQ(q_seq_starts_i32.dim(), 1);
-  CHECK_EQ(matched_prefix_lens_i32.dim(), 1);
-  CHECK_EQ(output_snd.dim(), 3);
-  CHECK_EQ(query_snd.sizes(), key_snd.sizes());
-  CHECK_EQ(query_snd.sizes(), value_snd.sizes());
-  CHECK_EQ(query_snd.sizes(), output_snd.sizes());
-  CHECK_GT(query_snd.size(0), 0);
-  CHECK_GT(query_snd.size(1), 0);
-  CHECK_GT(query_snd.size(2), 0);
-  CHECK_EQ(segment_offsets_i32.size(1), segment_rules_i32.size(0) + 1);
-  CHECK_EQ(q_seq_starts_i32.size(0), segment_offsets_i32.size(0));
-  CHECK_EQ(matched_prefix_lens_i32.size(0), segment_offsets_i32.size(0));
-  CHECK_GT(block_size, 0);
-  CHECK_GT(max_request_len, 0);
-  CHECK_GT(sm_scale, 0.0);
-
-  if (match_mode == 0) {
-    return;
-  }
-
-  CHECK(key_cache.is_cuda());
-  CHECK(value_cache.is_cuda());
-  CHECK(block_table_i32.is_cuda());
-  CHECK_EQ(key_cache.get_device(), query_snd.get_device());
-  CHECK_EQ(value_cache.get_device(), query_snd.get_device());
-  CHECK_EQ(block_table_i32.get_device(), query_snd.get_device());
-  CHECK(key_cache.is_contiguous());
-  CHECK(value_cache.is_contiguous());
-  CHECK(block_table_i32.is_contiguous());
-  CHECK_EQ(key_cache.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(value_cache.scalar_type(), torch::kBFloat16);
-  CHECK_EQ(block_table_i32.scalar_type(), torch::kInt32);
-  CHECK_EQ(key_cache.dim(), 4);
-  CHECK_EQ(value_cache.dim(), 4);
-  CHECK_EQ(block_table_i32.dim(), 2);
-  CHECK_EQ(key_cache.sizes(), value_cache.sizes());
-  CHECK_EQ(block_table_i32.size(0), segment_offsets_i32.size(0));
-  CHECK_EQ(key_cache.size(1), block_size);
-  CHECK_EQ(key_cache.size(2), query_snd.size(1));
-  CHECK_EQ(key_cache.size(3), query_snd.size(2));
-}
-
-torch::Tensor mtgr_hopper_build_unified_q_seq_starts(
-    const torch::Tensor& segment_offsets_i32,
-    const torch::Tensor& matched_prefix_lens_i32) {
-  const int64_t batch_size = segment_offsets_i32.size(0);
-  auto q_seq_starts_i32 =
-      torch::zeros({batch_size}, matched_prefix_lens_i32.options());
-  if (batch_size <= 1) {
-    return q_seq_starts_i32;
-  }
-
-  const int64_t last_offset_col = segment_offsets_i32.size(1) - 1;
-  auto prefix_live_lens_i32 =
-      segment_offsets_i32.select(1, last_offset_col)
-          .slice(0, 0, batch_size - 1) -
-      matched_prefix_lens_i32.slice(0, 0, batch_size - 1);
-  q_seq_starts_i32.slice(0, 1).copy_(
-      torch::cumsum(prefix_live_lens_i32, 0, torch::kInt32));
-  return q_seq_starts_i32;
 }
 
 template <bool AllowMixedRequests>
@@ -3200,6 +3080,11 @@ void dispatch_mtgr_ragged_segment_attention_hopper_unified_impl(
   CHECK_GE(props->major, 9)
       << "Hopper ragged segment attention unified research path requires "
          "SM90+.";
+  MTGR_TRACE(1) << "[KERNEL] unified_dispatch allow_mixed="
+                << AllowMixedRequests << " head_dim=" << query_snd.size(2)
+                << " device_sm=" << props->major << props->minor
+                << " max_request_len=" << max_request_len
+                << " block_size=" << block_size;
 
   switch (query_snd.size(2)) {
     case 64:
@@ -3321,6 +3206,9 @@ void dispatch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk(
   const auto* props = at::cuda::getCurrentDeviceProperties();
   CHECK_GE(props->major, 9)
       << "Hopper ragged segment attention WGMMA+TMA path requires SM90+.";
+  MTGR_TRACE(1) << "[KERNEL] dense_tma_dispatch head_dim="
+                << query_snd.size(2) << " device_sm=" << props->major
+                << props->minor << " max_request_len=" << max_request_len;
 
   switch (query_snd.size(2)) {
     case 64:

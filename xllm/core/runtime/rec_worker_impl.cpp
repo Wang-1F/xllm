@@ -21,7 +21,6 @@ limitations under the License.
 #include <map>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <vector>
 
 #include "common/device_monitor.h"
@@ -46,29 +45,10 @@ limitations under the License.
 #include "framework/sampling/rec_sampler.h"
 #include "models/model_registry.h"
 #include "util/env_var.h"
+#include "util/mtgr_trace.h"
 #include "util/timer.h"
 
 namespace xllm {
-
-namespace {
-
-std::string format_torch_tensor(const torch::Tensor& tensor) {
-  if (!tensor.defined()) {
-    return "undefined";
-  }
-  std::ostringstream oss;
-  oss << "shape=[";
-  for (int64_t i = 0; i < tensor.dim(); ++i) {
-    if (i > 0) {
-      oss << ", ";
-    }
-    oss << tensor.size(i);
-  }
-  oss << "], dtype=" << tensor.scalar_type() << ", device=" << tensor.device();
-  return oss.str();
-}
-
-}  // namespace
 
 // ============================================================
 // RecWorkerImpl Implementation (base)
@@ -406,6 +386,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
     COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
     DeviceMonitor::get_instance().update_active_activation_memory(
         runtime_.worker.device_.index());
+    MTGR_TRACE(1) << "[WORKER] step end no_driver";
     return std::nullopt;
   }
 
@@ -509,6 +490,7 @@ void RecWorkerImpl::LlmRecWithMmDataWorkPipeline::prepare_work_before_execute(
 
 ForwardInput RecWorkerImpl::RecPrefillOnlyWorkPipeline::prepare_inputs(
     Batch& batch) {
+  MTGR_TRACE(1) << "[WORKER] prepare_inputs begin";
   ThreadPool* thread_pool =
       runtime_.worker.input_builder_thread_pool_
           ? runtime_.worker.input_builder_thread_pool_.get()
@@ -519,35 +501,11 @@ ForwardInput RecWorkerImpl::RecPrefillOnlyWorkPipeline::prepare_inputs(
       /*min_decoding_batch_size=*/0,
       runtime_.context->get_model_args(),
       thread_pool);
-  const auto* mtgr_params = input.input_params.mtgr_params();
-  LOG(INFO) << "[MTGR_TRACE][WORKER] prepare_inputs token_ids="
-            << format_torch_tensor(input.token_ids)
-            << " positions=" << format_torch_tensor(input.positions)
-            << " input_embedding="
-            << format_torch_tensor(input.input_params.input_embedding)
-            << " mtgr_segment_offsets_i32="
-            << format_torch_tensor(
-                   mtgr_params != nullptr
-                       ? mtgr_params->mtgr_segment_offsets_i32
-                                          : torch::Tensor())
-            << " mtgr_segment_rules_i32="
-            << format_torch_tensor(
-                   mtgr_params != nullptr
-                       ? mtgr_params->mtgr_segment_rules_i32
-                                          : torch::Tensor())
-            << " mtgr_q_seq_starts_i32="
-            << format_torch_tensor(
-                   mtgr_params != nullptr ? mtgr_params->mtgr_q_seq_starts_i32
-                                          : torch::Tensor())
-            << " mtgr_matched_prefix_lens_i32="
-            << format_torch_tensor(
-                   mtgr_params != nullptr
-                       ? mtgr_params->mtgr_matched_prefix_lens_i32
-                                          : torch::Tensor())
-            << " mtgr_match_mode="
-            << (mtgr_params != nullptr
-                    ? static_cast<int32_t>(mtgr_params->mtgr_match_mode)
-                    : -1);
+  MTGR_TRACE(1) << "[WORKER] prepare_inputs end token_ids="
+                << mtgr_trace_tensor_shape(input.token_ids)
+                << " positions=" << mtgr_trace_tensor_shape(input.positions)
+                << " has_mtgr_params="
+                << input.input_params.has_mtgr_params();
   return input;
 }
 
@@ -555,27 +513,19 @@ std::optional<ForwardOutput> RecWorkerImpl::RecPrefillOnlyWorkPipeline::step(
     const ForwardInput& input) {
   Timer timer;
   runtime_.worker.device_.set_device();
+  MTGR_TRACE(1) << "[WORKER] step begin token_ids="
+                << mtgr_trace_tensor_shape(input.token_ids)
+                << " positions=" << mtgr_trace_tensor_shape(input.positions)
+                << " has_mtgr_params="
+                << input.input_params.has_mtgr_params();
 
-  LOG(INFO) << "[MTGR_TRACE][WORKER] step begin token_ids="
-            << format_torch_tensor(input.token_ids)
-            << " positions=" << format_torch_tensor(input.positions)
-            << " input_embedding="
-            << format_torch_tensor(input.input_params.input_embedding)
-            << " batch_forward_type="
-            << static_cast<int32_t>(input.input_params.batch_forward_type.value());
-
-  LOG(INFO) << "[MTGR_TRACE][WORKER] calling executor->forward";
   auto model_output = runtime_.executor->forward(input.token_ids,
                                                  input.positions,
                                                  runtime_.worker.kv_caches_,
                                                  input.input_params);
-  LOG(INFO) << "[MTGR_TRACE][WORKER] executor->forward returned hidden_states="
-            << format_torch_tensor(model_output.hidden_states);
   auto hidden_states = model_output.hidden_states;
-  if (!hidden_states.defined()) {
-    LOG(ERROR) << "[MTGR_TRACE][WORKER] hidden_states is undefined";
-    return std::nullopt;
-  }
+  MTGR_TRACE(1) << "[WORKER] executor_forward done hidden_states="
+                << mtgr_trace_tensor_shape(hidden_states);
 
   if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
       !runtime_.worker.options_.enable_speculative_decode()) {
@@ -597,13 +547,13 @@ std::optional<ForwardOutput> RecWorkerImpl::RecPrefillOnlyWorkPipeline::step(
   }
   output.sample_output = sample_output;
   output.embedding = sample_output.embeddings;
-  LOG(INFO) << "[MTGR_TRACE][WORKER] step output embedding="
-            << format_torch_tensor(output.embedding);
 
   runtime_.stream->synchronize();
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(
       runtime_.worker.device_.index());
+  MTGR_TRACE(1) << "[WORKER] step end embeddings="
+                << mtgr_trace_tensor_shape(output.sample_output.embeddings);
   return output;
 }
 
