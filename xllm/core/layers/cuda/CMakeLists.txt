@@ -7,8 +7,10 @@ cc_library(
   HDRS
     attention.h
     base_attention_impl.h
+    custom_mask_attention.h
     flashinfer_attention.h
     mtgr_attention.h
+    mtgr_decoder_layer_impl.h
     xattention.h
     xattention_planinfo.h
     flashinfer_workspace.h
@@ -17,16 +19,19 @@ cc_library(
   SRCS
     attention.cpp
     base_attention_impl.cpp
+    custom_mask_attention.cpp
     xattention.cpp
     xattention_planinfo.cpp
     flashinfer_attention.cpp
     mtgr_attention.cpp
+    mtgr_decoder_layer_impl.cpp
     flashinfer_workspace.cpp
     xattention_workspace.cpp
     flashinfer_planinfo.cpp
   DEPS
     :common_layers
     :cuda_mtgr_attention_runtime
+    :cuda_mtgr_hopper_runtime
 )
 
 cc_test(

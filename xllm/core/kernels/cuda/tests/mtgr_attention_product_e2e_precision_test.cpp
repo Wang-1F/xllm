@@ -132,7 +132,7 @@ class MTGRAttentionProductE2EPrecisionTest : public ::testing::Test {
   }
 };
 
-TEST_F(MTGRAttentionProductE2EPrecisionTest, NoMatchForwardUsesNpuStyleApi) {
+TEST_F(MTGRAttentionProductE2EPrecisionTest, NoMatchForwardUsesSegmentedApi) {
   const auto shape = make_shape(/*partial_match=*/false);
   const double scale = 1.0 / std::sqrt(static_cast<double>(shape.head_dim));
   auto opts =
@@ -172,7 +172,7 @@ TEST_F(MTGRAttentionProductE2EPrecisionTest, NoMatchForwardUsesNpuStyleApi) {
 }
 
 TEST_F(MTGRAttentionProductE2EPrecisionTest,
-       PartialRealTimeForwardUsesNpuStyleApi) {
+       PartialRealTimeForwardUsesSegmentedApi) {
   const auto shape = make_shape(/*partial_match=*/true);
   const double scale = 1.0 / std::sqrt(static_cast<double>(shape.head_dim));
   auto opts =

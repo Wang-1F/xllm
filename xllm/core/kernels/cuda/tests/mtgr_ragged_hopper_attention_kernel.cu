@@ -5,4 +5,4 @@
 #include "mtgr_ragged_hopper_attention_research_entry.cu"
 #include "mtgr_ragged_hopper_attention_unified_entry.cu"
 
-}  // namespace xllm::kernel::cuda::test
+}  // namespace xllm::kernel::cuda

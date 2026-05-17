@@ -18,25 +18,9 @@ limitations under the License.
 #include <cstdint>
 
 #include "common/global_flags.h"
+#include "mtgr_hopper_attention_runtime.h"
 
 namespace xllm::kernel::cuda::test {
-
-void mtgr_ragged_segment_attention_hopper_unified_research_cuda(
-    const torch::Tensor& query_snd,
-    const torch::Tensor& key_snd,
-    const torch::Tensor& value_snd,
-    const torch::Tensor& segment_offsets_i32,
-    const torch::Tensor& segment_rules_i32,
-    const torch::Tensor& q_seq_starts_i32,
-    const torch::Tensor& matched_prefix_lens_i32,
-    int64_t match_mode,
-    const torch::Tensor& key_cache,
-    const torch::Tensor& value_cache,
-    const torch::Tensor& block_table_i32,
-    int64_t block_size,
-    int64_t max_request_len,
-    double sm_scale,
-    torch::Tensor output_snd);
 
 MTGRAttentionTestImpl::MTGRAttentionTestImpl(int64_t num_heads,
                                              int64_t head_size,
@@ -69,7 +53,7 @@ MTGRAttentionTestImpl::forward(
   auto key_cache = kv_cache.get_k_cache();
   auto value_cache = kv_cache.get_v_cache();
 
-  mtgr_ragged_segment_attention_hopper_unified_research_cuda(
+  xllm::kernel::cuda::mtgr_ragged_segment_attention_hopper_unified_cuda(
       query_snd,
       key_snd,
       value_snd,

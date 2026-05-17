@@ -98,6 +98,21 @@ cc_library(
 
 cc_library(
   NAME
+    cuda_mtgr_hopper_runtime
+  HDRS
+    mtgr_hopper_attention_runtime.h
+  SRCS
+    mtgr_hopper_attention_runtime.cu
+  DEPS
+    :cuda_kernels
+    :flags
+    :kv_cache
+    torch
+    glog::glog
+)
+
+cc_library(
+  NAME
     cuda_mtgr_attention_runtime
   HDRS
     tests/mtgr_attenion_test.h
@@ -106,9 +121,9 @@ cc_library(
     tests/mtgr_fused_attention_kernel.cu
     tests/mtgr_full_attention_kernel.cu
     tests/mtgr_flashinfer_mask_kernel.cu
-    tests/mtgr_ragged_hopper_attention_kernel.cu
   DEPS
     :cuda_kernels
+    :cuda_mtgr_hopper_runtime
     :flags
     :kv_cache
     torch

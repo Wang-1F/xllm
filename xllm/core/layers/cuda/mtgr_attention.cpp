@@ -20,6 +20,7 @@ limitations under the License.
 #include <memory>
 #include <utility>
 
+#include "kernels/cuda/mtgr_hopper_attention_runtime.h"
 #include "kernels/cuda/tests/mtgr_attenion_test.h"
 
 namespace xllm {
@@ -119,6 +120,48 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
                            KVCache& kv_cache) {
   CHECK(impl_ != nullptr)
       << "MTGRAttentionImpl is not initialized with valid attention dims";
+  if (backend_ == MTGRAttentionBackend::kFused &&
+      attn_metadata.mtgr_segment_offsets_i32.defined()) {
+    std::optional<torch::Tensor> output_lse = std::nullopt;
+    if (attn_metadata.is_dummy) {
+      return {torch::empty_like(query), output_lse};
+    }
+
+    const int64_t total_q = query.size(0);
+    auto query_snd =
+        query.view({total_q, num_heads_, head_size_}).contiguous();
+    auto key_snd =
+        key.view({total_q, num_kv_heads_, head_size_}).contiguous();
+    auto value_snd =
+        value.view({total_q, num_kv_heads_, head_size_}).contiguous();
+    auto output_snd = torch::empty_like(query_snd);
+    auto key_cache = kv_cache.get_k_cache();
+    auto value_cache = kv_cache.get_v_cache();
+    const int64_t block_size =
+        key_cache.defined() && key_cache.dim() > 1 ? key_cache.size(1) : 1;
+
+    kernel::cuda::mtgr_ragged_segment_attention_hopper_unified_cuda(
+        query_snd,
+        key_snd,
+        value_snd,
+        attn_metadata.mtgr_segment_offsets_i32,
+        attn_metadata.mtgr_segment_rules_i32,
+        attn_metadata.mtgr_q_seq_starts_i32,
+        attn_metadata.mtgr_matched_prefix_lens_i32,
+        static_cast<int64_t>(attn_metadata.mtgr_match_mode),
+        key_cache,
+        value_cache,
+        attn_metadata.block_table,
+        block_size,
+        attn_metadata.max_seq_len,
+        scale_,
+        output_snd);
+
+    last_metrics_ = MTGRAttentionMetrics{};
+    return {output_snd.view({total_q, num_heads_ * head_size_}).contiguous(),
+            output_lse};
+  }
+
   auto result =
       impl_->kernel_impl.forward(attn_metadata, query, key, value, kv_cache);
   last_metrics_ = to_layer_metrics(impl_->kernel_impl.last_metrics());

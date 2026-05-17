@@ -24,6 +24,7 @@ cc_test(
     mtgr_attention_product_test.cpp
   DEPS
     :cuda_mtgr_attention_runtime
+    :cuda_mtgr_hopper_runtime
     :cuda_kernels
     :flags
     :kv_cache

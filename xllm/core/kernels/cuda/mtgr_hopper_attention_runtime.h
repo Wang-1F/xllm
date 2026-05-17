@@ -15,10 +15,25 @@ limitations under the License.
 
 #pragma once
 
-#if defined(USE_NPU)
-#include "npu_torch/mtgr_decoder_layer_impl.h"
-#elif defined(USE_CUDA)
-#include "cuda/mtgr_decoder_layer_impl.h"
-#else
-#error "MTGRDecoderLayer currently only supports USE_NPU or USE_CUDA."
-#endif
+#include <torch/torch.h>
+
+namespace xllm::kernel::cuda {
+
+void mtgr_ragged_segment_attention_hopper_unified_cuda(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& q_seq_starts_i32,
+    const torch::Tensor& matched_prefix_lens_i32,
+    int64_t match_mode,
+    const torch::Tensor& key_cache,
+    const torch::Tensor& value_cache,
+    const torch::Tensor& block_table_i32,
+    int64_t block_size,
+    int64_t max_request_len,
+    double sm_scale,
+    torch::Tensor output_snd);
+
+}  // namespace xllm::kernel::cuda

@@ -38,7 +38,7 @@ limitations under the License.
 #include "../../../../../third_party/cutlass/examples/88_hopper_fmha/collective/fmha_collective_softmax.hpp"
 #include "../../../../../third_party/cutlass/examples/88_hopper_fmha/collective/fmha_common.hpp"
 
-namespace xllm::kernel::cuda::test {
+namespace xllm::kernel::cuda {
 namespace {
 
 // Research-only Hopper path for ragged segment attention.

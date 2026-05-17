@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/platform/device.h"
 #include "cuda_ops_api.h"
+#include "mtgr_hopper_attention_runtime.h"
 #include "mtgr_flashinfer.h"
 #include "utils.h"
 
@@ -204,25 +205,6 @@ void full_attention_cuda(const torch::Tensor& query_snd,
                          const torch::Tensor& value_snd,
                          double sm_scale,
                          torch::Tensor output_snd);
-
-// Generation 3: Hopper unified research path.
-// This stays opt-in and separate from the stable wrappers.
-void mtgr_ragged_segment_attention_hopper_unified_research_cuda(
-    const torch::Tensor& query_snd,
-    const torch::Tensor& key_snd,
-    const torch::Tensor& value_snd,
-    const torch::Tensor& segment_offsets_i32,
-    const torch::Tensor& segment_rules_i32,
-    const torch::Tensor& q_seq_starts_i32,
-    const torch::Tensor& matched_prefix_lens_i32,
-    int64_t match_mode,
-    const torch::Tensor& key_cache,
-    const torch::Tensor& value_cache,
-    const torch::Tensor& block_table_i32,
-    int64_t block_size,
-    int64_t max_request_len,
-    double sm_scale,
-    torch::Tensor output_snd);
 
 namespace {
 
@@ -2184,7 +2166,7 @@ torch::Tensor run_fused_no_match_batched(const torch::Tensor& query,
       torch::TensorOptions().dtype(torch::kInt32).device(query.device()));
 
   record_stage_begin_if_needed(&timeline[kUnifiedIdx], query.device());
-  mtgr_ragged_segment_attention_hopper_unified_research_cuda(
+  xllm::kernel::cuda::mtgr_ragged_segment_attention_hopper_unified_cuda(
       query,
       key,
       value,
@@ -2403,7 +2385,7 @@ torch::Tensor run_four_segment_partial_rt_batched(
   auto output = torch::empty_like(query);
 
   record_stage_begin_if_needed(&timeline[kUnifiedIdx], query.device());
-  mtgr_ragged_segment_attention_hopper_unified_research_cuda(
+  xllm::kernel::cuda::mtgr_ragged_segment_attention_hopper_unified_cuda(
       query,
       key,
       value,
