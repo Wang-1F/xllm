@@ -156,4 +156,17 @@ torch::Tensor run_stable_ragged_segment_attention_batched_for_test(
     double sm_scale,
     MTGRAttentionTestMetrics* metrics = nullptr);
 
+// Harness bridge for the performance base: full logical mask build plus one
+// FlashInfer call, with NVTX scopes but without cudaEvent/chrono metrics.
+torch::Tensor run_mtgr_one_stage_full_base_nvtx_only(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    int64_t history_len,
+    int64_t context_len,
+    int64_t realtime_len,
+    int64_t target_len,
+    double sm_scale,
+    bool emit_nvtx);
+
 }  // namespace xllm::kernel::cuda::test

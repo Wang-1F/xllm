@@ -13,24 +13,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <torch/cuda.h>
 #include <torch/torch.h>
 
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
 #include <vector>
 
 #include "common/global_flags.h"
-#include "mtgr_attenion_test.h"
-#include "mtgr_attention_product_test.h"
-#include "mtgr_attention_torch_reference_test.h"
+#include "layers/cuda/mtgr_attention.h"
+#include "mtgr_attention_torch_reference.h"
+#include "../mtgr_attenion_test.h"
 
-namespace xllm::kernel::cuda::test {
+namespace xllm::kernel::cuda::test::mtgr_attention_harness {
 namespace {
 
 constexpr int64_t kBlockSize = 128;
@@ -89,32 +87,16 @@ int64_t odd_in_range(std::mt19937_64* rng, int64_t lo, int64_t hi) {
   return lo + 2 * dist(*rng);
 }
 
-double time_product_forward_ms(MTGRAttentionTestImpl* impl,
-                               const xllm::layer::AttentionMetadata& metadata,
-                               torch::Tensor& query_flat,
-                               torch::Tensor& key_flat,
-                               torch::Tensor& value_flat,
-                               xllm::KVCache& kv_cache,
-                               torch::Tensor* output) {
-  cudaEvent_t start = nullptr;
-  cudaEvent_t end = nullptr;
-  CHECK_EQ(cudaEventCreate(&start), cudaSuccess);
-  CHECK_EQ(cudaEventCreate(&end), cudaSuccess);
-  auto stream = c10::cuda::getCurrentCUDAStream().stream();
-  CHECK_EQ(cudaEventRecord(start, stream), cudaSuccess);
-  auto [got, lse] =
-      impl->forward(metadata, query_flat, key_flat, value_flat, kv_cache);
-  (void)lse;
-  CHECK_EQ(cudaEventRecord(end, stream), cudaSuccess);
-  CHECK_EQ(cudaEventSynchronize(end), cudaSuccess);
-  float ms = 0.0f;
-  CHECK_EQ(cudaEventElapsedTime(&ms, start, end), cudaSuccess);
-  CHECK_EQ(cudaEventDestroy(start), cudaSuccess);
-  CHECK_EQ(cudaEventDestroy(end), cudaSuccess);
-  if (output != nullptr) {
-    *output = got;
-  }
-  return static_cast<double>(ms);
+xllm::layer::MTGRAttentionImpl make_attention(int64_t heads,
+                                              int64_t head_dim,
+                                              double scale,
+                                              int64_t kv_heads) {
+  return xllm::layer::MTGRAttentionImpl(
+      heads,
+      head_dim,
+      static_cast<float>(scale),
+      kv_heads,
+      xllm::layer::MTGRAttentionBackend::kFused);
 }
 
 class MTGRAttentionProductE2EPrecisionTest : public ::testing::Test {
@@ -133,6 +115,7 @@ class MTGRAttentionProductE2EPrecisionTest : public ::testing::Test {
 };
 
 TEST_F(MTGRAttentionProductE2EPrecisionTest, NoMatchForwardUsesSegmentedApi) {
+  torch::NoGradGuard no_grad_guard;
   const auto shape = make_shape(/*partial_match=*/false);
   const double scale = 1.0 / std::sqrt(static_cast<double>(shape.head_dim));
   auto opts =
@@ -160,8 +143,7 @@ TEST_F(MTGRAttentionProductE2EPrecisionTest, NoMatchForwardUsesSegmentedApi) {
   auto value_flat =
       full_value.select(0, 0).reshape({shape.local_len(), -1}).contiguous();
 
-  MTGRAttentionTestImpl impl(
-      shape.heads, shape.head_dim, static_cast<float>(scale), shape.kv_heads);
+  auto impl = make_attention(shape.heads, shape.head_dim, scale, shape.kv_heads);
   auto [got, lse] =
       impl.forward(metadata, query_flat, key_flat, value_flat, kv_cache);
 
@@ -173,6 +155,7 @@ TEST_F(MTGRAttentionProductE2EPrecisionTest, NoMatchForwardUsesSegmentedApi) {
 
 TEST_F(MTGRAttentionProductE2EPrecisionTest,
        PartialRealTimeForwardUsesSegmentedApi) {
+  torch::NoGradGuard no_grad_guard;
   const auto shape = make_shape(/*partial_match=*/true);
   const double scale = 1.0 / std::sqrt(static_cast<double>(shape.head_dim));
   auto opts =
@@ -209,8 +192,7 @@ TEST_F(MTGRAttentionProductE2EPrecisionTest,
   auto key_flat = live_key.reshape({shape.local_len(), -1}).contiguous();
   auto value_flat = live_value.reshape({shape.local_len(), -1}).contiguous();
 
-  MTGRAttentionTestImpl impl(
-      shape.heads, shape.head_dim, static_cast<float>(scale), shape.kv_heads);
+  auto impl = make_attention(shape.heads, shape.head_dim, scale, shape.kv_heads);
   auto [got, lse] =
       impl.forward(metadata, query_flat, key_flat, value_flat, kv_cache);
 
@@ -305,55 +287,21 @@ TEST_F(MTGRAttentionProductE2EPrecisionTest,
   auto key_flat = key_snd.reshape({key_snd.size(0), -1}).contiguous();
   auto value_flat = value_snd.reshape({value_snd.size(0), -1}).contiguous();
 
-  MTGRAttentionTestImpl impl(
-      kHeads, kHeadDim, static_cast<float>(scale), kHeads);
+  auto impl = make_attention(kHeads, kHeadDim, scale, kHeads);
   auto [got, lse] = impl.forward(
       metadata, query_flat, key_flat, value_flat, mixed_setup.kv_cache);
 
   EXPECT_FALSE(lse.has_value());
   auto expected = torch::cat(expected_chunks, 0).contiguous();
-  int64_t out_start = 0;
-  for (int64_t i = 0; i < kBatchSize; ++i) {
-    auto chunk =
-        got.narrow(0, out_start, shapes[static_cast<size_t>(i)].local_len())
-            .to(torch::kFloat32);
-    if (!torch::isfinite(chunk).all().item<bool>()) {
-      auto finite_by_row =
-          torch::isfinite(chunk.view({chunk.size(0), kHeads, kHeadDim}))
-              .all({1, 2})
-              .to(torch::kCPU);
-      int64_t bad_row = -1;
-      for (int64_t row = 0; row < finite_by_row.size(0); ++row) {
-        if (!finite_by_row[row].item<bool>()) {
-          bad_row = row;
-          break;
-        }
-      }
-      std::fprintf(stderr,
-                   "[MTGR][CUDA][ProductAPI][mixed_request_level][bad] "
-                   "request=%ld matched_prefix=%ld local_len=%ld total_len=%ld "
-                   "bad_row=%ld\n",
-                   i,
-                   shapes[static_cast<size_t>(i)].matched_prefix,
-                   shapes[static_cast<size_t>(i)].local_len(),
-                   shapes[static_cast<size_t>(i)].total_len(),
-                   bad_row);
-      std::fflush(stderr);
-      break;
-    }
-    out_start += shapes[static_cast<size_t>(i)].local_len();
-  }
   expect_close("mixed_request_level", got, expected, kHeads, kHeadDim);
 }
 
 TEST_F(MTGRAttentionProductE2EPrecisionTest,
-       PurePartialBatchPartialModeVsMixedModePerf) {
+       PurePartialBatchPartialModeMatchesMixedMode) {
   torch::NoGradGuard no_grad_guard;
   constexpr int64_t kBatchSize = 100;
   constexpr int64_t kHeads = 8;
   constexpr int64_t kHeadDim = 128;
-  const int warmup = std::max(0, env_int("XLLM_MTGR_MIX_PROBE_WARMUP", 5));
-  const int repeat = std::max(1, env_int("XLLM_MTGR_MIX_PROBE_REPEAT", 20));
   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
   const auto device = torch::Device(torch::kCUDA, 0);
   auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -429,62 +377,28 @@ TEST_F(MTGRAttentionProductE2EPrecisionTest,
   auto key_flat = key_snd.reshape({key_snd.size(0), -1}).contiguous();
   auto value_flat = value_snd.reshape({value_snd.size(0), -1}).contiguous();
 
-  MTGRAttentionTestImpl impl(
-      kHeads, kHeadDim, static_cast<float>(scale), kHeads);
-  torch::Tensor partial_out;
-  torch::Tensor mixed_out;
-  for (int i = 0; i < warmup; ++i) {
-    (void)time_product_forward_ms(&impl,
-                                  partial_metadata,
-                                  query_flat,
-                                  key_flat,
-                                  value_flat,
-                                  partial_setup.kv_cache,
-                                  nullptr);
-    (void)time_product_forward_ms(&impl,
-                                  mixed_metadata,
-                                  query_flat,
-                                  key_flat,
-                                  value_flat,
-                                  partial_setup.kv_cache,
-                                  nullptr);
-  }
-
-  double partial_total_ms = 0.0;
-  double mixed_total_ms = 0.0;
-  for (int i = 0; i < repeat; ++i) {
-    partial_total_ms += time_product_forward_ms(&impl,
-                                                partial_metadata,
+  auto impl = make_attention(kHeads, kHeadDim, scale, kHeads);
+  auto [partial_out, partial_lse] = impl.forward(partial_metadata,
                                                 query_flat,
                                                 key_flat,
                                                 value_flat,
-                                                partial_setup.kv_cache,
-                                                &partial_out);
-    mixed_total_ms += time_product_forward_ms(&impl,
-                                              mixed_metadata,
-                                              query_flat,
-                                              key_flat,
-                                              value_flat,
-                                              partial_setup.kv_cache,
-                                              &mixed_out);
-  }
-  const double partial_ms = partial_total_ms / static_cast<double>(repeat);
-  const double mixed_ms = mixed_total_ms / static_cast<double>(repeat);
+                                                partial_setup.kv_cache);
+  auto [mixed_out, mixed_lse] = impl.forward(mixed_metadata,
+                                            query_flat,
+                                            key_flat,
+                                            value_flat,
+                                            partial_setup.kv_cache);
+  EXPECT_FALSE(partial_lse.has_value());
+  EXPECT_FALSE(mixed_lse.has_value());
+
   auto diff =
       (partial_out.to(torch::kFloat32) - mixed_out.to(torch::kFloat32)).abs();
   const double max_abs = diff.max().item<double>();
   const double mean_abs = diff.mean().item<double>();
   std::fprintf(stderr,
-               "[MTGR][CUDA][ProductAPI][PartialVsMixedModePerf] "
-               "requests=%ld warmup=%d repeat=%d partial_ms=%.6f "
-               "mixed_ms=%.6f mixed_over_partial=%.6f diff_max_abs=%.6e "
-               "diff_mean_abs=%.6e\n",
+               "[MTGR][CUDA][ProductAPI][PartialVsMixedMode] "
+               "requests=%ld diff_max_abs=%.6e diff_mean_abs=%.6e\n",
                kBatchSize,
-               warmup,
-               repeat,
-               partial_ms,
-               mixed_ms,
-               mixed_ms / partial_ms,
                max_abs,
                mean_abs);
   std::fflush(stderr);
@@ -494,4 +408,4 @@ TEST_F(MTGRAttentionProductE2EPrecisionTest,
 }
 
 }  // namespace
-}  // namespace xllm::kernel::cuda::test
+}  // namespace xllm::kernel::cuda::test::mtgr_attention_harness

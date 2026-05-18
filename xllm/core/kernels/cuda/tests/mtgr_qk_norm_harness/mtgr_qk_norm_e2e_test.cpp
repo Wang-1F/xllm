@@ -13,7 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "mtgr_qk_norm_contract.h"
+
 #include <cuda_runtime.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <nvtx3/nvToolsExt.h>
 #include <torch/cuda.h>
@@ -24,44 +27,18 @@ limitations under the License.
 #include <string>
 #include <tuple>
 
-#include "layers/common/qwen3_next_rms_norm.h"
-#include "mtgr_qk_norm_test.h"
-
-namespace xllm::kernel::cuda::test {
+namespace xllm::kernel::cuda::test::mtgr_qk_norm_harness {
 namespace {
-
-torch::Tensor run_project_module_qwen3_next_rms_norm(const torch::Tensor& input,
-                                                     const torch::Tensor& weight,
-                                                     double eps) {
-  auto norm = xllm::layer::Qwen3NextRMSNorm(
-      input.size(-1), eps, input.options().requires_grad(false));
-  norm->load_state_dict(xllm::StateDict({{"weight", weight}}));
-  auto input_copy = input.clone();
-  return norm->forward(input_copy);
-}
-
-std::tuple<torch::Tensor, torch::Tensor> make_sliced_qk_from_qkv(
-    int64_t tokens,
-    int64_t num_q_heads,
-    int64_t num_kv_heads,
-    int64_t head_dim,
-    const torch::TensorOptions& opts) {
-  const int64_t q_size = num_q_heads * head_dim;
-  const int64_t kv_size = num_kv_heads * head_dim;
-  auto qkv = torch::randn({tokens, q_size + 2 * kv_size}, opts) * 0.1;
-  auto q = qkv.slice(-1, 0, q_size).reshape({tokens, num_q_heads, head_dim});
-  auto k = qkv.slice(-1, q_size, q_size + kv_size)
-               .reshape({tokens, num_kv_heads, head_dim});
-  return {q, k};
-}
 
 class ScopedNvtxRange {
  public:
-  explicit ScopedNvtxRange(const std::string& name) { nvtxRangePushA(name.c_str()); }
+  explicit ScopedNvtxRange(const std::string& name) {
+    nvtxRangePushA(name.c_str());
+  }
   ~ScopedNvtxRange() { nvtxRangePop(); }
 };
 
-void run_nvtx_replay(MTGRQKNormTestImpl* impl,
+void run_nvtx_replay(IMTGRQKNormBackend* backend,
                      const torch::Tensor& q,
                      const torch::Tensor& k,
                      const torch::Tensor& q_weight,
@@ -69,42 +46,23 @@ void run_nvtx_replay(MTGRQKNormTestImpl* impl,
                      double eps,
                      int warmup,
                      int iters) {
-  CHECK(impl != nullptr);
+  CHECK(backend != nullptr);
   for (int i = 0; i < warmup; ++i) {
-    auto outputs = impl->forward(q, k, q_weight, k_weight, eps);
+    auto outputs = backend->forward(q, k, q_weight, k_weight, eps);
     (void)outputs;
   }
   CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const std::string range_name =
-      std::string("MTGR/QKNorm/") + impl->name() + "/replay";
+      std::string("MTGR/QKNorm/") + backend->name() + "/replay";
   {
     ScopedNvtxRange range(range_name);
     for (int i = 0; i < iters; ++i) {
-      auto outputs = impl->forward(q, k, q_weight, k_weight, eps);
+      auto outputs = backend->forward(q, k, q_weight, k_weight, eps);
       (void)outputs;
     }
     CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
   }
-}
-
-void expect_close(const char* tag,
-                  const torch::Tensor& got,
-                  const torch::Tensor& expected,
-                  double atol,
-                  double rtol) {
-  auto got_f32 = got.to(torch::kFloat32);
-  auto expected_f32 = expected.to(torch::kFloat32);
-  auto diff = (got_f32 - expected_f32).abs();
-  const double max_abs = diff.max().item<double>();
-  const double mean_abs = diff.mean().item<double>();
-  std::fprintf(stderr,
-               "[MTGR][QKNorm][%s] max_abs=%.6e mean_abs=%.6e\n",
-               tag,
-               max_abs,
-               mean_abs);
-  std::fflush(stderr);
-  EXPECT_TRUE(torch::allclose(got, expected, rtol, atol));
 }
 
 class MTGRQKNormE2ETest : public ::testing::Test {
@@ -127,16 +85,15 @@ TEST_F(MTGRQKNormE2ETest, ProjectBaselineMatchesProjectModuleForContiguousBF16) 
   constexpr int64_t kNumKVHeads = 8;
   constexpr int64_t kHeadDim = 128;
   constexpr double kEps = 1e-6;
-  auto opts =
-      torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
+  auto opts = torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
 
   auto q = torch::randn({kTokens, kNumQHeads, kHeadDim}, opts) * 0.1;
   auto k = torch::randn({kTokens, kNumKVHeads, kHeadDim}, opts) * 0.1;
   auto q_weight = torch::randn({kHeadDim}, opts) * 0.05;
   auto k_weight = torch::randn({kHeadDim}, opts) * 0.05;
 
-  auto impl = make_mtgr_qk_norm_project_baseline();
-  auto [q_out, k_out] = impl->forward(q, k, q_weight, k_weight, kEps);
+  auto backend = make_project_baseline_backend();
+  auto [q_out, k_out] = backend->forward(q, k, q_weight, k_weight, kEps);
 
   auto q_expected = run_project_module_qwen3_next_rms_norm(q, q_weight, kEps);
   auto k_expected = run_project_module_qwen3_next_rms_norm(k, k_weight, kEps);
@@ -157,16 +114,15 @@ TEST_F(MTGRQKNormE2ETest,
   constexpr int64_t kNumKVHeads = 8;
   constexpr int64_t kHeadDim = 128;
   constexpr double kEps = 1e-6;
-  auto opts =
-      torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
+  auto opts = torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
 
   auto [q, k] =
       make_sliced_qk_from_qkv(kTokens, kNumQHeads, kNumKVHeads, kHeadDim, opts);
   auto q_weight = torch::randn({kHeadDim}, opts) * 0.05;
   auto k_weight = torch::randn({kHeadDim}, opts) * 0.05;
 
-  auto impl = make_mtgr_qk_norm_project_baseline();
-  auto [q_out, k_out] = impl->forward(q, k, q_weight, k_weight, kEps);
+  auto backend = make_project_baseline_backend();
+  auto [q_out, k_out] = backend->forward(q, k, q_weight, k_weight, kEps);
 
   auto q_expected = run_project_module_qwen3_next_rms_norm(q, q_weight, kEps);
   auto k_expected = run_project_module_qwen3_next_rms_norm(k, k_weight, kEps);
@@ -182,16 +138,15 @@ TEST_F(MTGRQKNormE2ETest, CudaRmsNormMatchesProjectBaselineForSlicedQKVViews) {
   constexpr int64_t kNumKVHeads = 8;
   constexpr int64_t kHeadDim = 128;
   constexpr double kEps = 1e-6;
-  auto opts =
-      torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
+  auto opts = torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
 
   auto [q, k] =
       make_sliced_qk_from_qkv(kTokens, kNumQHeads, kNumKVHeads, kHeadDim, opts);
   auto q_weight = torch::randn({kHeadDim}, opts) * 0.05;
   auto k_weight = torch::randn({kHeadDim}, opts) * 0.05;
 
-  auto baseline = make_mtgr_qk_norm_project_baseline();
-  auto custom = make_mtgr_qk_norm_cuda_rms_norm();
+  auto baseline = make_project_baseline_backend();
+  auto custom = make_cuda_rms_norm_backend();
   auto [q_expected, k_expected] =
       baseline->forward(q, k, q_weight, k_weight, kEps);
   auto [q_out, k_out] = custom->forward(q, k, q_weight, k_weight, kEps);
@@ -208,16 +163,15 @@ TEST_F(MTGRQKNormE2ETest,
   constexpr int64_t kNumKVHeads = 8;
   constexpr int64_t kHeadDim = 128;
   constexpr double kEps = 1e-6;
-  auto opts =
-      torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
+  auto opts = torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
 
   auto [q, k] =
       make_sliced_qk_from_qkv(kTokens, kNumQHeads, kNumKVHeads, kHeadDim, opts);
   auto q_weight = torch::randn({kHeadDim}, opts) * 0.05;
   auto k_weight = torch::randn({kHeadDim}, opts) * 0.05;
 
-  auto baseline = make_mtgr_qk_norm_project_baseline();
-  auto custom = make_mtgr_qk_norm_strided_bf16_hd128();
+  auto baseline = make_project_baseline_backend();
+  auto custom = make_strided_bf16_hd128_backend();
   auto [q_expected, k_expected] =
       baseline->forward(q, k, q_weight, k_weight, kEps);
   auto [q_out, k_out] = custom->forward(q, k, q_weight, k_weight, kEps);
@@ -233,21 +187,20 @@ TEST_F(MTGRQKNormE2ETest, NvtxReplaySmokeForThreeImplementationsBF16) {
   constexpr int64_t kNumKVHeads = 8;
   constexpr int64_t kHeadDim = 128;
   constexpr double kEps = 1e-6;
-  auto opts =
-      torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
+  auto opts = torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
 
   auto [q, k] =
       make_sliced_qk_from_qkv(kTokens, kNumQHeads, kNumKVHeads, kHeadDim, opts);
   auto q_weight = torch::randn({kHeadDim}, opts) * 0.05;
   auto k_weight = torch::randn({kHeadDim}, opts) * 0.05;
 
-  auto baseline = make_mtgr_qk_norm_project_baseline();
-  auto reshape_plus_kernel = make_mtgr_qk_norm_cuda_rms_norm();
-  auto strided_kernel = make_mtgr_qk_norm_strided_bf16_hd128();
+  auto baseline = make_project_baseline_backend();
+  auto reshape_plus_kernel = make_cuda_rms_norm_backend();
+  auto strided_kernel = make_strided_bf16_hd128_backend();
 
   std::fprintf(stderr,
                "[MTGR][QKNorm][nvtx_replay] use NVTX ranges under "
-               "MTGR/QKNorm/<impl>/replay for host-side profiling\n");
+               "MTGR/QKNorm/<backend>/replay for host-side profiling\n");
   std::fflush(stderr);
   run_nvtx_replay(baseline.get(), q, k, q_weight, k_weight, kEps, 20, 1000);
   run_nvtx_replay(
@@ -257,4 +210,4 @@ TEST_F(MTGRQKNormE2ETest, NvtxReplaySmokeForThreeImplementationsBF16) {
 }
 
 }  // namespace
-}  // namespace xllm::kernel::cuda::test
+}  // namespace xllm::kernel::cuda::test::mtgr_qk_norm_harness

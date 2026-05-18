@@ -37,6 +37,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/platform/device.h"
+#include "core/util/mtgr_nvtx.h"
 #include "cuda_ops_api.h"
 #include "mtgr_hopper_attention_runtime.h"
 #include "mtgr_flashinfer.h"
@@ -1857,6 +1858,58 @@ torch::Tensor run_one_stage_no_match(const torch::Tensor& query_snd,
       query_snd, key_snd, value_snd, packed_mask, sm_scale, metrics);
 }
 
+torch::Tensor run_mtgr_one_stage_full_base_nvtx_only_impl(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    int64_t history_len,
+    int64_t context_len,
+    int64_t realtime_len,
+    int64_t target_len,
+    double sm_scale,
+    bool emit_nvtx) {
+  const auto device = query_snd.device();
+  torch::Tensor packed_mask;
+  if (emit_nvtx) {
+    xllm::MtgrNvtxRange range(2, "MTGR/harness/mtgr_attention/base/mask_build");
+    packed_mask = build_one_stage_packed_mask_reusing_buffer(
+        device, history_len, context_len, realtime_len, target_len);
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  } else {
+    packed_mask = build_one_stage_packed_mask_reusing_buffer(
+        device, history_len, context_len, realtime_len, target_len);
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  }
+
+  torch::Tensor output;
+  if (emit_nvtx) {
+    xllm::MtgrNvtxRange range(
+        2, "MTGR/harness/mtgr_attention/base/one_stage_flashinfer");
+    output = run_fa_segment(query_snd,
+                            key_snd,
+                            value_snd,
+                            sm_scale,
+                            /*causal=*/false,
+                            /*need_lse=*/false,
+                            /*stage_timeline=*/nullptr,
+                            packed_mask)
+                 .out_snd;
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  } else {
+    output = run_fa_segment(query_snd,
+                            key_snd,
+                            value_snd,
+                            sm_scale,
+                            /*causal=*/false,
+                            /*need_lse=*/false,
+                            /*stage_timeline=*/nullptr,
+                            packed_mask)
+                 .out_snd;
+    CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  }
+  return output;
+}
+
 torch::Tensor run_one_stage_partial_rt(const torch::Tensor& query_snd,
                                        const torch::Tensor& key_snd,
                                        const torch::Tensor& value_snd,
@@ -2502,6 +2555,27 @@ torch::Tensor run_fused_partial_rt(const torch::Tensor& query,
 }
 
 }  // namespace
+
+torch::Tensor run_mtgr_one_stage_full_base_nvtx_only(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    int64_t history_len,
+    int64_t context_len,
+    int64_t realtime_len,
+    int64_t target_len,
+    double sm_scale,
+    bool emit_nvtx) {
+  return run_mtgr_one_stage_full_base_nvtx_only_impl(query_snd,
+                                                     key_snd,
+                                                     value_snd,
+                                                     history_len,
+                                                     context_len,
+                                                     realtime_len,
+                                                     target_len,
+                                                     sm_scale,
+                                                     emit_nvtx);
+}
 
 torch::Tensor run_four_segment_no_match_batched_for_test(
     const torch::Tensor& query_snd,

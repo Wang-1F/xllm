@@ -20,9 +20,9 @@ limitations under the License.
 
 #include <limits>
 
-#include "mtgr_attenion_test.h"
+#include "../mtgr_attenion_test.h"
 
-namespace xllm::kernel::cuda::test {
+namespace xllm::kernel::cuda::test::mtgr_attention_harness {
 
 inline torch::Tensor build_mtgr_torch_full_visible_mask(
     const MTGRAttentionTestShape& shape,
@@ -109,4 +109,4 @@ inline torch::Tensor run_mtgr_torch_mask_attention_reference(
       .contiguous();
 }
 
-}  // namespace xllm::kernel::cuda::test
+}  // namespace xllm::kernel::cuda::test::mtgr_attention_harness

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "mtgr_qk_norm_test.h"
+#include "mtgr_qk_norm_contract.h"
 
 #include <glog/logging.h>
 
@@ -22,7 +22,7 @@ limitations under the License.
 
 #include "core/kernels/cuda/cuda_ops_api.h"
 
-namespace xllm::kernel::cuda::test {
+namespace xllm::kernel::cuda::test::mtgr_qk_norm_harness {
 namespace {
 
 torch::Tensor run_project_baseline_qwen3_next_rms_norm(
@@ -40,7 +40,7 @@ torch::Tensor run_project_baseline_qwen3_next_rms_norm(
   return (normalized * (1.0f + weight.to(torch::kFloat32))).to(input_dtype);
 }
 
-class MTGRQKNormProjectBaselineImpl final : public MTGRQKNormTestImpl {
+class ProjectBaselineBackend final : public IMTGRQKNormBackend {
  public:
   std::tuple<torch::Tensor, torch::Tensor> forward(
       const torch::Tensor& q,
@@ -55,7 +55,7 @@ class MTGRQKNormProjectBaselineImpl final : public MTGRQKNormTestImpl {
   const char* name() const override { return "project_baseline"; }
 };
 
-class MTGRQKNormCudaRmsNormImpl final : public MTGRQKNormTestImpl {
+class CudaRmsNormBackend final : public IMTGRQKNormBackend {
  public:
   std::tuple<torch::Tensor, torch::Tensor> forward(
       const torch::Tensor& q,
@@ -77,14 +77,40 @@ class MTGRQKNormCudaRmsNormImpl final : public MTGRQKNormTestImpl {
   const char* name() const override { return "cuda_rms_norm"; }
 };
 
+class StridedBf16Hd128Backend final : public IMTGRQKNormBackend {
+ public:
+  std::tuple<torch::Tensor, torch::Tensor> forward(
+      const torch::Tensor& q,
+      const torch::Tensor& k,
+      const torch::Tensor& q_weight,
+      const torch::Tensor& k_weight,
+      double eps) override {
+    CHECK_EQ(q.size(-1), 128);
+    CHECK_EQ(k.size(-1), 128);
+    auto q_out = torch::empty(q.sizes(), q.options());
+    auto k_out = torch::empty(k.sizes(), k.options());
+    xllm::kernel::cuda::mtgr_qk_norm_strided_bf16_hd128(
+        q_out, q, q_weight, eps);
+    xllm::kernel::cuda::mtgr_qk_norm_strided_bf16_hd128(
+        k_out, k, k_weight, eps);
+    return {q_out, k_out};
+  }
+
+  const char* name() const override { return "strided_bf16_hd128_kernel"; }
+};
+
 }  // namespace
 
-std::unique_ptr<MTGRQKNormTestImpl> make_mtgr_qk_norm_project_baseline() {
-  return std::make_unique<MTGRQKNormProjectBaselineImpl>();
+std::unique_ptr<IMTGRQKNormBackend> make_project_baseline_backend() {
+  return std::make_unique<ProjectBaselineBackend>();
 }
 
-std::unique_ptr<MTGRQKNormTestImpl> make_mtgr_qk_norm_cuda_rms_norm() {
-  return std::make_unique<MTGRQKNormCudaRmsNormImpl>();
+std::unique_ptr<IMTGRQKNormBackend> make_cuda_rms_norm_backend() {
+  return std::make_unique<CudaRmsNormBackend>();
 }
 
-}  // namespace xllm::kernel::cuda::test
+std::unique_ptr<IMTGRQKNormBackend> make_strided_bf16_hd128_backend() {
+  return std::make_unique<StridedBf16Hd128Backend>();
+}
+
+}  // namespace xllm::kernel::cuda::test::mtgr_qk_norm_harness

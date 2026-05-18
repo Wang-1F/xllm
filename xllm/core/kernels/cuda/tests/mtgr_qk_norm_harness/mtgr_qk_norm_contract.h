@@ -20,11 +20,11 @@ limitations under the License.
 #include <memory>
 #include <tuple>
 
-namespace xllm::kernel::cuda::test {
+namespace xllm::kernel::cuda::test::mtgr_qk_norm_harness {
 
-class MTGRQKNormTestImpl {
+class IMTGRQKNormBackend {
  public:
-  virtual ~MTGRQKNormTestImpl() = default;
+  virtual ~IMTGRQKNormBackend() = default;
 
   virtual std::tuple<torch::Tensor, torch::Tensor> forward(
       const torch::Tensor& q,
@@ -36,8 +36,26 @@ class MTGRQKNormTestImpl {
   virtual const char* name() const = 0;
 };
 
-std::unique_ptr<MTGRQKNormTestImpl> make_mtgr_qk_norm_project_baseline();
-std::unique_ptr<MTGRQKNormTestImpl> make_mtgr_qk_norm_cuda_rms_norm();
-std::unique_ptr<MTGRQKNormTestImpl> make_mtgr_qk_norm_strided_bf16_hd128();
+std::unique_ptr<IMTGRQKNormBackend> make_project_baseline_backend();
+std::unique_ptr<IMTGRQKNormBackend> make_cuda_rms_norm_backend();
+std::unique_ptr<IMTGRQKNormBackend> make_strided_bf16_hd128_backend();
 
-}  // namespace xllm::kernel::cuda::test
+torch::Tensor run_project_module_qwen3_next_rms_norm(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    double eps);
+
+std::tuple<torch::Tensor, torch::Tensor> make_sliced_qk_from_qkv(
+    int64_t tokens,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    const torch::TensorOptions& opts);
+
+void expect_close(const char* tag,
+                  const torch::Tensor& got,
+                  const torch::Tensor& expected,
+                  double atol,
+                  double rtol);
+
+}  // namespace xllm::kernel::cuda::test::mtgr_qk_norm_harness
