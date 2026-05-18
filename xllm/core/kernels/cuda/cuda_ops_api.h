@@ -140,6 +140,11 @@ void rms_norm(torch::Tensor output,
               torch::Tensor weight,
               double eps);
 
+void mtgr_qk_norm_strided_bf16_hd128(torch::Tensor output,
+                                     torch::Tensor input,
+                                     torch::Tensor weight,
+                                     double eps);
+
 void fused_add_rms_norm(torch::Tensor& input,     // [..., hidden_size]
                         torch::Tensor& residual,  // [..., hidden_size]
                         torch::Tensor& weight,    // [hidden_size]

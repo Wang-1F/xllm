@@ -17,31 +17,27 @@ limitations under the License.
 
 #include <torch/torch.h>
 
-#include "framework/state_dict/state_dict.h"
-#include "framework/state_dict/utils.h"
+#include <memory>
+#include <tuple>
 
-namespace xllm {
-namespace layer {
+namespace xllm::kernel::cuda::test {
 
-class Qwen3NextRMSNormImpl : public torch::nn::Module {
+class MTGRQKNormTestImpl {
  public:
-  Qwen3NextRMSNormImpl(int64_t dim,
-                       double eps,
-                       const torch::TensorOptions& options);
+  virtual ~MTGRQKNormTestImpl() = default;
 
-  torch::Tensor forward(torch::Tensor& input);
+  virtual std::tuple<torch::Tensor, torch::Tensor> forward(
+      const torch::Tensor& q,
+      const torch::Tensor& k,
+      const torch::Tensor& q_weight,
+      const torch::Tensor& k_weight,
+      double eps) = 0;
 
-  void load_state_dict(const StateDict& state_dict);
-
-  torch::Tensor weight() const { return weight_; }
-  double eps() const { return eps_; }
-
- private:
-  DEFINE_WEIGHT(weight);
-  int64_t norm_dim_;
-  double eps_;
+  virtual const char* name() const = 0;
 };
-TORCH_MODULE(Qwen3NextRMSNorm);
 
-}  // namespace layer
-}  // namespace xllm
+std::unique_ptr<MTGRQKNormTestImpl> make_mtgr_qk_norm_project_baseline();
+std::unique_ptr<MTGRQKNormTestImpl> make_mtgr_qk_norm_cuda_rms_norm();
+std::unique_ptr<MTGRQKNormTestImpl> make_mtgr_qk_norm_strided_bf16_hd128();
+
+}  // namespace xllm::kernel::cuda::test

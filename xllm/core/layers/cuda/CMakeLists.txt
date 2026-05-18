@@ -47,3 +47,20 @@ cc_test(
     glog::glog
 )
 target_link_libraries(xattention_test PRIVATE brpc)
+
+cc_test(
+  NAME
+    custom_mask_attention_integration_test
+  SRCS
+    tests/custom_mask_attention_integration_test.cpp
+  DEPS
+    :cuda_layers
+    :cuda_kernels
+    :cuda_mtgr_attention_runtime
+    :flags
+    :kv_cache
+    torch
+    GTest::gtest_main
+    glog::glog
+)
+target_link_libraries(custom_mask_attention_integration_test PRIVATE brpc)

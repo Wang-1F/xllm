@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
 #include <torch/cuda.h>
 
 #include <cub/cub.cuh>
@@ -37,6 +38,65 @@ using CubMaxOp = cub::Max;
 namespace {
 
 using namespace xllm::kernel::cuda;
+constexpr int kMTGRQKNormHeadDim = 128;
+constexpr int kMTGRQKNormWarpSize = 32;
+constexpr int kMTGRQKNormElemsPerLane =
+    kMTGRQKNormHeadDim / kMTGRQKNormWarpSize;
+constexpr uint32_t kMTGRQKNormFinalMask = 0xffffffffu;
+
+__device__ __forceinline__ float mtgr_qk_norm_warp_reduce_sum(float value) {
+#pragma unroll
+  for (int offset = kMTGRQKNormWarpSize / 2; offset > 0; offset /= 2) {
+    value += __shfl_xor_sync(kMTGRQKNormFinalMask, value, offset);
+  }
+  return value;
+}
+
+__global__ void mtgr_qk_norm_strided_bf16_hd128_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ weight,
+    int64_t token_stride,
+    int64_t head_stride,
+    int64_t num_heads,
+    int64_t num_rows,
+    float eps) {
+  const int warps_per_block = blockDim.x / kMTGRQKNormWarpSize;
+  const int warp_id = threadIdx.x / kMTGRQKNormWarpSize;
+  const int lane_id = threadIdx.x % kMTGRQKNormWarpSize;
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * warps_per_block +
+                      static_cast<int64_t>(warp_id);
+  if (row >= num_rows) {
+    return;
+  }
+
+  const int64_t token_idx = row / num_heads;
+  const int64_t head_idx = row % num_heads;
+  const int64_t input_base = token_idx * token_stride + head_idx * head_stride;
+  const int64_t output_base = row * kMTGRQKNormHeadDim;
+
+  float values[kMTGRQKNormElemsPerLane];
+  float sum_squares = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kMTGRQKNormElemsPerLane; ++i) {
+    const int dim = lane_id * kMTGRQKNormElemsPerLane + i;
+    const float x = __bfloat162float(input[input_base + dim]);
+    values[i] = x;
+    sum_squares += x * x;
+  }
+
+  sum_squares = mtgr_qk_norm_warp_reduce_sum(sum_squares);
+  const float inv_rms =
+      rsqrtf(sum_squares / static_cast<float>(kMTGRQKNormHeadDim) + eps);
+
+#pragma unroll
+  for (int i = 0; i < kMTGRQKNormElemsPerLane; ++i) {
+    const int dim = lane_id * kMTGRQKNormElemsPerLane + i;
+    const float scale = 1.0f + __bfloat162float(weight[dim]);
+    output[output_base + dim] =
+        __float2bfloat16_rn(values[i] * inv_rms * scale);
+  }
+}
 
 template <typename scalar_t>
 __global__ void rms_norm_kernel(
@@ -451,6 +511,27 @@ void rms_norm(torch::Tensor output,  // [..., hidden_size]
                                      num_tokens,
                                      hidden_size);
   });
+}
+
+void mtgr_qk_norm_strided_bf16_hd128(torch::Tensor output,
+                                     torch::Tensor input,
+                                     torch::Tensor weight,
+                                     double eps) {
+  const int64_t rows = input.size(0) * input.size(1);
+  constexpr int kWarpsPerBlock = 8;
+  dim3 block(kWarpsPerBlock * kMTGRQKNormWarpSize);
+  dim3 grid((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  mtgr_qk_norm_strided_bf16_hd128_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<c10::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(output.data_ptr<c10::BFloat16>()),
+      reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr<c10::BFloat16>()),
+      input.stride(0),
+      input.stride(1),
+      input.size(1),
+      rows,
+      static_cast<float>(eps));
 }
 
 void fused_add_rms_norm(torch::Tensor& input,     // [..., hidden_size]

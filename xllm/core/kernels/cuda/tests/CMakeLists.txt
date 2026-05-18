@@ -35,6 +35,20 @@ cc_test(
 
 cc_test(
   NAME
+    mtgr_qk_norm_e2e_test
+  SRCS
+    mtgr_qk_norm_e2e_test.cpp
+    mtgr_qk_norm_test.cpp
+    mtgr_qk_norm_kernel.cu
+  DEPS
+    :cuda_layers
+    torch
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
     mtgr_attention_one_vs_multi_stage_perf_test
   SRCS
     mtgr_attention_one_vs_multi_stage_perf_test.cpp

@@ -18,11 +18,33 @@ limitations under the License.
 #include <cmath>
 #include <tuple>
 
+#include "core/kernels/cuda/cuda_ops_api.h"
 #include "core/util/mtgr_nvtx.h"
 #include "core/util/mtgr_trace.h"
 
 namespace xllm {
 namespace layer {
+namespace {
+
+bool use_mtgr_qk_norm_fast_path(const torch::Tensor& input, int64_t head_dim) {
+  return input.is_cuda() && input.scalar_type() == torch::kBFloat16 &&
+         input.dim() == 3 && input.size(-1) == 128 && head_dim == 128 &&
+         input.stride(-1) == 1;
+}
+
+torch::Tensor run_mtgr_qk_norm(torch::Tensor input,
+                               Qwen3NextRMSNorm& norm,
+                               int64_t head_dim) {
+  if (use_mtgr_qk_norm_fast_path(input, head_dim)) {
+    auto output = torch::empty(input.sizes(), input.options());
+    xllm::kernel::cuda::mtgr_qk_norm_strided_bf16_hd128(
+        output, input, norm->weight(), norm->eps());
+    return output;
+  }
+  return norm->forward(input);
+}
+
+}  // namespace
 
 CustomMaskAttentionImpl::CustomMaskAttentionImpl(
     const ModelArgs& args,
@@ -110,9 +132,9 @@ torch::Tensor CustomMaskAttentionImpl::forward(
   {
     MTGR_NVTX_RANGE(2, "MTGR/attention/qk_norm");
     auto q_reshaped = q.reshape({tokens, num_heads_, head_dim_});
-    auto q_normed = q_norm_->forward(q_reshaped);
+    auto q_normed = run_mtgr_qk_norm(q_reshaped, q_norm_, head_dim_);
     auto k_reshaped = k.reshape({tokens, num_kv_heads_, head_dim_});
-    auto k_normed = k_norm_->forward(k_reshaped);
+    auto k_normed = run_mtgr_qk_norm(k_reshaped, k_norm_, head_dim_);
 
     q = q_normed.view({tokens, q_size_});
     k = k_normed.view({tokens, kv_size_});
