@@ -712,8 +712,10 @@ void run_warmup(const std::vector<MTGRAttentionHarnessMetadata>& metadata_cases,
     for (const auto& metadata : metadata_cases) {
       auto data = build_case_data(metadata, device);
       auto base = make_full_flashinfer_base_backend(metadata);
+      auto block_base = make_block_sparse_flashinfer_base_backend(metadata);
       auto hopper = make_hopper_unified_backend(metadata);
       CHECK(run_base(base.get(), &data).defined());
+      CHECK(run_base(block_base.get(), &data).defined());
       CHECK(run_hopper(hopper.get(), &data).defined());
     }
   }
@@ -764,10 +766,20 @@ TEST_F(MTGRAttentionHarnessTest, Precision) {
   for (const auto& metadata : metadata_cases) {
     auto data = build_case_data(metadata, device_);
     auto base = make_full_flashinfer_base_backend(metadata);
+    auto block_base = make_block_sparse_flashinfer_base_backend(metadata);
     auto hopper = make_hopper_unified_backend(metadata);
     auto base_out = live_slice_from_base(run_base(base.get(), &data), metadata);
+    auto block_base_out =
+        live_slice_from_base(run_base(block_base.get(), &data), metadata);
     auto hopper_out = run_hopper(hopper.get(), &data);
+    auto block_diff = compare_outputs(base_out, block_base_out);
     auto diff = compare_outputs(base_out, hopper_out);
+    EXPECT_TRUE(block_diff.all_finite)
+        << "block_sparse_base mode=" << metadata.mode_name()
+        << " pair_id=" << metadata.pair_id;
+    EXPECT_LE(block_diff.max_abs, max_abs_threshold)
+        << "block_sparse_base mode=" << metadata.mode_name()
+        << " pair_id=" << metadata.pair_id;
     EXPECT_TRUE(diff.all_finite) << "mode=" << metadata.mode_name()
                                  << " pair_id=" << metadata.pair_id;
     EXPECT_LE(diff.max_abs, max_abs_threshold)
@@ -812,6 +824,7 @@ TEST_F(MTGRAttentionHarnessTest, PerfNvtxCsv) {
     for (int r = 0; r < repeat; ++r) {
       auto data = build_case_data(metadata, device_);
       auto base = make_full_flashinfer_base_backend(metadata);
+      auto block_base = make_block_sparse_flashinfer_base_backend(metadata);
       auto hopper = make_hopper_unified_backend(metadata);
 
       CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -822,6 +835,17 @@ TEST_F(MTGRAttentionHarnessTest, PerfNvtxCsv) {
         const auto root = base->nvtx_root_name(metadata);
         xllm::MtgrNvtxRange range(1, root.c_str());
         CHECK(run_base(base.get(), &data).defined());
+      }
+      CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+      CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
+      ++idx;
+      write_perf_label_row(labels, idx, block_base->name(), metadata, r + 1);
+      labels.flush();
+      {
+        const auto root = block_base->nvtx_root_name(metadata);
+        xllm::MtgrNvtxRange range(1, root.c_str());
+        CHECK(run_base(block_base.get(), &data).defined());
       }
       CHECK_EQ(cudaDeviceSynchronize(), cudaSuccess);
 

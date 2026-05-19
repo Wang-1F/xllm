@@ -36,6 +36,21 @@ void mtgr_ragged_segment_attention_hopper_unified_cuda(
     double sm_scale,
     torch::Tensor output_snd);
 
+void mtgr_flashinfer_token_mask_attention_cuda(
+    const torch::Tensor& query_snd,
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& segment_rules_i32,
+    const torch::Tensor& q_seq_starts_i32,
+    const torch::Tensor& matched_prefix_lens_i32,
+    const torch::Tensor& key_cache,
+    const torch::Tensor& value_cache,
+    const torch::Tensor& block_table_i32,
+    int64_t block_size,
+    double sm_scale,
+    torch::Tensor output_snd);
+
 void mtgr_kv_cache_writeback_cuda(
     const torch::Tensor& key_snd,
     const torch::Tensor& value_snd,

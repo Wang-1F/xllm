@@ -557,6 +557,11 @@ DEFINE_int32(mtgr_nvtx_level,
              "request/batch/model/attention/kernel route scopes, 2 also marks "
              "layer-level and projection/layout sub-scopes.");
 
+DEFINE_string(mtgr_attention_backend,
+              "hopper",
+              "MTGR CUDA attention backend. Supported values: hopper, "
+              "flashinfer_token_mask.");
+
 // --- reasoning parser config ---
 
 DEFINE_string(reasoning_parser,

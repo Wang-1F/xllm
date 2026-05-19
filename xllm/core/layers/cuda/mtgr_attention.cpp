@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <utility>
 
+#include "core/common/global_flags.h"
 #include "kernels/cuda/mtgr_hopper_attention_runtime.h"
 #include "util/mtgr_nvtx.h"
 #include "util/mtgr_trace.h"
@@ -94,7 +95,25 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
                 << " matched_prefix_lens="
                 << attn_metadata.mtgr_matched_prefix_lens_i32.sizes();
 
-  {
+  const bool use_flashinfer_token_mask_base =
+      FLAGS_mtgr_attention_backend == "flashinfer_token_mask";
+  if (use_flashinfer_token_mask_base) {
+    MTGR_NVTX_RANGE(1, "MTGR/kernel/flashinfer_token_mask_base_call");
+    kernel::cuda::mtgr_flashinfer_token_mask_attention_cuda(
+        query_snd,
+        key_snd,
+        value_snd,
+        attn_metadata.mtgr_segment_offsets_i32,
+        attn_metadata.mtgr_segment_rules_i32,
+        attn_metadata.mtgr_q_seq_starts_i32,
+        attn_metadata.mtgr_matched_prefix_lens_i32,
+        key_cache,
+        value_cache,
+        attn_metadata.block_table,
+        block_size,
+        scale_,
+        output_snd);
+  } else {
     MTGR_NVTX_RANGE(1, "MTGR/kernel/hopper_unified_call");
     kernel::cuda::mtgr_ragged_segment_attention_hopper_unified_cuda(
         query_snd,
@@ -114,7 +133,7 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
         output_snd);
   }
 
-  {
+  if (!use_flashinfer_token_mask_base) {
     MTGR_NVTX_RANGE(1, "MTGR/kernel/kv_writeback_call");
     kernel::cuda::mtgr_kv_cache_writeback_cuda(
         raw_key_snd,

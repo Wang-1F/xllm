@@ -130,6 +130,8 @@ MTGRAttentionCaseData build_case_data(
 
 std::unique_ptr<IMTGRAttentionBackend> make_full_flashinfer_base_backend(
     const MTGRAttentionHarnessMetadata& metadata);
+std::unique_ptr<IMTGRAttentionBackend> make_block_sparse_flashinfer_base_backend(
+    const MTGRAttentionHarnessMetadata& metadata);
 std::unique_ptr<IMTGRAttentionBackend> make_hopper_unified_backend(
     const MTGRAttentionHarnessMetadata& metadata);
 

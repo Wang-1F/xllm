@@ -260,6 +260,7 @@ DECLARE_bool(output_rec_logprobs);
 
 DECLARE_int32(mtgr_trace_log_level);
 DECLARE_int32(mtgr_nvtx_level);
+DECLARE_string(mtgr_attention_backend);
 
 // --- qwen3 reranker config ---
 DECLARE_bool(enable_qwen3_reranker);
