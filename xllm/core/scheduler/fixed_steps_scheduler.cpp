@@ -38,6 +38,35 @@ limitations under the License.
 #include "framework/request/sequence.h"
 
 namespace xllm {
+namespace {
+
+constexpr const char* kMtgrSegmentOffsetsName = "segment_offsets";
+
+size_t get_mtgr_cacheable_len(const Sequence* sequence) {
+  auto offsets =
+      sequence->get_mm_data().get<torch::Tensor>(kMtgrSegmentOffsetsName)
+          .value()
+          .to(torch::kInt32)
+          .cpu()
+          .contiguous();
+  if (offsets.dim() == 2 && offsets.size(0) == 1) {
+    offsets = offsets.view({offsets.size(1)}).contiguous();
+  }
+  CHECK_EQ(offsets.dim(), 1) << "MTGR segment_offsets must be 1-D or [1, N]";
+  CHECK_GE(offsets.size(0), 2)
+      << "MTGR segment_offsets must include at least begin and end";
+  const auto* offsets_ptr = offsets.data_ptr<int32_t>();
+  const int32_t cacheable_len = offsets_ptr[offsets.size(0) - 2];
+  const int32_t total_len = offsets_ptr[offsets.size(0) - 1];
+  CHECK_GE(cacheable_len, 0) << "MTGR cacheable length must be non-negative";
+  CHECK_LE(cacheable_len, total_len)
+      << "MTGR cacheable length cannot exceed total length";
+  CHECK_EQ(static_cast<size_t>(total_len), sequence->num_tokens())
+      << "MTGR segment_offsets last element must match sequence length";
+  return static_cast<size_t>(cacheable_len);
+}
+
+}  // namespace
 
 FixedStepsScheduler::FixedStepsScheduler(Engine* engine, const Options& options)
     : ContinuousScheduler(engine, options),
@@ -441,7 +470,7 @@ FixedStepsScheduler::RecPrefillOnlySchedulerPipeline::create_batches(
 bool FixedStepsScheduler::RecPrefillOnlySchedulerPipeline::allocate_kv_cache(
     KVCacheManager* kv_cache_manager,
     Sequence* sequence) {
-  return kv_cache_manager->allocate(sequence);
+  return kv_cache_manager->allocate(sequence, get_mtgr_cacheable_len(sequence));
 }
 
 std::vector<Batch>

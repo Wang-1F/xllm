@@ -58,11 +58,16 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
   torch::Tensor query_snd;
   torch::Tensor key_snd;
   torch::Tensor value_snd;
+  torch::Tensor raw_key_snd;
+  torch::Tensor raw_value_snd;
   {
     MTGR_NVTX_RANGE(2, "MTGR/attention/prepare_qkv_snd");
     query_snd = query.view({total_q, num_heads_, head_size_}).contiguous();
-    key_snd = key.view({total_q, num_kv_heads_, head_size_});
-    value_snd = value.view({total_q, num_kv_heads_, head_size_});
+    raw_key_snd = key.view({total_q, num_kv_heads_, head_size_}).contiguous();
+    raw_value_snd =
+        value.view({total_q, num_kv_heads_, head_size_}).contiguous();
+    key_snd = raw_key_snd;
+    value_snd = raw_value_snd;
     if (num_kv_heads_ != num_heads_) {
       const int64_t repeat_factor = num_heads_ / num_kv_heads_;
       key_snd = key_snd.repeat_interleave(repeat_factor, 1);
@@ -107,6 +112,20 @@ MTGRAttentionImpl::forward(const AttentionMetadata& attn_metadata,
         attn_metadata.max_seq_len,
         scale_,
         output_snd);
+  }
+
+  {
+    MTGR_NVTX_RANGE(1, "MTGR/kernel/kv_writeback_call");
+    kernel::cuda::mtgr_kv_cache_writeback_cuda(
+        raw_key_snd,
+        raw_value_snd,
+        attn_metadata.mtgr_segment_offsets_i32,
+        attn_metadata.mtgr_q_seq_starts_i32,
+        attn_metadata.mtgr_matched_prefix_lens_i32,
+        attn_metadata.block_table,
+        key_cache,
+        value_cache,
+        attn_metadata.max_seq_len);
   }
 
   MTGR_TRACE(1) << "[ATTN] mtgr_attention fused end output_shape="

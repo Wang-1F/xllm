@@ -831,8 +831,80 @@ TEST(BatchTest, MtgrRecPrefillBuilderTrimsEmbeddingAtPrefixBoundary) {
   EXPECT_TRUE(equal(mtgr_params->mtgr_matched_prefix_lens_i32,
                     std::vector<int32_t>{4}));
   EXPECT_EQ(static_cast<int32_t>(mtgr_params->mtgr_match_mode), 1);
+  EXPECT_EQ(sequence->kv_state().kv_cache_tokens_num(), 4);
+  EXPECT_EQ(forward_input.input_params.new_cache_slots.numel(), 0);
+  EXPECT_TRUE(equal(forward_input.input_params.block_tables,
+                    std::vector<int32_t>{1}));
   EXPECT_TRUE(equal(forward_input.sampling_params.selected_token_idxes,
                     std::vector<int32_t>{0}));
+}
+
+TEST(BatchTest, MtgrRecPrefillBuilderUsesCacheableLenForKvSlots) {
+  torch::Device device(Device::type_torch(), 0);
+  const uint32_t n_blocks = 4;
+  const uint32_t block_size = 4;
+  BlockManager::Options options;
+  options.num_blocks(n_blocks).block_size(block_size);
+  BlockManagerImpl manager(options);
+
+  RequestSamplingParam sampling_param;
+  sampling_param.is_embeddings = true;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(1);
+
+  SequenceParams seq_params;
+  seq_params.seq_capacity = 16;
+  seq_params.stopping_checker = &stopping_checker;
+  seq_params.sampling_param = &sampling_param;
+  seq_params.skip_special_tokens = true;
+  seq_params.echo = false;
+  seq_params.logprobs = false;
+  seq_params.enable_schedule_overlap = false;
+  seq_params.rec_type = RecType::kMtgr;
+
+  const std::string prompt = "mtgr";
+  std::vector<int32_t> prompt_tokens = {11, 12, 13, 14, 15};
+  torch::Tensor input_embedding =
+      torch::tensor({{1.0f, 2.0f},
+                     {3.0f, 4.0f},
+                     {5.0f, 6.0f},
+                     {7.0f, 8.0f},
+                     {9.0f, 10.0f}});
+
+  MMDict mm_dict;
+  mm_dict["segment_offsets"] = torch::tensor({0, 2, 3, 4, 5}, torch::kInt32);
+  mm_dict["segment_rules"] = torch::tensor({0, 1, 0, 2}, torch::kInt32);
+  MMData mm_data(MMType::EMBEDDING, mm_dict);
+
+  SequencesGroup sequence_group(
+      prompt, prompt_tokens, input_embedding, mm_data, seq_params);
+  auto* sequence = sequence_group.sequences()[0].get();
+  sequence->add_kv_blocks(manager.allocate(1));
+
+  Batch batch;
+  batch.add(&sequence_group);
+  ForwardInput forward_input = batch.prepare_rec_forward_input(
+      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0, ModelArgs());
+
+  EXPECT_TRUE(
+      equal(forward_input.token_ids, std::vector<int32_t>{11, 12, 13, 14, 15}));
+  EXPECT_TRUE(
+      equal(forward_input.positions, std::vector<int32_t>{0, 1, 2, 3, 4}));
+  EXPECT_EQ(sequence->kv_state().kv_cache_tokens_num(), 4);
+  EXPECT_TRUE(equal(forward_input.input_params.new_cache_slots,
+                    std::vector<int32_t>{4, 5, 6, 7}));
+  EXPECT_TRUE(equal(forward_input.input_params.block_tables,
+                    std::vector<int32_t>{1}));
+
+  const auto* mtgr_params = forward_input.input_params.mtgr_params();
+  ASSERT_NE(mtgr_params, nullptr);
+  EXPECT_TRUE(equal(mtgr_params->mtgr_q_seq_starts_i32,
+                    std::vector<int32_t>{0}));
+  EXPECT_TRUE(equal(mtgr_params->mtgr_matched_prefix_lens_i32,
+                    std::vector<int32_t>{0}));
+  EXPECT_EQ(static_cast<int32_t>(mtgr_params->mtgr_match_mode), 0);
+  EXPECT_TRUE(equal(forward_input.sampling_params.selected_token_idxes,
+                    std::vector<int32_t>{4}));
 }
 
 }  // namespace xllm

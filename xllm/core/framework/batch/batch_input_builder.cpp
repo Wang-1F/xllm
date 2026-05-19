@@ -57,7 +57,8 @@ BatchInputBuilder::BatchInputBuilder(
     const ModelArgs* args,
     BatchForwardType batch_forward_type,
     int32_t cp_size,
-    ThreadPool* thread_pool)
+    ThreadPool* thread_pool,
+    const std::vector<uint32_t>* cache_seq_lens)
     : sequences_(sequences),
       allowed_max_tokens_(allowed_max_tokens),
       input_embeddings_vec_(input_embeddings_vec),
@@ -68,6 +69,7 @@ BatchInputBuilder::BatchInputBuilder(
       swap_block_transfer_infos_(swap_block_transfer_infos),
       batch_id_(batch_id),
       cp_size_(std::max(1, cp_size)) {
+  cache_seq_lens_ = cache_seq_lens;
   // Reserve space for better performance
   state_.flatten_tokens_vec.reserve(1000);
   state_.flatten_positions_vec.reserve(1000);
@@ -290,9 +292,18 @@ void BatchInputBuilder::process_single_sequence(
   }
   const uint32_t logical_seq_len = q_seq_len + n_kv_cache_tokens;
   const uint32_t seq_len = padded_q_seq_len + n_kv_cache_tokens;
+  const bool has_cache_seq_len_override =
+      cache_seq_lens_ != nullptr &&
+      static_cast<size_t>(seq_index) < cache_seq_lens_->size();
+  const uint32_t cache_seq_len =
+      has_cache_seq_len_override ? (*cache_seq_lens_)[seq_index] : seq_len;
+  CHECK_LE(cache_seq_len, seq_len)
+      << "cache sequence length cannot exceed attention sequence length";
+  CHECK_GE(cache_seq_len, n_kv_cache_tokens)
+      << "cache sequence length cannot be shorter than matched prefix";
 
   // Validation
-  CHECK_GE(sequence->kv_state().current_max_tokens_capacity(), seq_len);
+  CHECK_GE(sequence->kv_state().current_max_tokens_capacity(), cache_seq_len);
   CHECK_GT(q_seq_len, 0) << "at least one token should be processed. "
                          << "n_tokens: " << n_tokens
                          << ", n_kv_cache_tokens: " << n_kv_cache_tokens
@@ -320,7 +331,9 @@ void BatchInputBuilder::process_single_sequence(
   setup_kv_cache_info(sequence,
                       n_kv_cache_tokens,
                       seq_len,
+                      cache_seq_len,
                       padded_q_seq_len,
+                      has_cache_seq_len_override,
                       state_ptr,
                       write_block_ids_ptr);
 
@@ -439,47 +452,74 @@ void BatchInputBuilder::setup_kv_cache_info(
     Sequence* sequence,
     uint32_t n_kv_cache_tokens,
     uint32_t seq_len,
+    uint32_t cache_seq_len,
     uint32_t q_seq_len,
+    bool trim_block_table_to_cache_seq_len,
     BuilderState* state_ptr,
     std::unordered_set<int32_t>* write_block_ids_ptr) {
   BuilderState& state = state_ptr ? *state_ptr : state_;
   std::unordered_set<int32_t>& write_block_ids =
       write_block_ids_ptr ? *write_block_ids_ptr : write_block_ids_;
 
-  sequence->kv_state().incr_kv_cache_tokens_num(/*size=*/q_seq_len);
+  (void)seq_len;
+  (void)q_seq_len;
+  const uint32_t cache_q_seq_len = cache_seq_len - n_kv_cache_tokens;
+  sequence->kv_state().incr_kv_cache_tokens_num(/*size=*/cache_q_seq_len);
 
   const auto blocks = sequence->kv_state().kv_blocks();
   const auto slot_ids =
-      sequence->kv_state().kv_cache_slots(n_kv_cache_tokens, seq_len);
+      cache_seq_len > n_kv_cache_tokens
+          ? sequence->kv_state().kv_cache_slots(n_kv_cache_tokens,
+                                                cache_seq_len)
+          : std::vector<int32_t>();
   state.new_token_slot_ids.insert(
       state.new_token_slot_ids.end(), slot_ids.begin(), slot_ids.end());
 
   std::vector<int32_t> block_ids;
   std::vector<uint64_t> u_block_ids;
-  block_ids.reserve(blocks.size());
-  int32_t block_size = 0;
+  int32_t block_size = blocks.empty() ? 1 : blocks[0].size();
+  const size_t cache_block_count =
+      cache_seq_len == 0
+          ? 0
+          : (static_cast<size_t>(cache_seq_len) + block_size - 1) / block_size;
+  const size_t block_table_count =
+      trim_block_table_to_cache_seq_len ? cache_block_count : blocks.size();
+  CHECK_LE(block_table_count, blocks.size())
+      << "cache sequence length requires more blocks than allocated";
+  block_ids.reserve(block_table_count);
   auto& transfer_kv_info = sequence->kv_state().transfer_kv_info();
   uint32_t push_size = 0;
   if (transfer_kv_info.has_value()) {
+    const size_t remote_blocks =
+        transfer_kv_info.value().remote_blocks_ids.size();
     push_size =
-        blocks.size() - transfer_kv_info.value().remote_blocks_ids.size();
+        block_table_count > remote_blocks ? block_table_count - remote_blocks
+                                          : 0;
   }
-  for (const auto& block : blocks) {
-    block_size = block.size();
+  for (size_t block_idx = 0; block_idx < block_table_count; ++block_idx) {
+    const auto& block = blocks[block_idx];
     block_ids.push_back(block.id());
     if (block_ids.size() > push_size) {
       u_block_ids.emplace_back(block.id());
     }
     state.paged_kv_indices.push_back(block.id());
   }
-  state.paged_kv_indptr.push_back(state.paged_kv_indptr.back() + blocks.size());
+  state.paged_kv_indptr.push_back(state.paged_kv_indptr.back() +
+                                  block_table_count);
   int32_t last_page_len =
-      (seq_len % block_size == 0) ? block_size : seq_len % block_size;
+      cache_seq_len == 0
+          ? 0
+          : ((cache_seq_len % block_size == 0) ? block_size
+                                               : cache_seq_len % block_size);
   state.paged_kv_last_page_len.push_back(last_page_len);
 
   // calculate the block ids that need to be written
   int32_t kv_cache_block_idx = n_kv_cache_tokens / block_size;
-  for (auto iter = block_ids.cbegin() + kv_cache_block_idx;
+  const auto write_begin_iter =
+      block_ids.cbegin() +
+      std::min<size_t>(static_cast<size_t>(kv_cache_block_idx),
+                       block_ids.size());
+  for (auto iter = write_begin_iter;
        iter != block_ids.cend();
        ++iter) {
     write_block_ids.insert(*iter);

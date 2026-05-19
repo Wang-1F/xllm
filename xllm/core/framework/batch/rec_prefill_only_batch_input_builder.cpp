@@ -83,6 +83,7 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
   std::vector<torch::Tensor> segment_offset_rows_i32;
   std::vector<torch::Tensor> matched_prefix_lens_i32;
   std::vector<torch::Tensor> q_seq_starts_i32;
+  std::vector<uint32_t> cacheable_seq_lens;
   torch::Tensor batch_segment_rules_i32;
   bool has_no_match_request = false;
   bool has_partial_match_request = false;
@@ -124,6 +125,38 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
         total_input_len = token_ids.size(0);
         input_token_ids_i64 = token_ids;
       }
+
+      auto offsets = get_i32_tensor(mm_data, kMtgrSegmentOffsetsName);
+      if (offsets.dim() == 2 && offsets.size(0) == 1) {
+        offsets = offsets.view({offsets.size(1)}).contiguous();
+      }
+      auto rules = get_i32_tensor(mm_data, kMtgrSegmentRulesName);
+      if (rules.dim() == 2 && rules.size(0) == 1) {
+        rules = rules.view({rules.size(1)}).contiguous();
+      }
+      CHECK_GE(offsets.size(0), 2)
+          << "MTGR segment_offsets must include at least begin and end";
+      const auto* offsets_ptr = offsets.data_ptr<int32_t>();
+      const int32_t cacheable_len =
+          offsets_ptr[static_cast<int64_t>(offsets.size(0)) - 2];
+      const int32_t logical_total_len =
+          offsets_ptr[static_cast<int64_t>(offsets.size(0)) - 1];
+      CHECK_EQ(logical_total_len, total_input_len)
+          << "MTGR segment_offsets last element must match input length";
+      CHECK_LE(cacheable_len, logical_total_len)
+          << "MTGR cacheable length cannot exceed total length";
+      CHECK_GE(cacheable_len, 0) << "MTGR cacheable length must be non-negative";
+      CHECK_LE(matched_prefix, cacheable_len)
+          << "MTGR matched prefix cannot exceed cacheable length";
+      if (matched_prefix > 0) {
+        const auto blocks = sequence->kv_state().kv_blocks();
+        CHECK(!blocks.empty())
+            << "MTGR matched prefix requires allocated/shared KV blocks";
+        CHECK_EQ(matched_prefix % static_cast<int32_t>(blocks[0].size()), 0)
+            << "MTGR matched prefix must be block aligned";
+      }
+      cacheable_seq_lens.push_back(static_cast<uint32_t>(cacheable_len));
+
       const int32_t local_q_len =
           static_cast<int32_t>(total_input_len - matched_prefix);
       q_seq_starts_i32.emplace_back(
@@ -132,6 +165,7 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
                     << " input_mode="
                     << (uses_embedding ? "input_embedding" : "token_ids")
                     << " total_input_len=" << total_input_len
+                    << " cacheable_len=" << cacheable_len
                     << " matched_prefix=" << matched_prefix
                     << " local_q_len=" << local_q_len
                     << " q_start=" << packed_q_start;
@@ -148,14 +182,6 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
             /*length=*/local_q_len));
       }
 
-      auto offsets = get_i32_tensor(mm_data, kMtgrSegmentOffsetsName);
-      if (offsets.dim() == 2 && offsets.size(0) == 1) {
-        offsets = offsets.view({offsets.size(1)}).contiguous();
-      }
-      auto rules = get_i32_tensor(mm_data, kMtgrSegmentRulesName);
-      if (rules.dim() == 2 && rules.size(0) == 1) {
-        rules = rules.view({rules.size(1)}).contiguous();
-      }
       MTGR_TRACE(2) << "[BATCH] seq_idx=" << sequences.size() - 1
                     << " segment_offsets_shape=" << offsets.sizes()
                     << " segment_rules_shape=" << rules.sizes();
@@ -181,7 +207,8 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
                             args_,
                             batch_forward_type_,
                             /*cp_size=*/1,
-                            thread_pool_);
+                            thread_pool_,
+                            &cacheable_seq_lens);
   ForwardInput forward_input;
   {
     MTGR_NVTX_RANGE(2, "MTGR/batch/base_build_forward_input");

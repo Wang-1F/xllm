@@ -43,7 +43,8 @@ class BatchInputBuilder {
       const ModelArgs* args,
       BatchForwardType batch_forward_type,
       int32_t cp_size = 1,
-      ThreadPool* thread_pool = nullptr);
+      ThreadPool* thread_pool = nullptr,
+      const std::vector<uint32_t>* cache_seq_lens = nullptr);
 
   ForwardInput build_forward_input(uint32_t num_decoding_tokens,
                                    uint32_t min_decoding_batch_size);
@@ -132,7 +133,9 @@ class BatchInputBuilder {
       Sequence* sequence,
       uint32_t n_kv_cache_tokens,
       uint32_t seq_len,
+      uint32_t cache_seq_len,
       uint32_t q_seq_len,
+      bool trim_block_table_to_cache_seq_len,
       BuilderState* state_ptr = nullptr,
       std::unordered_set<int32_t>* write_block_ids_ptr = nullptr);
 
@@ -151,6 +154,7 @@ class BatchInputBuilder {
   uint32_t num_sequences_ = 0;
   bool need_unique_tokens_ = true;
   int32_t cp_size_ = 1;
+  const std::vector<uint32_t>* cache_seq_lens_ = nullptr;
 
   // copy in and out cache contents
   std::unordered_set<int32_t> write_block_ids_;

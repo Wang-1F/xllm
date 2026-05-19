@@ -34,6 +34,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/util/mtgr_nvtx.h"
+#include "kernels/cuda/mtgr_hopper_attention_runtime.h"
 #include "layers/cuda/mtgr_attention.h"
 
 namespace xllm::kernel::cuda::test::mtgr_attention_harness {
@@ -138,8 +139,35 @@ MTGRAttentionTestShape make_product_shape(bool partial_match) {
   return shape;
 }
 
+MTGRAttentionTestShape make_block_aligned_partial_product_shape() {
+  MTGRAttentionTestShape shape = make_product_shape(/*partial_match=*/true);
+  shape.history = kDefaultBlockSize;
+  shape.context = 0;
+  shape.realtime = kDefaultBlockSize * 2 + 1;
+  shape.target = 129;
+  shape.matched_prefix = kDefaultBlockSize * 2;
+  return shape;
+}
+
 int64_t cacheable_end(const MTGRAttentionTestShape& shape) {
   return shape.history + shape.context + shape.realtime;
+}
+
+void use_cacheable_only_block_table(xllm::layer::AttentionMetadata* metadata,
+                                    const MTGRAttentionTestShape& shape,
+                                    const torch::Device& device,
+                                    int64_t block_size) {
+  const int64_t cacheable_blocks =
+      (cacheable_end(shape) + block_size - 1) / block_size;
+  std::vector<int32_t> block_table(static_cast<size_t>(cacheable_blocks));
+  for (int64_t i = 0; i < cacheable_blocks; ++i) {
+    block_table[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+  metadata->block_table =
+      torch::tensor(block_table,
+                    torch::TensorOptions().dtype(torch::kInt32).device(device))
+          .view({1, cacheable_blocks})
+          .contiguous();
 }
 
 xllm::KVCache clone_kv_cache(const xllm::KVCache& kv_cache) {
@@ -222,6 +250,58 @@ void run_writeback_and_expect_cuda_matches_reference(
                       reference_cache.get_v_cache());
 }
 
+xllm::layer::MTGRAttentionImpl make_attention(int64_t heads,
+                                              int64_t head_dim,
+                                              double scale,
+                                              int64_t kv_heads);
+
+void run_product_forward_and_expect_cache_matches_reference(
+    const MTGRAttentionTestShape& shape,
+    const torch::Tensor& full_query,
+    const torch::Tensor& full_key,
+    const torch::Tensor& full_value,
+    double scale) {
+  auto metadata =
+      make_mtgr_attention_metadata(shape, torch::kCUDA, kDefaultBlockSize);
+  auto initial_cache =
+      make_mtgr_kv_cache(shape, torch::kCUDA, torch::kBFloat16, kDefaultBlockSize);
+  if (shape.matched_prefix > 0) {
+    prefill_mtgr_matched_prefix_cache(
+        full_key, full_value, shape, kDefaultBlockSize, initial_cache);
+  }
+
+  auto reference_cache = clone_kv_cache(initial_cache);
+  auto production_cache = clone_kv_cache(initial_cache);
+  auto live_query = full_query.select(0, 0)
+                        .narrow(0, shape.matched_prefix, shape.local_len())
+                        .contiguous();
+  auto live_key = full_key.select(0, 0)
+                      .narrow(0, shape.matched_prefix, shape.local_len())
+                      .contiguous();
+  auto live_value = full_value.select(0, 0)
+                        .narrow(0, shape.matched_prefix, shape.local_len())
+                        .contiguous();
+  auto query_flat = live_query.reshape({shape.local_len(), -1}).contiguous();
+  auto key_flat = live_key.reshape({shape.local_len(), -1}).contiguous();
+  auto value_flat = live_value.reshape({shape.local_len(), -1}).contiguous();
+
+  run_mtgr_kv_writeback_reference(
+      live_key, live_value, metadata, reference_cache);
+
+  auto impl = make_attention(shape.heads, shape.head_dim, scale, shape.kv_heads);
+  auto [output, lse] =
+      impl.forward(metadata, query_flat, key_flat, value_flat, production_cache);
+  (void)output;
+  EXPECT_FALSE(lse.has_value());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  expect_exact_tensor("product_forward_key_cache_vs_reference",
+                      production_cache.get_k_cache(),
+                      reference_cache.get_k_cache());
+  expect_exact_tensor("product_forward_value_cache_vs_reference",
+                      production_cache.get_v_cache(),
+                      reference_cache.get_v_cache());
+}
+
 struct WritebackPerfCase {
   std::string mode;
   int64_t batch_size = 1;
@@ -235,6 +315,13 @@ struct WritebackPerfCase {
   torch::Tensor key_snd;
   torch::Tensor value_snd;
   xllm::KVCache kv_cache;
+};
+
+struct DynamicSegmentPrecisionCase {
+  std::string name;
+  std::vector<int32_t> offsets;
+  std::vector<int32_t> rules;
+  int32_t matched_prefix = 0;
 };
 
 void write_writeback_perf_label_header(std::ostream& out) {
@@ -365,6 +452,236 @@ WritebackPerfCase make_mixed_writeback_perf_case(const torch::Device& device,
   perf_case.value_snd = torch::cat(live_values, 0).contiguous();
   perf_case.kv_cache = std::move(setup.kv_cache);
   return perf_case;
+}
+
+int64_t dynamic_total_len(const DynamicSegmentPrecisionCase& test_case) {
+  CHECK_GE(test_case.offsets.size(), 2);
+  return test_case.offsets.back();
+}
+
+int64_t dynamic_cacheable_end(const DynamicSegmentPrecisionCase& test_case) {
+  CHECK_GE(test_case.offsets.size(), 2);
+  return test_case.offsets[test_case.offsets.size() - 2];
+}
+
+std::vector<DynamicSegmentPrecisionCase> make_dynamic_segment_precision_cases() {
+  std::vector<DynamicSegmentPrecisionCase> cases;
+  auto add_cases =
+      [&cases](const std::string& name,
+               std::vector<int32_t> offsets,
+               std::vector<int32_t> rules,
+               std::vector<int32_t> matched_prefixes) {
+        for (const int32_t matched_prefix : matched_prefixes) {
+          cases.push_back(
+              {.name = name + "_match" + std::to_string(matched_prefix),
+               .offsets = offsets,
+               .rules = rules,
+               .matched_prefix = matched_prefix});
+        }
+      };
+
+  add_cases("no_match_mixed_odd_lengths",
+            {0, 129, 257, 386, 514, 643},
+            {0, 1, 2, 0, 2},
+            {0});
+  add_cases("two_segment_causal_to_diag",
+            {0, 256, 384},
+            {0, 2},
+            {0, 128, 256});
+  add_cases("partial_full_segment",
+            {0, 128, 384, 512},
+            {1, 1, 2},
+            {128, 256});
+  add_cases("partial_causal_then_diag",
+            {0, 128, 256, 512, 768, 896},
+            {0, 1, 0, 2, 2},
+            {256, 384, 512, 640});
+  add_cases("partial_all_diag",
+            {0, 128, 256, 384, 640, 768},
+            {2, 2, 2, 2, 2},
+            {128, 256, 512});
+  add_cases("partial_alternating_rules",
+            {0, 64, 192, 320, 448, 576, 704, 832},
+            {1, 0, 2, 1, 2, 0, 2},
+            {128, 384, 512, 640});
+  add_cases("partial_diag_dense_boundaries",
+            {0, 128, 256, 512, 768, 1024, 1152},
+            {0, 1, 2, 2, 2, 2},
+            {384, 512, 640, 896});
+  return cases;
+}
+
+xllm::layer::AttentionMetadata make_dynamic_segment_metadata(
+    const DynamicSegmentPrecisionCase& test_case,
+    const torch::Device& device,
+    int64_t block_size,
+    int64_t heads,
+    int64_t head_dim) {
+  CHECK_EQ(test_case.offsets.front(), 0);
+  CHECK_EQ(test_case.rules.size() + 1, test_case.offsets.size());
+  CHECK_GE(test_case.matched_prefix, 0);
+  CHECK_LE(test_case.matched_prefix, dynamic_cacheable_end(test_case));
+  CHECK_EQ(test_case.matched_prefix % block_size, 0);
+  for (size_t i = 1; i < test_case.offsets.size(); ++i) {
+    CHECK_LT(test_case.offsets[i - 1], test_case.offsets[i]);
+  }
+  for (const int32_t rule : test_case.rules) {
+    CHECK_GE(rule, 0);
+    CHECK_LE(rule, 2);
+  }
+
+  const int64_t total = dynamic_total_len(test_case);
+  const int64_t live = total - test_case.matched_prefix;
+  const int64_t cache_blocks =
+      std::max<int64_t>((dynamic_cacheable_end(test_case) + block_size - 1) /
+                            block_size,
+                        1);
+  std::vector<int32_t> block_table(static_cast<size_t>(cache_blocks));
+  for (int64_t i = 0; i < cache_blocks; ++i) {
+    block_table[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+
+  auto len_opts =
+      torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+  auto i32_dev_opts =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
+
+  xllm::layer::AttentionMetadata metadata;
+  metadata.is_dummy = false;
+  metadata.is_prefill = true;
+  metadata.is_chunked_prefill = false;
+  metadata.mtgr_match_mode =
+      test_case.matched_prefix == 0
+          ? xllm::layer::MTGRMatchMode::kNoMatchOnly
+          : xllm::layer::MTGRMatchMode::kPartialOnly;
+  metadata.max_query_len = live;
+  metadata.max_seq_len = live;
+  metadata.q_seq_lens = torch::tensor({live}, len_opts).contiguous();
+  metadata.kv_seq_lens = torch::tensor({live}, len_opts).contiguous();
+  metadata.block_table =
+      torch::tensor(block_table,
+                    torch::TensorOptions().dtype(torch::kInt32).device(device))
+          .view({1, cache_blocks})
+          .contiguous();
+  metadata.mtgr_segment_offsets_i32 =
+      torch::tensor(test_case.offsets, i32_dev_opts)
+          .view({1, static_cast<int64_t>(test_case.offsets.size())})
+          .contiguous();
+  metadata.mtgr_segment_rules_i32 =
+      torch::tensor(test_case.rules, i32_dev_opts).contiguous();
+  metadata.mtgr_q_seq_starts_i32 =
+      torch::tensor({0}, i32_dev_opts).contiguous();
+  metadata.mtgr_matched_prefix_lens_i32 =
+      torch::tensor({test_case.matched_prefix}, i32_dev_opts).contiguous();
+  (void)heads;
+  (void)head_dim;
+  return metadata;
+}
+
+xllm::KVCache make_dynamic_kv_cache(const DynamicSegmentPrecisionCase& test_case,
+                                    const torch::Device& device,
+                                    torch::ScalarType dtype,
+                                    int64_t block_size,
+                                    int64_t heads,
+                                    int64_t head_dim) {
+  const int64_t cache_blocks =
+      std::max<int64_t>((dynamic_cacheable_end(test_case) + block_size - 1) /
+                            block_size,
+                        1);
+  auto opts = torch::TensorOptions().dtype(dtype).device(device);
+  return xllm::KVCache(torch::zeros({cache_blocks, block_size, heads, head_dim},
+                                    opts),
+                       torch::zeros({cache_blocks, block_size, heads, head_dim},
+                                    opts));
+}
+
+void prefill_dynamic_prefix_cache(
+    const torch::Tensor& full_key_bshd,
+    const torch::Tensor& full_value_bshd,
+    const DynamicSegmentPrecisionCase& test_case,
+    int64_t block_size,
+    xllm::KVCache* kv_cache) {
+  const int64_t matched = test_case.matched_prefix;
+  if (matched == 0) {
+    return;
+  }
+  std::vector<int64_t> slots;
+  slots.reserve(static_cast<size_t>(matched));
+  for (int64_t token = 0; token < matched; ++token) {
+    slots.push_back(token);
+  }
+  auto slots_dev =
+      torch::tensor(slots,
+                    torch::TensorOptions()
+                        .dtype(torch::kInt64)
+                        .device(full_key_bshd.device()))
+          .contiguous();
+  auto key_flat = kv_cache->get_k_cache().view(
+      {kv_cache->get_k_cache().size(0) * kv_cache->get_k_cache().size(1),
+       kv_cache->get_k_cache().size(2),
+       kv_cache->get_k_cache().size(3)});
+  auto value_flat = kv_cache->get_v_cache().view(
+      {kv_cache->get_v_cache().size(0) * kv_cache->get_v_cache().size(1),
+       kv_cache->get_v_cache().size(2),
+       kv_cache->get_v_cache().size(3)});
+  key_flat.index_copy_(0, slots_dev, full_key_bshd.select(0, 0).narrow(0, 0, matched));
+  value_flat.index_copy_(
+      0, slots_dev, full_value_bshd.select(0, 0).narrow(0, 0, matched));
+  (void)block_size;
+}
+
+torch::Tensor run_dynamic_torch_mask_attention_reference(
+    const torch::Tensor& full_query_bshd,
+    const torch::Tensor& full_key_bshd,
+    const torch::Tensor& full_value_bshd,
+    const DynamicSegmentPrecisionCase& test_case,
+    double sm_scale) {
+  const int64_t total = dynamic_total_len(test_case);
+  const int64_t heads = full_query_bshd.size(2);
+  const int64_t head_dim = full_query_bshd.size(3);
+  CHECK_EQ(full_query_bshd.sizes(),
+           torch::IntArrayRef({1, total, heads, head_dim}));
+  CHECK_EQ(full_key_bshd.sizes(), full_query_bshd.sizes());
+  CHECK_EQ(full_value_bshd.sizes(), full_query_bshd.sizes());
+
+  auto mask = torch::zeros(
+      {total, total},
+      torch::TensorOptions().dtype(torch::kBool).device(full_query_bshd.device()));
+  for (int64_t q = 0; q < total; ++q) {
+    size_t seg_id = 0;
+    while (seg_id + 1 < test_case.offsets.size() &&
+           q >= test_case.offsets[seg_id + 1]) {
+      ++seg_id;
+    }
+    CHECK_LT(seg_id, test_case.rules.size());
+    const int64_t seg_start = test_case.offsets[seg_id];
+    const int64_t seg_end = test_case.offsets[seg_id + 1];
+    auto row = mask.select(0, q);
+    const int32_t rule = test_case.rules[seg_id];
+    if (rule == 0) {
+      row.narrow(0, 0, q + 1).fill_(true);
+    } else if (rule == 1) {
+      row.narrow(0, 0, seg_end).fill_(true);
+    } else {
+      row.narrow(0, 0, seg_start).fill_(true);
+      row.narrow(0, q, 1).fill_(true);
+    }
+  }
+
+  auto query = full_query_bshd.select(0, 0).to(torch::kFloat32).contiguous();
+  auto key = full_key_bshd.select(0, 0).to(torch::kFloat32).contiguous();
+  auto value = full_value_bshd.select(0, 0).to(torch::kFloat32).contiguous();
+  auto scores = torch::einsum("qhd,khd->qhk", {query, key}) *
+                static_cast<float>(sm_scale);
+  auto masked_scores =
+      scores.masked_fill(mask.logical_not().unsqueeze(1),
+                         -std::numeric_limits<float>::infinity());
+  auto probs = torch::softmax(masked_scores, /*dim=*/-1);
+  auto full_output = torch::einsum("qhk,khd->qhd", {probs, value}).contiguous();
+  return full_output.narrow(0,
+                            test_case.matched_prefix,
+                            total - test_case.matched_prefix)
+      .contiguous();
 }
 
 int64_t odd_in_range(std::mt19937_64* rng, int64_t lo, int64_t hi) {
@@ -815,6 +1132,400 @@ TEST_F(MTGRAttentionHarnessTest, KVWritebackPerfNvtxCsv) {
                cases.size(),
                static_cast<long long>(idx),
                labels_path.c_str());
+}
+
+TEST_F(MTGRAttentionHarnessTest, ProductForwardWritesCacheableKvAndSkipsTarget) {
+  torch::NoGradGuard no_grad_guard;
+  auto opts =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+  torch::manual_seed(20260519);
+
+  for (bool partial_match : {false, true}) {
+    auto shape = partial_match ? make_block_aligned_partial_product_shape()
+                               : make_product_shape(/*partial_match=*/false);
+    ASSERT_LE(shape.matched_prefix, cacheable_end(shape));
+    ASSERT_EQ(shape.matched_prefix % kDefaultBlockSize, 0);
+
+    const double scale = 1.0 / std::sqrt(static_cast<double>(shape.head_dim));
+    auto full_query =
+        torch::randn({1, shape.total_len(), shape.heads, shape.head_dim},
+                     opts) *
+        0.05;
+    auto full_key =
+        torch::randn({1, shape.total_len(), shape.kv_heads, shape.head_dim},
+                     opts) *
+        0.05;
+    auto full_value =
+        torch::randn({1, shape.total_len(), shape.kv_heads, shape.head_dim},
+                     opts) *
+        0.05;
+
+    run_product_forward_and_expect_cache_matches_reference(
+        shape, full_query, full_key, full_value, scale);
+  }
+}
+
+TEST_F(MTGRAttentionHarnessTest, ProductForwardUsesCacheableOnlyBlockTable) {
+  torch::NoGradGuard no_grad_guard;
+  const auto device = torch::Device(torch::kCUDA, 0);
+  auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  torch::manual_seed(20260520);
+
+  for (bool partial_match : {false, true}) {
+    auto shape = partial_match ? make_block_aligned_partial_product_shape()
+                               : make_product_shape(/*partial_match=*/false);
+    ASSERT_LT((cacheable_end(shape) + kDefaultBlockSize - 1) /
+                  kDefaultBlockSize,
+              (shape.total_len() + kDefaultBlockSize - 1) / kDefaultBlockSize);
+
+    const double scale = 1.0 / std::sqrt(static_cast<double>(shape.head_dim));
+    auto full_query =
+        torch::randn({1, shape.total_len(), shape.heads, shape.head_dim},
+                     opts) *
+        0.05;
+    auto full_key =
+        torch::randn({1, shape.total_len(), shape.kv_heads, shape.head_dim},
+                     opts) *
+        0.05;
+    auto full_value =
+        torch::randn({1, shape.total_len(), shape.kv_heads, shape.head_dim},
+                     opts) *
+        0.05;
+
+    auto metadata = make_mtgr_attention_metadata(shape, device, kDefaultBlockSize);
+    use_cacheable_only_block_table(&metadata, shape, device, kDefaultBlockSize);
+    auto initial_cache =
+        make_mtgr_kv_cache(shape, device, torch::kBFloat16, kDefaultBlockSize);
+    if (shape.matched_prefix > 0) {
+      prefill_mtgr_matched_prefix_cache(
+          full_key, full_value, shape, kDefaultBlockSize, initial_cache);
+    }
+
+    auto reference_cache = clone_kv_cache(initial_cache);
+    auto production_cache = clone_kv_cache(initial_cache);
+    auto live_query = full_query.select(0, 0)
+                          .narrow(0, shape.matched_prefix, shape.local_len())
+                          .contiguous();
+    auto live_key = full_key.select(0, 0)
+                        .narrow(0, shape.matched_prefix, shape.local_len())
+                        .contiguous();
+    auto live_value = full_value.select(0, 0)
+                          .narrow(0, shape.matched_prefix, shape.local_len())
+                          .contiguous();
+    auto query_flat = live_query.reshape({shape.local_len(), -1}).contiguous();
+    auto key_flat = live_key.reshape({shape.local_len(), -1}).contiguous();
+    auto value_flat = live_value.reshape({shape.local_len(), -1}).contiguous();
+
+    run_mtgr_kv_writeback_reference(
+        live_key, live_value, metadata, reference_cache);
+    auto impl = make_attention(shape.heads, shape.head_dim, scale, shape.kv_heads);
+    auto [got, lse] =
+        impl.forward(metadata, query_flat, key_flat, value_flat, production_cache);
+    EXPECT_FALSE(lse.has_value());
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    auto expected = run_mtgr_torch_mask_attention_reference(
+        full_query, full_key, full_value, shape, scale);
+    expect_product_close(partial_match ? "cacheable_block_table_partial"
+                                       : "cacheable_block_table_no_match",
+                         got,
+                         expected,
+                         shape.heads,
+                         shape.head_dim);
+    expect_exact_tensor("cacheable_block_table_key_cache",
+                        production_cache.get_k_cache(),
+                        reference_cache.get_k_cache());
+    expect_exact_tensor("cacheable_block_table_value_cache",
+                        production_cache.get_v_cache(),
+                        reference_cache.get_v_cache());
+  }
+}
+
+TEST_F(MTGRAttentionHarnessTest, DynamicSegmentRulesPrecision) {
+  torch::NoGradGuard no_grad_guard;
+  constexpr int64_t kHeads = 8;
+  constexpr int64_t kHeadDim = 128;
+  const auto device = torch::Device(torch::kCUDA, 0);
+  auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
+
+  const auto cases = make_dynamic_segment_precision_cases();
+
+  for (size_t case_idx = 0; case_idx < cases.size(); ++case_idx) {
+    const auto& test_case = cases[case_idx];
+    torch::manual_seed(20260530 + static_cast<uint64_t>(case_idx));
+    const int64_t total = dynamic_total_len(test_case);
+    const int64_t live = total - test_case.matched_prefix;
+    auto full_query = torch::randn({1, total, kHeads, kHeadDim}, opts) * 0.05;
+    auto full_key = torch::randn({1, total, kHeads, kHeadDim}, opts) * 0.05;
+    auto full_value = torch::randn({1, total, kHeads, kHeadDim}, opts) * 0.05;
+
+    auto metadata = make_dynamic_segment_metadata(
+        test_case, device, kDefaultBlockSize, kHeads, kHeadDim);
+    auto kv_cache = make_dynamic_kv_cache(
+        test_case, device, torch::kBFloat16, kDefaultBlockSize, kHeads, kHeadDim);
+    prefill_dynamic_prefix_cache(
+        full_key, full_value, test_case, kDefaultBlockSize, &kv_cache);
+
+    auto live_query = full_query.select(0, 0)
+                          .narrow(0, test_case.matched_prefix, live)
+                          .contiguous();
+    auto live_key = full_key.select(0, 0)
+                        .narrow(0, test_case.matched_prefix, live)
+                        .contiguous();
+    auto live_value = full_value.select(0, 0)
+                          .narrow(0, test_case.matched_prefix, live)
+                          .contiguous();
+    auto query_flat = live_query.reshape({live, kHeads * kHeadDim}).contiguous();
+    auto key_flat = live_key.reshape({live, kHeads * kHeadDim}).contiguous();
+    auto value_flat = live_value.reshape({live, kHeads * kHeadDim}).contiguous();
+
+    auto impl = make_attention(kHeads, kHeadDim, scale, kHeads);
+    auto [got, lse] =
+        impl.forward(metadata, query_flat, key_flat, value_flat, kv_cache);
+    EXPECT_FALSE(lse.has_value()) << test_case.name;
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess) << test_case.name;
+
+    auto expected = run_dynamic_torch_mask_attention_reference(
+        full_query, full_key, full_value, test_case, scale);
+    expect_product_close(
+        test_case.name.c_str(), got, expected, kHeads, kHeadDim);
+  }
+}
+
+TEST_F(MTGRAttentionHarnessTest, DynamicWritebackThenAttentionPrecision) {
+  torch::NoGradGuard no_grad_guard;
+  constexpr int64_t kHeads = 8;
+  constexpr int64_t kHeadDim = 128;
+  const auto device = torch::Device(torch::kCUDA, 0);
+  auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
+
+  const auto cases = make_dynamic_segment_precision_cases();
+  for (size_t case_idx = 0; case_idx < cases.size(); ++case_idx) {
+    const auto& test_case = cases[case_idx];
+    if (test_case.matched_prefix == 0) {
+      continue;
+    }
+
+    torch::manual_seed(20260630 + static_cast<uint64_t>(case_idx));
+    const int64_t total = dynamic_total_len(test_case);
+    const int64_t live = total - test_case.matched_prefix;
+    auto full_query = torch::randn({1, total, kHeads, kHeadDim}, opts) * 0.05;
+    auto full_key = torch::randn({1, total, kHeads, kHeadDim}, opts) * 0.05;
+    auto full_value = torch::randn({1, total, kHeads, kHeadDim}, opts) * 0.05;
+
+    auto no_match_case = test_case;
+    no_match_case.matched_prefix = 0;
+    auto write_metadata = make_dynamic_segment_metadata(
+        no_match_case, device, kDefaultBlockSize, kHeads, kHeadDim);
+    auto read_metadata = make_dynamic_segment_metadata(
+        test_case, device, kDefaultBlockSize, kHeads, kHeadDim);
+    auto kv_cache = make_dynamic_kv_cache(
+        test_case, device, torch::kBFloat16, kDefaultBlockSize, kHeads, kHeadDim);
+
+    auto full_key_snd = full_key.select(0, 0).contiguous();
+    auto full_value_snd = full_value.select(0, 0).contiguous();
+    xllm::kernel::cuda::mtgr_kv_cache_writeback_cuda(
+        full_key_snd,
+        full_value_snd,
+        write_metadata.mtgr_segment_offsets_i32,
+        write_metadata.mtgr_q_seq_starts_i32,
+        write_metadata.mtgr_matched_prefix_lens_i32,
+        write_metadata.block_table,
+        kv_cache.get_k_cache(),
+        kv_cache.get_v_cache(),
+        write_metadata.max_seq_len);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess) << test_case.name;
+
+    expect_exact_tensor(
+        "writeback_then_attention_prefix_key",
+        gather_cache_tokens(kv_cache.get_k_cache(),
+                            read_metadata,
+                            0,
+                            0,
+                            test_case.matched_prefix),
+        full_key_snd.narrow(0, 0, test_case.matched_prefix));
+    expect_exact_tensor(
+        "writeback_then_attention_prefix_value",
+        gather_cache_tokens(kv_cache.get_v_cache(),
+                            read_metadata,
+                            0,
+                            0,
+                            test_case.matched_prefix),
+        full_value_snd.narrow(0, 0, test_case.matched_prefix));
+
+    auto live_query = full_query.select(0, 0)
+                          .narrow(0, test_case.matched_prefix, live)
+                          .contiguous();
+    auto live_key = full_key_snd.narrow(0, test_case.matched_prefix, live)
+                        .contiguous();
+    auto live_value = full_value_snd.narrow(0, test_case.matched_prefix, live)
+                          .contiguous();
+    auto query_flat = live_query.reshape({live, kHeads * kHeadDim}).contiguous();
+    auto key_flat = live_key.reshape({live, kHeads * kHeadDim}).contiguous();
+    auto value_flat = live_value.reshape({live, kHeads * kHeadDim}).contiguous();
+
+    auto impl = make_attention(kHeads, kHeadDim, scale, kHeads);
+    auto [got, lse] =
+        impl.forward(read_metadata, query_flat, key_flat, value_flat, kv_cache);
+    EXPECT_FALSE(lse.has_value()) << test_case.name;
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess) << test_case.name;
+
+    auto expected = run_dynamic_torch_mask_attention_reference(
+        full_query, full_key, full_value, test_case, scale);
+    expect_product_close(
+        test_case.name.c_str(), got, expected, kHeads, kHeadDim);
+  }
+}
+
+TEST_F(MTGRAttentionHarnessTest, MixedBatchWritebackThenAttentionPrecision) {
+  torch::NoGradGuard no_grad_guard;
+  constexpr int64_t kBatchSize = 12;
+  constexpr int64_t kHeads = 8;
+  constexpr int64_t kHeadDim = 128;
+  const auto device = torch::Device(torch::kCUDA, 0);
+  auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
+
+  std::vector<MTGRAttentionTestShape> read_shapes;
+  std::vector<MTGRAttentionTestShape> write_shapes;
+  std::vector<torch::Tensor> full_queries;
+  std::vector<torch::Tensor> full_keys;
+  std::vector<torch::Tensor> full_values;
+  std::vector<torch::Tensor> write_keys;
+  std::vector<torch::Tensor> write_values;
+  std::vector<torch::Tensor> live_queries;
+  std::vector<torch::Tensor> live_keys;
+  std::vector<torch::Tensor> live_values;
+  std::vector<torch::Tensor> expected_chunks;
+  read_shapes.reserve(kBatchSize);
+  write_shapes.reserve(kBatchSize);
+  full_queries.reserve(kBatchSize);
+  full_keys.reserve(kBatchSize);
+  full_values.reserve(kBatchSize);
+  write_keys.reserve(kBatchSize);
+  write_values.reserve(kBatchSize);
+  live_queries.reserve(kBatchSize);
+  live_keys.reserve(kBatchSize);
+  live_values.reserve(kBatchSize);
+  expected_chunks.reserve(kBatchSize);
+
+  torch::manual_seed(20260631);
+  for (int64_t row = 0; row < kBatchSize; ++row) {
+    MTGRAttentionTestShape shape;
+    shape.heads = kHeads;
+    shape.kv_heads = kHeads;
+    shape.head_dim = kHeadDim;
+    shape.history = kDefaultBlockSize * (1 + (row % 3));
+    shape.context = kDefaultBlockSize;
+    shape.realtime = kDefaultBlockSize * (2 + (row % 4));
+    shape.target = kDefaultBlockSize + 1 + (row % 3) * 2;
+    if ((row % 3) != 0) {
+      const int64_t realtime_blocks = shape.realtime / kDefaultBlockSize;
+      const int64_t matched_realtime_blocks =
+          1 + (row % (realtime_blocks - 1));
+      shape.matched_prefix =
+          shape.history + shape.context +
+          matched_realtime_blocks * kDefaultBlockSize;
+    }
+    ASSERT_EQ(shape.matched_prefix % kDefaultBlockSize, 0);
+    ASSERT_LT(shape.matched_prefix, cacheable_end(shape));
+
+    auto write_shape = shape;
+    write_shape.matched_prefix = 0;
+    auto full_query =
+        torch::randn({1, shape.total_len(), kHeads, kHeadDim}, opts) * 0.05;
+    auto full_key =
+        torch::randn({1, shape.total_len(), kHeads, kHeadDim}, opts) * 0.05;
+    auto full_value =
+        torch::randn({1, shape.total_len(), kHeads, kHeadDim}, opts) * 0.05;
+
+    write_keys.push_back(full_key.select(0, 0).contiguous());
+    write_values.push_back(full_value.select(0, 0).contiguous());
+    live_queries.push_back(
+        full_query.select(0, 0)
+            .narrow(0, shape.matched_prefix, shape.local_len())
+            .contiguous());
+    live_keys.push_back(full_key.select(0, 0)
+                            .narrow(0, shape.matched_prefix, shape.local_len())
+                            .contiguous());
+    live_values.push_back(
+        full_value.select(0, 0)
+            .narrow(0, shape.matched_prefix, shape.local_len())
+            .contiguous());
+    expected_chunks.push_back(run_mtgr_torch_mask_attention_reference(
+        full_query, full_key, full_value, shape, scale));
+    full_queries.push_back(full_query);
+    full_keys.push_back(full_key);
+    full_values.push_back(full_value);
+    read_shapes.push_back(shape);
+    write_shapes.push_back(write_shape);
+  }
+
+  auto write_setup = make_mtgr_partial_batch_setup(
+      write_shapes, full_keys, full_values, device, torch::kBFloat16, kDefaultBlockSize);
+  auto read_setup = make_mtgr_partial_batch_setup(
+      read_shapes, full_keys, full_values, device, torch::kBFloat16, kDefaultBlockSize);
+  auto read_metadata = read_setup.metadata;
+  read_metadata.mtgr_match_mode = xllm::layer::MTGRMatchMode::kMixed;
+  read_metadata.block_table = write_setup.metadata.block_table;
+
+  auto write_key_snd = torch::cat(write_keys, 0).contiguous();
+  auto write_value_snd = torch::cat(write_values, 0).contiguous();
+  xllm::kernel::cuda::mtgr_kv_cache_writeback_cuda(
+      write_key_snd,
+      write_value_snd,
+      write_setup.metadata.mtgr_segment_offsets_i32,
+      write_setup.metadata.mtgr_q_seq_starts_i32,
+      write_setup.metadata.mtgr_matched_prefix_lens_i32,
+      write_setup.metadata.block_table,
+      write_setup.kv_cache.get_k_cache(),
+      write_setup.kv_cache.get_v_cache(),
+      write_setup.metadata.max_seq_len);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  for (int64_t row = 0; row < kBatchSize; ++row) {
+    const auto& shape = read_shapes[static_cast<size_t>(row)];
+    if (shape.matched_prefix == 0) {
+      continue;
+    }
+    expect_exact_tensor(
+        "mixed_writeback_then_attention_prefix_key",
+        gather_cache_tokens(write_setup.kv_cache.get_k_cache(),
+                            read_metadata,
+                            row,
+                            0,
+                            shape.matched_prefix),
+        full_keys[static_cast<size_t>(row)].select(0, 0).narrow(
+            0, 0, shape.matched_prefix));
+    expect_exact_tensor(
+        "mixed_writeback_then_attention_prefix_value",
+        gather_cache_tokens(write_setup.kv_cache.get_v_cache(),
+                            read_metadata,
+                            row,
+                            0,
+                            shape.matched_prefix),
+        full_values[static_cast<size_t>(row)].select(0, 0).narrow(
+            0, 0, shape.matched_prefix));
+  }
+
+  auto query_snd = torch::cat(live_queries, 0).contiguous();
+  auto key_snd = torch::cat(live_keys, 0).contiguous();
+  auto value_snd = torch::cat(live_values, 0).contiguous();
+  auto query_flat = query_snd.reshape({query_snd.size(0), -1}).contiguous();
+  auto key_flat = key_snd.reshape({key_snd.size(0), -1}).contiguous();
+  auto value_flat = value_snd.reshape({value_snd.size(0), -1}).contiguous();
+
+  auto impl = make_attention(kHeads, kHeadDim, scale, kHeads);
+  auto [got, lse] = impl.forward(
+      read_metadata, query_flat, key_flat, value_flat, write_setup.kv_cache);
+  EXPECT_FALSE(lse.has_value());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  auto expected = torch::cat(expected_chunks, 0).contiguous();
+  expect_product_close(
+      "mixed_writeback_then_attention", got, expected, kHeads, kHeadDim);
 }
 
 TEST_F(MTGRAttentionHarnessTest, ProductNoMatchForwardUsesSegmentedApi) {
