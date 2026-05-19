@@ -30,7 +30,6 @@ cc_library(
     flashinfer_planinfo.cpp
   DEPS
     :common_layers
-    :cuda_mtgr_attention_runtime
     :cuda_mtgr_hopper_runtime
 )
 
@@ -56,7 +55,7 @@ cc_test(
   DEPS
     :cuda_layers
     :cuda_kernels
-    :cuda_mtgr_attention_runtime
+    :mtgr_attention_harness_test_utils
     :flags
     :kv_cache
     torch

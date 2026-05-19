@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize the prototype MTGR attention harness NVTX benchmark."""
+"""Summarize MTGR attention NVTX benchmark traces."""
 
 from __future__ import annotations
 

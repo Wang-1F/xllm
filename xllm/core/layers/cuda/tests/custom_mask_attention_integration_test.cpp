@@ -26,7 +26,7 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "framework/state_dict/state_dict.h"
 #include "kernels/cuda/cuda_ops_api.h"
-#include "kernels/cuda/tests/mtgr_attenion_test.h"
+#include "kernels/cuda/tests/mtgr_attention_harness/mtgr_attention_contract.h"
 #include "layers/common/linear.h"
 #include "layers/common/partial_rotary_embedding.h"
 #include "layers/common/qwen3_next_rms_norm.h"
@@ -36,6 +36,8 @@ limitations under the License.
 
 namespace xllm::layer::test {
 namespace {
+
+namespace mtgr_harness = xllm::kernel::cuda::test::mtgr_attention_harness;
 
 constexpr int64_t kBlockSize = 128;
 constexpr int64_t kHeads = 8;
@@ -310,7 +312,7 @@ TEST_F(CustomMaskAttentionIntegrationTest,
   auto parallel_args = make_parallel_args(&process_group);
   auto state_dict = make_state_dict(options);
 
-  kernel::cuda::test::MTGRAttentionTestShape shape;
+  mtgr_harness::MTGRAttentionTestShape shape;
   shape.heads = kHeads;
   shape.kv_heads = kKVHeads;
   shape.head_dim = kHeadDim;
@@ -321,8 +323,8 @@ TEST_F(CustomMaskAttentionIntegrationTest,
   shape.matched_prefix = 0;
 
   auto metadata =
-      kernel::cuda::test::make_mtgr_attention_metadata(shape, device, kBlockSize);
-  auto kv_cache = kernel::cuda::test::make_mtgr_kv_cache(
+      mtgr_harness::make_mtgr_attention_metadata(shape, device, kBlockSize);
+  auto kv_cache = mtgr_harness::make_mtgr_kv_cache(
       shape, device, torch::kBFloat16, kBlockSize);
   auto positions = torch::arange(shape.local_len(),
                                  torch::TensorOptions()
@@ -359,7 +361,7 @@ TEST_F(CustomMaskAttentionIntegrationTest,
   auto parallel_args = make_parallel_args(&process_group);
   auto state_dict = make_state_dict(options);
 
-  kernel::cuda::test::MTGRAttentionTestShape shape;
+  mtgr_harness::MTGRAttentionTestShape shape;
   shape.heads = kHeads;
   shape.kv_heads = kKVHeads;
   shape.head_dim = kHeadDim;
@@ -370,10 +372,10 @@ TEST_F(CustomMaskAttentionIntegrationTest,
   shape.matched_prefix = shape.history + shape.context + 41;
 
   auto metadata =
-      kernel::cuda::test::make_mtgr_attention_metadata(shape, device, kBlockSize);
-  auto baseline_kv_cache = kernel::cuda::test::make_mtgr_kv_cache(
+      mtgr_harness::make_mtgr_attention_metadata(shape, device, kBlockSize);
+  auto baseline_kv_cache = mtgr_harness::make_mtgr_kv_cache(
       shape, device, torch::kBFloat16, kBlockSize);
-  auto integrated_kv_cache = kernel::cuda::test::make_mtgr_kv_cache(
+  auto integrated_kv_cache = mtgr_harness::make_mtgr_kv_cache(
       shape, device, torch::kBFloat16, kBlockSize);
 
   auto full_hidden_states =
@@ -389,13 +391,13 @@ TEST_F(CustomMaskAttentionIntegrationTest,
       full_hidden_states, state_dict, /*use_fast_qk_norm=*/true,
       &integrated_full_key, &integrated_full_value);
 
-  kernel::cuda::test::prefill_mtgr_matched_prefix_cache(
+  mtgr_harness::prefill_mtgr_matched_prefix_cache(
       baseline_full_key,
       baseline_full_value,
       shape,
       kBlockSize,
       baseline_kv_cache);
-  kernel::cuda::test::prefill_mtgr_matched_prefix_cache(
+  mtgr_harness::prefill_mtgr_matched_prefix_cache(
       integrated_full_key,
       integrated_full_value,
       shape,

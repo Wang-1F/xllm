@@ -111,25 +111,6 @@ cc_library(
     glog::glog
 )
 
-cc_library(
-  NAME
-    cuda_mtgr_attention_runtime
-  HDRS
-    tests/mtgr_attenion_test.h
-  SRCS
-    tests/mtgr_attenion_test.cpp
-    tests/mtgr_fused_attention_kernel.cu
-    tests/mtgr_full_attention_kernel.cu
-    tests/mtgr_flashinfer_mask_kernel.cu
-  DEPS
-    :cuda_kernels
-    :cuda_mtgr_hopper_runtime
-    :flags
-    :kv_cache
-    torch
-    glog::glog
-)
-
 cc_test(
   NAME
     activation_test

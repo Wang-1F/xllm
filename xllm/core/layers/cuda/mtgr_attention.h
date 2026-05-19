@@ -17,11 +17,8 @@ limitations under the License.
 
 #include <torch/torch.h>
 
-#include <memory>
 #include <optional>
-#include <string>
 #include <tuple>
-#include <vector>
 
 #include "framework/kv_cache/kv_cache.h"
 #include "layers/common/attention_metadata.h"
@@ -29,38 +26,13 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-enum class MTGRAttentionBackend {
-  kOneStage,
-  kMultiStage,
-  kFused,
-};
-
-struct MTGRStageMetric {
-  std::string name;
-  double workspace_ms = 0.0;
-  double exec_ms = 0.0;
-  double host_submit_ms = 0.0;
-};
-
-struct MTGRAttentionMetrics {
-  double mask_build_ms = 0.0;
-  double h2d_ms = 0.0;
-  double workspace_ms = 0.0;
-  double fia_ms = 0.0;
-  double device_total_ms = 0.0;
-  double wall_total_ms = 0.0;
-  std::vector<MTGRStageMetric> stages;
-};
-
 class MTGRAttentionImpl : public torch::nn::Module {
  public:
   MTGRAttentionImpl() = default;
-  MTGRAttentionImpl(
-      int64_t num_heads,
-      int64_t head_size,
-      float scale,
-      int64_t num_kv_heads,
-      MTGRAttentionBackend backend = MTGRAttentionBackend::kFused);
+  MTGRAttentionImpl(int64_t num_heads,
+                    int64_t head_size,
+                    float scale,
+                    int64_t num_kv_heads);
   ~MTGRAttentionImpl() override;
 
   std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
@@ -70,23 +42,10 @@ class MTGRAttentionImpl : public torch::nn::Module {
       torch::Tensor& value,
       KVCache& kv_cache);
 
-  void set_backend(MTGRAttentionBackend backend);
-
-  const MTGRAttentionMetrics& last_metrics() const { return last_metrics_; }
-
   int64_t num_heads_ = 0;
   int64_t head_size_ = 0;
   float scale_ = 1.0f;
   int64_t num_kv_heads_ = 0;
-
- private:
-  struct ForwardImpl;
-
-  void rebuild_impl();
-
-  MTGRAttentionBackend backend_ = MTGRAttentionBackend::kFused;
-  MTGRAttentionMetrics last_metrics_;
-  std::unique_ptr<ForwardImpl> impl_;
 };
 TORCH_MODULE(MTGRAttention);
 

@@ -36,14 +36,15 @@ void mtgr_ragged_segment_attention_hopper_unified_research_cuda(
   if (match_mode == 0) {
     MTGR_NVTX_RANGE(1, "MTGR/kernel/no_match_dense_tma");
     MTGR_TRACE(1) << "[KERNEL] unified_entry route=no_match_dense_tma";
-    mtgr_ragged_segment_attention_hopper_research_cuda(query_snd,
-                                                       key_snd,
-                                                       value_snd,
-                                                       segment_offsets_i32,
-                                                       segment_rules_i32,
-                                                       max_request_len,
-                                                       sm_scale,
-                                                       output_snd);
+    dispatch_mtgr_ragged_segment_attention_hopper_wgmma_tma_qk(
+        query_snd,
+        key_snd,
+        value_snd,
+        segment_offsets_i32,
+        segment_rules_i32,
+        max_request_len,
+        sm_scale,
+        output_snd);
     return;
   }
 

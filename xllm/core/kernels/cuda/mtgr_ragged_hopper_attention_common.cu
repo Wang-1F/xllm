@@ -38,17 +38,16 @@ limitations under the License.
 #include "core/util/mtgr_nvtx.h"
 #include "core/util/mtgr_trace.h"
 
-#include "../../../../../third_party/cutlass/examples/88_hopper_fmha/collective/fmha_collective_softmax.hpp"
-#include "../../../../../third_party/cutlass/examples/88_hopper_fmha/collective/fmha_common.hpp"
+#include "../../../../third_party/cutlass/examples/88_hopper_fmha/collective/fmha_collective_softmax.hpp"
+#include "../../../../third_party/cutlass/examples/88_hopper_fmha/collective/fmha_common.hpp"
 
 namespace xllm::kernel::cuda {
 namespace {
 
-// Research-only Hopper path for ragged segment attention.
+// Hopper unified path for ragged segment attention.
 //
-// The stable implementation remains in mtgr_fused_attention_kernel.cu. This
-// file is intentionally separate so that SM90A-specific TMA/WGMMA experiments
-// can move quickly without destabilizing the current q64/reg-frag kernel.
+// This file hosts the SM90A TMA/WGMMA implementation used by the production
+// MTGR Hopper runtime.
 //
 // Initial target shape:
 //   - one CTA owns one request/head/q tile

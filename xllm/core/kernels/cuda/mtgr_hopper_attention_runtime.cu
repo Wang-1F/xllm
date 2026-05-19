@@ -17,9 +17,9 @@ limitations under the License.
 
 #include "core/util/mtgr_nvtx.h"
 
-// Reuse the physically split Hopper research implementation while exposing a
-// production-facing wrapper symbol from a non-test TU.
-#include "tests/mtgr_ragged_hopper_attention_kernel.cu"
+// Reuse the physically split Hopper implementation while exposing a
+// production-facing wrapper symbol.
+#include "mtgr_ragged_hopper_attention_kernel.cu"
 
 namespace xllm::kernel::cuda {
 
