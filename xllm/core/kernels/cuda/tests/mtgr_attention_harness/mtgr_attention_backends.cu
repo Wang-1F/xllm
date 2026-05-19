@@ -18,6 +18,7 @@ limitations under the License.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 
@@ -89,6 +90,59 @@ __global__ void build_mtgr_packed_mask_kernel(uint8_t* __restrict__ packed_mask,
     }
   }
   packed_mask[byte_idx] = packed;
+}
+
+__global__ void mtgr_kv_writeback_bf16_kernel(
+    const __nv_bfloat16* __restrict__ key_snd,
+    const __nv_bfloat16* __restrict__ value_snd,
+    __nv_bfloat16* __restrict__ key_cache,
+    __nv_bfloat16* __restrict__ value_cache,
+    const int32_t* __restrict__ segment_offsets,
+    const int32_t* __restrict__ q_seq_starts,
+    const int32_t* __restrict__ matched_prefix_lens,
+    const int32_t* __restrict__ block_table,
+    int32_t num_segments,
+    int32_t segment_offsets_stride,
+    int32_t block_table_stride,
+    int32_t block_size,
+    int32_t num_kv_heads,
+    int32_t head_dim) {
+  const int32_t row = static_cast<int32_t>(blockIdx.x);
+  const int64_t elems_per_token =
+      static_cast<int64_t>(num_kv_heads) * head_dim;
+  const int64_t linear =
+      (static_cast<int64_t>(blockIdx.y) * blockDim.x) + threadIdx.x;
+
+  const int32_t matched = matched_prefix_lens[row];
+  const int32_t cacheable_end =
+      segment_offsets[row * segment_offsets_stride + num_segments - 1];
+  const int64_t write_elems =
+      static_cast<int64_t>(cacheable_end - matched) * elems_per_token;
+  if (linear >= write_elems) {
+    return;
+  }
+
+  const int32_t token_delta = static_cast<int32_t>(linear / elems_per_token);
+  const int32_t elem = static_cast<int32_t>(linear - token_delta * elems_per_token);
+  const int32_t kv_head = elem / head_dim;
+  const int32_t dim = elem - kv_head * head_dim;
+  const int32_t logical_token = matched + token_delta;
+  const int32_t logical_block = logical_token / block_size;
+  const int32_t block_offset = logical_token - logical_block * block_size;
+  const int32_t physical_block =
+      block_table[row * block_table_stride + logical_block];
+  const int64_t src_token = q_seq_starts[row] + token_delta;
+
+  const int64_t src_idx =
+      (src_token * num_kv_heads + kv_head) * head_dim + dim;
+  const int64_t dst_idx =
+      (((static_cast<int64_t>(physical_block) * block_size + block_offset) *
+            num_kv_heads +
+        kv_head) *
+           head_dim) +
+      dim;
+  key_cache[dst_idx] = key_snd[src_idx];
+  value_cache[dst_idx] = value_snd[src_idx];
 }
 
 }  // namespace
@@ -515,6 +569,61 @@ std::unique_ptr<IMTGRAttentionBackend> make_full_flashinfer_base_backend(
 std::unique_ptr<IMTGRAttentionBackend> make_hopper_unified_backend(
     const MTGRAttentionHarnessMetadata& metadata) {
   return std::make_unique<HopperUnifiedBackend>(metadata);
+}
+
+void run_mtgr_kv_writeback_cuda(
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const xllm::layer::AttentionMetadata& attn_metadata,
+    xllm::KVCache& kv_cache) {
+  MTGR_NVTX_RANGE(2, "MTGR/harness/mtgr_attention/writeback/cuda_launch");
+  CHECK_EQ(key_snd.dim(), 3);
+  CHECK_EQ(value_snd.sizes(), key_snd.sizes());
+  CHECK_EQ(key_snd.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(value_snd.scalar_type(), torch::kBFloat16);
+
+  auto key_cache = kv_cache.get_k_cache();
+  auto value_cache = kv_cache.get_v_cache();
+  CHECK_EQ(key_cache.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(value_cache.scalar_type(), torch::kBFloat16);
+
+  c10::cuda::CUDAGuard guard(key_snd.device());
+  const int64_t batch_size = attn_metadata.mtgr_segment_offsets_i32.size(0);
+  const int64_t num_segments =
+      attn_metadata.mtgr_segment_offsets_i32.size(1) - 1;
+  const int64_t max_query_len = attn_metadata.max_query_len;
+  const int64_t num_kv_heads = key_snd.size(1);
+  const int64_t head_dim = key_snd.size(2);
+  const int64_t elems_per_request = max_query_len * num_kv_heads * head_dim;
+  if (batch_size == 0 || elems_per_request == 0) {
+    return;
+  }
+
+  constexpr int threads = 256;
+  dim3 grid(static_cast<unsigned int>(batch_size),
+            static_cast<unsigned int>((elems_per_request + threads - 1) /
+                                      threads));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  mtgr_kv_writeback_bf16_kernel<<<grid, threads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(
+          key_snd.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const __nv_bfloat16*>(
+          value_snd.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(
+          key_cache.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(
+          value_cache.data_ptr<at::BFloat16>()),
+      attn_metadata.mtgr_segment_offsets_i32.data_ptr<int32_t>(),
+      attn_metadata.mtgr_q_seq_starts_i32.data_ptr<int32_t>(),
+      attn_metadata.mtgr_matched_prefix_lens_i32.data_ptr<int32_t>(),
+      attn_metadata.block_table.data_ptr<int32_t>(),
+      static_cast<int32_t>(num_segments),
+      static_cast<int32_t>(attn_metadata.mtgr_segment_offsets_i32.stride(0)),
+      static_cast<int32_t>(attn_metadata.block_table.stride(0)),
+      static_cast<int32_t>(key_cache.size(1)),
+      static_cast<int32_t>(num_kv_heads),
+      static_cast<int32_t>(head_dim));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace xllm::kernel::cuda::test::mtgr_attention_harness

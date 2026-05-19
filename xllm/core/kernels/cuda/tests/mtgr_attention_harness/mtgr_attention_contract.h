@@ -176,6 +176,18 @@ torch::Tensor run_mtgr_torch_mask_attention_reference(
 MTGRAttentionDiff compare_outputs(const torch::Tensor& reference,
                                   const torch::Tensor& candidate);
 
+void run_mtgr_kv_writeback_reference(
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const xllm::layer::AttentionMetadata& attn_metadata,
+    xllm::KVCache& kv_cache);
+
+void run_mtgr_kv_writeback_cuda(
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const xllm::layer::AttentionMetadata& attn_metadata,
+    xllm::KVCache& kv_cache);
+
 void write_perf_label_header(std::ostream& out);
 void write_perf_label_row(std::ostream& out,
                           int64_t idx,

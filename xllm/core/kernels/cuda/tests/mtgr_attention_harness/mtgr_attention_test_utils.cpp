@@ -625,6 +625,74 @@ MTGRAttentionDiff compare_outputs(const torch::Tensor& reference,
   };
 }
 
+void run_mtgr_kv_writeback_reference(
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const xllm::layer::AttentionMetadata& attn_metadata,
+    xllm::KVCache& kv_cache) {
+  CHECK_EQ(key_snd.dim(), 3);
+  CHECK_EQ(value_snd.sizes(), key_snd.sizes());
+  auto key_cache = kv_cache.get_k_cache();
+  auto value_cache = kv_cache.get_v_cache();
+  const int64_t block_size = key_cache.size(1);
+
+  auto segment_offsets =
+      attn_metadata.mtgr_segment_offsets_i32.to(torch::kCPU).contiguous();
+  auto q_seq_starts =
+      attn_metadata.mtgr_q_seq_starts_i32.to(torch::kCPU).contiguous();
+  auto matched_prefix_lens =
+      attn_metadata.mtgr_matched_prefix_lens_i32.to(torch::kCPU).contiguous();
+  auto block_table = attn_metadata.block_table.to(torch::kCPU).contiguous();
+  const int64_t batch_size = segment_offsets.size(0);
+  const int64_t num_segments = segment_offsets.size(1) - 1;
+  auto offsets_acc = segment_offsets.accessor<int32_t, 2>();
+  auto q_starts_acc = q_seq_starts.accessor<int32_t, 1>();
+  auto matched_acc = matched_prefix_lens.accessor<int32_t, 1>();
+  auto block_table_acc = block_table.accessor<int32_t, 2>();
+
+  std::vector<int64_t> src_rows;
+  std::vector<int64_t> dst_slots;
+  for (int64_t row = 0; row < batch_size; ++row) {
+    const int64_t matched = matched_acc[row];
+    const int64_t cacheable_end = offsets_acc[row][num_segments - 1];
+    const int64_t q_start = q_starts_acc[row];
+    CHECK_LE(matched, cacheable_end);
+    for (int64_t logical_token = matched; logical_token < cacheable_end;
+         ++logical_token) {
+      const int64_t logical_block = logical_token / block_size;
+      const int64_t block_offset = logical_token % block_size;
+      const int64_t physical_block = block_table_acc[row][logical_block];
+      src_rows.push_back(q_start + logical_token - matched);
+      dst_slots.push_back(physical_block * block_size + block_offset);
+    }
+  }
+
+  if (src_rows.empty()) {
+    return;
+  }
+
+  const auto device = key_snd.device();
+  auto src_rows_dev =
+      torch::tensor(src_rows,
+                    torch::TensorOptions().dtype(torch::kInt64).device(device))
+          .contiguous();
+  auto dst_slots_dev =
+      torch::tensor(dst_slots,
+                    torch::TensorOptions().dtype(torch::kInt64).device(device))
+          .contiguous();
+  auto key_cache_flat =
+      key_cache.view({key_cache.size(0) * key_cache.size(1),
+                      key_cache.size(2),
+                      key_cache.size(3)});
+  auto value_cache_flat =
+      value_cache.view({value_cache.size(0) * value_cache.size(1),
+                        value_cache.size(2),
+                        value_cache.size(3)});
+  key_cache_flat.index_copy_(0, dst_slots_dev, key_snd.index_select(0, src_rows_dev));
+  value_cache_flat.index_copy_(
+      0, dst_slots_dev, value_snd.index_select(0, src_rows_dev));
+}
+
 void write_perf_label_header(std::ostream& out) {
   out << "idx,backend,pair_id,mode,heads,kv_heads,head_dim,history,context,"
          "realtime,realtime_matched,target,total_q,matched_prefix,live_q,"
