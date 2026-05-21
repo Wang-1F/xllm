@@ -20,12 +20,50 @@ limitations under the License.
 
 #include "block_manager_impl.h"
 #include "common/global_flags.h"
+#include "common/rec_model_utils.h"
 #include "concurrent_block_manager_impl.h"
 #include "framework/xtensor/page_allocator.h"
 #include "framework/xtensor/phy_page_pool.h"
 #include "framework/xtensor/xtensor_block_manager_impl.h"
 
 namespace xllm {
+namespace {
+
+constexpr const char* kMtgrSegmentOffsetsName = "segment_offsets";
+
+size_t get_policy_cacheable_tokens(const Sequence* sequence,
+                                   size_t default_num_tokens) {
+  DCHECK(sequence != nullptr);
+  if (sequence->rec_type() != RecType::kMtgr) {
+    return default_num_tokens;
+  }
+
+  auto offsets_opt =
+      sequence->get_mm_data().get<torch::Tensor>(kMtgrSegmentOffsetsName);
+  CHECK(offsets_opt.has_value())
+      << "MTGR sequence requires segment_offsets to derive cache policy";
+  auto offsets =
+      offsets_opt.value().to(torch::kInt32).cpu().contiguous();
+  if (offsets.dim() == 2 && offsets.size(0) == 1) {
+    offsets = offsets.view({offsets.size(1)}).contiguous();
+  }
+  CHECK_EQ(offsets.dim(), 1) << "MTGR segment_offsets must be 1-D or [1, N]";
+  CHECK_GE(offsets.size(0), 2)
+      << "MTGR segment_offsets must include at least begin and end";
+
+  const auto* offsets_ptr = offsets.data_ptr<int32_t>();
+  const int32_t prefix_match_limit =
+      offsets_ptr[static_cast<int64_t>(offsets.size(0)) - 2];
+  const int32_t logical_total_len =
+      offsets_ptr[static_cast<int64_t>(offsets.size(0)) - 1];
+  CHECK_EQ(static_cast<size_t>(logical_total_len), sequence->num_tokens())
+      << "MTGR segment_offsets last element must match sequence length";
+  const int32_t cacheable_len =
+      mtgr_cacheable_len_for_policy(prefix_match_limit, logical_total_len);
+  return static_cast<size_t>(cacheable_len);
+}
+
+}  // namespace
 
 BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
     : options_(options) {
@@ -174,13 +212,16 @@ void BlockManagerPool::reset_transfer_infos() {
 
 bool BlockManagerPool::allocate(Sequence* sequence) {
   DCHECK(sequence != nullptr);
-  return allocate(sequence, sequence->num_tokens());
+  return allocate(sequence,
+                  get_policy_cacheable_tokens(sequence, sequence->num_tokens()));
 }
 
 bool BlockManagerPool::allocate(std::vector<Sequence*>& sequences) {
   for (auto* sequence : sequences) {
     DCHECK(sequence != nullptr);
-    if (!allocate(sequence, sequence->num_tokens())) {
+    if (!allocate(sequence,
+                  get_policy_cacheable_tokens(sequence,
+                                              sequence->num_tokens()))) {
       // should we gurantee the atomicity of the allocation? all or nothing?
       return false;
     }
@@ -191,6 +232,8 @@ bool BlockManagerPool::allocate(std::vector<Sequence*>& sequences) {
 bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
   AUTO_COUNTER(allocate_blocks_latency_seconds);
   DCHECK(sequence != nullptr);
+  const size_t cacheable_num_tokens =
+      get_policy_cacheable_tokens(sequence, num_tokens);
   int32_t dp_rank = get_dp_rank(sequence);
   const bool needs_embedding_id = !sequence->has_embedding_id();
   if (needs_embedding_id && !allocate_embedding_id(sequence, dp_rank)) {
@@ -199,13 +242,14 @@ bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
 
   // first try to allocate shared blocks
   if (sequence->kv_state().num_kv_blocks() == 0) {
-    BlockManagerPool::allocate_shared(sequence);
+    BlockManagerPool::allocate_shared(sequence, cacheable_num_tokens);
   }
 
   const size_t num_blocks = sequence->kv_state().num_kv_blocks();
   // round up to the nearest block number
   const size_t block_size = options_.block_size();
-  const size_t num_blocks_needed = (num_tokens + block_size - 1) / block_size;
+  const size_t num_blocks_needed =
+      (cacheable_num_tokens + block_size - 1) / block_size;
   if (num_blocks_needed <= num_blocks) {
     return process_beam_search(sequence, /*need_swap*/ true);
   }
@@ -242,6 +286,9 @@ std::vector<Block> BlockManagerPool::allocate(size_t num_tokens,
 }
 
 bool BlockManagerPool::try_allocate(Sequence* sequence) {
+  DCHECK(sequence != nullptr);
+  const size_t cacheable_num_tokens =
+      get_policy_cacheable_tokens(sequence, sequence->tokens().size());
   int32_t dp_rank = get_dp_rank(sequence);
   const bool needs_embedding_id = !sequence->has_embedding_id();
   if (needs_embedding_id && !allocate_embedding_id(sequence, dp_rank)) {
@@ -255,25 +302,29 @@ bool BlockManagerPool::try_allocate(Sequence* sequence) {
         0, sequence->kv_state().shared_kv_blocks_num());
     // If the sequence holds shared_blocks, the hash values of these blocks do
     // not need to be recalculated and can be reused directly.
+    const size_t match_tokens =
+        std::min(cacheable_num_tokens, sequence->num_tokens());
+    auto token_slice = sequence->tokens().slice(0, match_tokens);
     shared_blocks = block_managers_[dp_rank]->allocate_shared(
-        sequence->tokens(), existed_shared_blocks);
+        token_slice, existed_shared_blocks);
 
     if (!shared_blocks.empty()) {
-      sequence->add_kv_blocks(shared_blocks);
-      sequence->kv_state().incr_shared_kv_blocks_num(shared_blocks.size());
-      shared_num = shared_blocks.size();
+      sequence->add_shared_kv_blocks(std::move(shared_blocks));
+      shared_num = sequence->kv_state().shared_kv_blocks_num();
     }
   }
 
   const size_t block_size = options_.block_size();
-  size_t num_tokens = sequence->tokens().size() - shared_num * block_size;
+  const size_t shared_tokens =
+      std::min(cacheable_num_tokens, shared_num * block_size);
+  size_t num_tokens = cacheable_num_tokens - shared_tokens;
 
   const size_t num_blocks_needed = (num_tokens + block_size - 1) / block_size;
   if (num_blocks_needed > 0) {
     const auto blocks = block_managers_[dp_rank]->allocate(num_blocks_needed);
     if (blocks.size() != num_blocks_needed) {
-      if (shared_num != 0) {
-        block_managers_[dp_rank]->deallocate(shared_blocks);
+      if (sequence->kv_state().num_kv_blocks() != 0) {
+        block_managers_[dp_rank]->deallocate(sequence->kv_state().kv_blocks());
         sequence->reset();
       }
       if (needs_embedding_id) {
@@ -285,7 +336,10 @@ bool BlockManagerPool::try_allocate(Sequence* sequence) {
     sequence->add_kv_blocks(std::move(blocks));
   }
 
-  sequence->kv_state().incr_kv_cache_tokens_num(sequence->tokens().size());
+  const size_t cached_tokens = sequence->kv_state().kv_cache_tokens_num();
+  CHECK_GE(cacheable_num_tokens, cached_tokens);
+  sequence->kv_state().incr_kv_cache_tokens_num(cacheable_num_tokens -
+                                                cached_tokens);
   return true;
 }
 
@@ -317,6 +371,11 @@ bool BlockManagerPool::process_beam_search(Sequence* sequence, bool need_swap) {
 }
 
 void BlockManagerPool::allocate_shared(Sequence* sequence) {
+  allocate_shared(sequence,
+                  get_policy_cacheable_tokens(sequence, sequence->num_tokens()));
+}
+
+void BlockManagerPool::allocate_shared(Sequence* sequence, size_t num_tokens) {
   // only allocate shared blocks for prefill sequences
   if (options_.enable_prefix_cache()) {
     int32_t dp_rank = get_dp_rank(sequence);
@@ -324,8 +383,10 @@ void BlockManagerPool::allocate_shared(Sequence* sequence) {
         0, sequence->kv_state().shared_kv_blocks_num());
     // If the sequence holds shared_blocks, the hash values of these blocks do
     // not need to be recalculated and can be reused directly.
+    const size_t match_tokens = std::min(num_tokens, sequence->num_tokens());
+    auto token_slice = sequence->tokens().slice(0, match_tokens);
     std::vector<Block> shared_blocks =
-        block_managers_[dp_rank]->allocate_shared(sequence->tokens(),
+        block_managers_[dp_rank]->allocate_shared(token_slice,
                                                   existed_shared_blocks);
     sequence->add_shared_kv_blocks(std::move(shared_blocks));
   }

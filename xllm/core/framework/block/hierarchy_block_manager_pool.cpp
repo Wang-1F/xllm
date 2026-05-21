@@ -15,10 +15,50 @@ limitations under the License.
 
 #include "hierarchy_block_manager_pool.h"
 
+#include <algorithm>
+
 #include "block_manager_impl.h"
+#include "common/rec_model_utils.h"
 #include "concurrent_block_manager_impl.h"
 
 namespace xllm {
+namespace {
+
+constexpr const char* kMtgrSegmentOffsetsName = "segment_offsets";
+
+size_t get_policy_cacheable_tokens(const Sequence* sequence,
+                                   size_t default_num_tokens) {
+  DCHECK(sequence != nullptr);
+  if (sequence->rec_type() != RecType::kMtgr) {
+    return default_num_tokens;
+  }
+
+  auto offsets_opt =
+      sequence->get_mm_data().get<torch::Tensor>(kMtgrSegmentOffsetsName);
+  CHECK(offsets_opt.has_value())
+      << "MTGR sequence requires segment_offsets to derive cache policy";
+  auto offsets =
+      offsets_opt.value().to(torch::kInt32).cpu().contiguous();
+  if (offsets.dim() == 2 && offsets.size(0) == 1) {
+    offsets = offsets.view({offsets.size(1)}).contiguous();
+  }
+  CHECK_EQ(offsets.dim(), 1) << "MTGR segment_offsets must be 1-D or [1, N]";
+  CHECK_GE(offsets.size(0), 2)
+      << "MTGR segment_offsets must include at least begin and end";
+
+  const auto* offsets_ptr = offsets.data_ptr<int32_t>();
+  const int32_t prefix_match_limit =
+      offsets_ptr[static_cast<int64_t>(offsets.size(0)) - 2];
+  const int32_t logical_total_len =
+      offsets_ptr[static_cast<int64_t>(offsets.size(0)) - 1];
+  CHECK_EQ(static_cast<size_t>(logical_total_len), sequence->num_tokens())
+      << "MTGR segment_offsets last element must match sequence length";
+  const int32_t cacheable_len =
+      mtgr_cacheable_len_for_policy(prefix_match_limit, logical_total_len);
+  return static_cast<size_t>(cacheable_len);
+}
+
+}  // namespace
 
 HierarchyBlockManagerPool::HierarchyBlockManagerPool(
     const BlockManagerPool::Options& options,
@@ -112,7 +152,8 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
 
   if (sequence->host_kv_state().num_kv_blocks() == 0 &&
       sequence->stage() != SequenceStage::DECODE) {
-    allocate_host_shared(sequence);
+    allocate_host_shared(
+        sequence, get_policy_cacheable_tokens(sequence, num_tokens));
   }
 
   int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
@@ -164,7 +205,8 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
 
   if (sequence->host_kv_state().num_kv_blocks() == 0 &&
       sequence->stage() != SequenceStage::DECODE) {
-    allocate_host_shared(sequence);
+    allocate_host_shared(
+        sequence, get_policy_cacheable_tokens(sequence, num_tokens));
   }
 
   int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
@@ -198,10 +240,18 @@ void HierarchyBlockManagerPool::allocate_shared(Sequence* sequence) {
 }
 
 void HierarchyBlockManagerPool::allocate_host_shared(Sequence* sequence) {
+  allocate_host_shared(
+      sequence, get_policy_cacheable_tokens(sequence, sequence->num_tokens()));
+}
+
+void HierarchyBlockManagerPool::allocate_host_shared(Sequence* sequence,
+                                                     size_t num_tokens) {
   if (options_.enable_prefix_cache()) {
     int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
+    const size_t match_tokens = std::min(num_tokens, sequence->num_tokens());
+    auto token_slice = sequence->tokens().slice(0, match_tokens);
     std::vector<Block> shared_blocks =
-        host_block_managers_[dp_rank]->allocate_shared(sequence->tokens());
+        host_block_managers_[dp_rank]->allocate_shared(token_slice);
     sequence->add_shared_host_kv_blocks(std::move(shared_blocks));
   }
 }
@@ -216,18 +266,23 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
     DCHECK(prefill_sequence.get() != nullptr);
 
     int32_t dp_rank = BlockManagerPool::get_dp_rank(prefill_sequence.get());
+    const size_t cacheable_tokens = get_policy_cacheable_tokens(
+        prefill_sequence.get(), prefill_sequence->num_tokens());
+    auto token_slice = prefill_sequence->tokens().slice(
+        0, std::min(cacheable_tokens, prefill_sequence->num_tokens()));
     std::vector<Block> shared_blocks =
-        host_block_managers_[dp_rank]->allocate_shared(
-            prefill_sequence->tokens());
+        host_block_managers_[dp_rank]->allocate_shared(token_slice);
     prefill_sequence->add_shared_host_kv_blocks(std::move(shared_blocks));
 
     // round down to the nearest block number
     size_t shared_blocks_num =
         prefill_sequence->host_kv_state().shared_kv_blocks_num();
+    const size_t target_host_blocks =
+        (cacheable_tokens + options_.block_size() - 1) / options_.block_size();
     const size_t num_additional_blocks =
-        (prefill_sequence->num_tokens() + options_.block_size() - 1) /
-            options_.block_size() -
-        shared_blocks_num;
+        target_host_blocks > shared_blocks_num
+            ? target_host_blocks - shared_blocks_num
+            : 0;
     if (num_additional_blocks <= 1) {
       continue;
     }

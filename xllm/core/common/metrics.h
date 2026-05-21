@@ -128,6 +128,9 @@ DECLARE_COUNTER(prefix_cache_latency_seconds_insert);
 DECLARE_COUNTER(prefix_cache_latency_seconds_match);
 DECLARE_COUNTER(prefix_cache_latency_seconds_evict);
 DECLARE_COUNTER(prefix_cache_match_length_total);
+DECLARE_COUNTER(prefix_cache_evict_requests_total);
+DECLARE_COUNTER(prefix_cache_requested_evict_blocks_total);
+DECLARE_COUNTER(prefix_cache_evicted_blocks_total);
 DECLARE_COUNTER(allocate_blocks_latency_seconds);
 
 // latency of detokenization operations in seconds

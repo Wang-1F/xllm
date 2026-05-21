@@ -183,7 +183,7 @@ __global__ void mtgr_kv_writeback_bf16_kernel(
 
   const int32_t matched = matched_prefix_lens[row];
   const int32_t cacheable_end =
-      segment_offsets[row * segment_offsets_stride + num_segments - 1];
+      segment_offsets[row * segment_offsets_stride + num_segments];
   const int64_t write_elems =
       static_cast<int64_t>(cacheable_end - matched) * elems_per_token;
   if (linear >= write_elems) {

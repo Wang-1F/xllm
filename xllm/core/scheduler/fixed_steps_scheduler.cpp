@@ -56,14 +56,14 @@ size_t get_mtgr_cacheable_len(const Sequence* sequence) {
   CHECK_GE(offsets.size(0), 2)
       << "MTGR segment_offsets must include at least begin and end";
   const auto* offsets_ptr = offsets.data_ptr<int32_t>();
-  const int32_t cacheable_len = offsets_ptr[offsets.size(0) - 2];
+  const int32_t prefix_match_limit =
+      offsets_ptr[static_cast<int64_t>(offsets.size(0)) - 2];
   const int32_t total_len = offsets_ptr[offsets.size(0) - 1];
-  CHECK_GE(cacheable_len, 0) << "MTGR cacheable length must be non-negative";
-  CHECK_LE(cacheable_len, total_len)
-      << "MTGR cacheable length cannot exceed total length";
+  CHECK_GE(total_len, 0) << "MTGR sequence length must be non-negative";
   CHECK_EQ(static_cast<size_t>(total_len), sequence->num_tokens())
       << "MTGR segment_offsets last element must match sequence length";
-  return static_cast<size_t>(cacheable_len);
+  return static_cast<size_t>(
+      mtgr_cacheable_len_for_policy(prefix_match_limit, total_len));
 }
 
 }  // namespace

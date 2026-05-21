@@ -19,6 +19,7 @@ limitations under the License.
 #include <unordered_set>
 
 #include "framework/prefix_cache/prefix_cache_factory.h"
+#include "util/mtgr_trace.h"
 namespace xllm {
 
 BlockManagerImpl::BlockManagerImpl(const Options& options)
@@ -103,10 +104,29 @@ bool BlockManagerImpl::has_enough_blocks(uint32_t num_blocks) {
   }
 
   // try to evict some blocks from the prefix cache
-  const uint32_t n_blocks_to_evict = num_blocks - num_free_blocks_;
+  const size_t free_blocks_before =
+      num_free_blocks_.load(std::memory_order_relaxed);
+  if (num_blocks <= free_blocks_before) {
+    return true;
+  }
+  const size_t cache_blocks_before = prefix_cache_->num_blocks();
+  const uint32_t n_blocks_to_evict =
+      static_cast<uint32_t>(num_blocks - free_blocks_before);
 
   AUTO_COUNTER(prefix_cache_latency_seconds_evict);
   const uint32_t n_blocks_evicted = prefix_cache_->evict(n_blocks_to_evict);
+  COUNTER_INC(prefix_cache_evict_requests_total);
+  COUNTER_ADD(prefix_cache_requested_evict_blocks_total, n_blocks_to_evict);
+  COUNTER_ADD(prefix_cache_evicted_blocks_total, n_blocks_evicted);
+  MTGR_TRACE(1) << "[PREFIX_CACHE] evict requested_blocks="
+                << n_blocks_to_evict
+                << " evicted_blocks=" << n_blocks_evicted
+                << " need_blocks=" << num_blocks
+                << " free_blocks_before=" << free_blocks_before
+                << " free_blocks_after="
+                << num_free_blocks_.load(std::memory_order_relaxed)
+                << " cache_blocks_before=" << cache_blocks_before
+                << " cache_blocks_after=" << prefix_cache_->num_blocks();
   if (n_blocks_evicted < n_blocks_to_evict) {
     return false;
   }

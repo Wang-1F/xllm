@@ -23,13 +23,15 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-TEST(RecMasterInternalTest, BuildMtgrPromptTokensKeepsOnlyPrefixCacheable) {
+TEST(RecMasterInternalTest,
+     BuildMtgrPromptTokensKeepsOnlyPrefixCacheableForHopper) {
   const std::optional<std::vector<int32_t>> prompt_tokens =
       std::vector<int32_t>{10, 11, 12, 13, 14, 15};
   const auto built = rec_master_internal::build_mtgr_prompt_tokens(
       prompt_tokens,
       /*total_seq_len=*/6,
       /*cacheable_prefix_len=*/4,
+      MTGRCachePolicy::kPrefixOnly,
       /*unique_salt=*/7);
 
   ASSERT_EQ(built.size(), 6u);
@@ -41,11 +43,32 @@ TEST(RecMasterInternalTest, BuildMtgrPromptTokensKeepsOnlyPrefixCacheable) {
   EXPECT_NE(built[5], 15);
 }
 
+TEST(RecMasterInternalTest,
+     BuildMtgrPromptTokensKeepsFullSequenceCacheableForFlashInferBase) {
+  const std::optional<std::vector<int32_t>> prompt_tokens =
+      std::vector<int32_t>{10, 11, 12, 13, 14, 15};
+  const auto built = rec_master_internal::build_mtgr_prompt_tokens(
+      prompt_tokens,
+      /*total_seq_len=*/6,
+      /*cacheable_prefix_len=*/4,
+      MTGRCachePolicy::kFullSequence,
+      /*unique_salt=*/7);
+
+  ASSERT_EQ(built.size(), 6u);
+  EXPECT_EQ(built[0], 10);
+  EXPECT_EQ(built[1], 11);
+  EXPECT_EQ(built[2], 12);
+  EXPECT_EQ(built[3], 13);
+  EXPECT_EQ(built[4], 14);
+  EXPECT_EQ(built[5], 15);
+}
+
 TEST(RecMasterInternalTest, BuildMtgrPromptTokensWithoutIdsDisablesReuse) {
   const auto built = rec_master_internal::build_mtgr_prompt_tokens(
       std::nullopt,
       /*total_seq_len=*/5,
       /*cacheable_prefix_len=*/4,
+      MTGRCachePolicy::kFullSequence,
       /*unique_salt=*/11);
 
   ASSERT_EQ(built.size(), 5u);

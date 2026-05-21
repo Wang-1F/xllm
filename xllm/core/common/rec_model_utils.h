@@ -18,6 +18,8 @@ limitations under the License.
 #include <cstdint>
 #include <string_view>
 
+#include <glog/logging.h>
+
 #include "core/common/global_flags.h"
 
 namespace xllm {
@@ -36,6 +38,15 @@ enum class RecPipelineType : uint8_t {
   kOneRecDefault = 2,             // OneRec
   kLlmRecMultiRoundPipeline = 3,  // LlmRec multi-round pipeline (device loop)
   kRecPrefillOnly = 4,            // Rec prefill-only pipeline
+};
+
+enum class MTGRCachePolicy : uint8_t {
+  // Conservative baseline: cache and write back the full logical sequence,
+  // including the target segment.
+  kFullSequence = 0,
+  // Optimized Hopper experiment: cache only the reusable prefix and keep the
+  // target segment live for the current request.
+  kPrefixOnly = 1,
 };
 
 // Check if Rec multi-round mode is enabled.
@@ -91,6 +102,53 @@ inline constexpr RecModelKind get_rec_model_kind(std::string_view model_type) {
     return RecModelKind::kLlmRec;
   }
   return RecModelKind::kNone;
+}
+
+inline bool is_mtgr_flashinfer_token_mask_backend() {
+  return FLAGS_mtgr_attention_backend == "flashinfer_token_mask";
+}
+
+inline bool is_mtgr_hopper_backend() {
+  return FLAGS_mtgr_attention_backend == "hopper";
+}
+
+inline MTGRCachePolicy get_mtgr_cache_policy() {
+  if (is_mtgr_flashinfer_token_mask_backend()) {
+    return MTGRCachePolicy::kFullSequence;
+  }
+  if (is_mtgr_hopper_backend()) {
+    return MTGRCachePolicy::kPrefixOnly;
+  }
+  CHECK(false) << "Unsupported MTGR attention backend: "
+               << FLAGS_mtgr_attention_backend
+               << ". Expected hopper or flashinfer_token_mask.";
+  return MTGRCachePolicy::kPrefixOnly;
+}
+
+inline const char* mtgr_cache_policy_name(MTGRCachePolicy policy) {
+  switch (policy) {
+    case MTGRCachePolicy::kFullSequence:
+      return "full_sequence";
+    case MTGRCachePolicy::kPrefixOnly:
+      return "prefix_only";
+  }
+  CHECK(false) << "Unknown MTGR cache policy";
+  return "unknown";
+}
+
+inline const char* current_mtgr_cache_policy_name() {
+  return mtgr_cache_policy_name(get_mtgr_cache_policy());
+}
+
+inline int32_t mtgr_cacheable_len_for_policy(int32_t prefix_match_limit,
+                                             int32_t logical_total_len) {
+  CHECK_GE(prefix_match_limit, 0)
+      << "MTGR prefix match limit must be non-negative";
+  CHECK_GE(logical_total_len, prefix_match_limit)
+      << "MTGR logical total length must cover the prefix match limit";
+  return get_mtgr_cache_policy() == MTGRCachePolicy::kFullSequence
+             ? logical_total_len
+             : prefix_match_limit;
 }
 
 }  // namespace xllm

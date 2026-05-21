@@ -21,6 +21,8 @@ limitations under the License.
 #include <cstdint>
 #include <optional>
 
+#include "core/common/global_flags.h"
+#include "core/common/rec_model_utils.h"
 #include "layers/common/attention_metadata.h"
 #include "framework/request/sequence.h"
 #include "util/mtgr_nvtx.h"
@@ -137,17 +139,20 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
       CHECK_GE(offsets.size(0), 2)
           << "MTGR segment_offsets must include at least begin and end";
       const auto* offsets_ptr = offsets.data_ptr<int32_t>();
-      const int32_t cacheable_len =
+      const int32_t prefix_match_limit =
           offsets_ptr[static_cast<int64_t>(offsets.size(0)) - 2];
       const int32_t logical_total_len =
           offsets_ptr[static_cast<int64_t>(offsets.size(0)) - 1];
+      const int32_t cacheable_len =
+          mtgr_cacheable_len_for_policy(prefix_match_limit, logical_total_len);
       CHECK_EQ(logical_total_len, total_input_len)
           << "MTGR segment_offsets last element must match input length";
-      CHECK_LE(cacheable_len, logical_total_len)
-          << "MTGR cacheable length cannot exceed total length";
-      CHECK_GE(cacheable_len, 0) << "MTGR cacheable length must be non-negative";
+      CHECK_LE(prefix_match_limit, logical_total_len)
+          << "MTGR prefix match limit cannot exceed total length";
+      CHECK_GE(prefix_match_limit, 0)
+          << "MTGR prefix match limit must be non-negative";
       CHECK_LE(matched_prefix, cacheable_len)
-          << "MTGR matched prefix cannot exceed cacheable length";
+          << "MTGR matched prefix cannot exceed backend cacheable length";
       if (matched_prefix > 0) {
         const auto blocks = sequence->kv_state().kv_blocks();
         CHECK(!blocks.empty())
@@ -166,6 +171,9 @@ ForwardInput RecPrefillOnlyBatchInputBuilder::build_rec_forward_input(
                     << (uses_embedding ? "input_embedding" : "token_ids")
                     << " total_input_len=" << total_input_len
                     << " cacheable_len=" << cacheable_len
+                    << " cache_policy="
+                    << current_mtgr_cache_policy_name()
+                    << " prefix_match_limit=" << prefix_match_limit
                     << " matched_prefix=" << matched_prefix
                     << " local_q_len=" << local_q_len
                     << " q_start=" << packed_q_start;

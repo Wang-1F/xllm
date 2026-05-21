@@ -403,9 +403,14 @@ HFModelLoader::HFModelLoader(const std::string& model_weights_path)
       model_weights_files_.push_back(entry.path().string());
     }
   }
-  CHECK(!model_weights_files_.empty())
+  CHECK(!model_weights_files_.empty() || args_.model_type() == "mtgr")
       << "Failed to find model weights files in " << model_weights_path;
-  // sort the model weights files by name
+
+  if (model_weights_files_.empty()) {
+    LOG(INFO) << "No safetensors weights found in " << model_weights_path
+              << "; MTGR will fake-initialize weights from config.json.";
+  }
+
   std::sort(model_weights_files_.begin(), model_weights_files_.end());
 
   threadpool_ = std::make_unique<ThreadPool>(32);

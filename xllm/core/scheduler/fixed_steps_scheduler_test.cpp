@@ -23,6 +23,7 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "continuous_scheduler.h"
 #include "distributed_runtime/engine.h"
+#include "framework/request/mm_type.h"
 #include "framework/request/rec_type.h"
 
 namespace xllm {
@@ -62,11 +63,13 @@ class FakeTokenizer : public Tokenizer {
 
 class FakeEngine : public Engine {
  public:
-  FakeEngine(int32_t num_blocks, int32_t block_size) {
+  FakeEngine(int32_t num_blocks,
+             int32_t block_size,
+             bool enable_prefix_cache = false) {
     BlockManagerPool::Options opt;
     opt.num_blocks_ = num_blocks;
     opt.block_size_ = block_size;
-    opt.enable_prefix_cache_ = false;
+    opt.enable_prefix_cache_ = enable_prefix_cache;
     fake_tokenizer_ = std::make_unique<FakeTokenizer>();
     fake_block_manager_ = std::make_unique<BlockManagerPool>(opt, 1);
   }
@@ -116,6 +119,45 @@ ContinuousScheduler::Options CreateOptions(
   return opt;
 }
 
+int32_t MtgrMatchedPrefix(const ForwardInput& input) {
+  const auto* mtgr_params = input.input_params.mtgr_params();
+  CHECK(mtgr_params != nullptr);
+  auto matched =
+      mtgr_params->mtgr_matched_prefix_lens_i32.to(torch::kCPU).contiguous();
+  CHECK_EQ(matched.numel(), 1);
+  return matched.data_ptr<int32_t>()[0];
+}
+
+void DrainPrefixCacheForDestruction(BlockManagerPool* block_manager_pool) {
+  int32_t dp_rank = 0;
+  const size_t alloc_tokens =
+      static_cast<size_t>(block_manager_pool->num_blocks() - 1) *
+      block_manager_pool->block_size();
+  auto blocks = block_manager_pool->allocate(alloc_tokens, dp_rank);
+  EXPECT_EQ(blocks.size(),
+            static_cast<size_t>(block_manager_pool->num_blocks() - 1));
+}
+
+MMData MakeMtgrMMData(int32_t prompt_len, int32_t cacheable_prefix_len) {
+  CHECK_GE(prompt_len, 2);
+  CHECK_GE(cacheable_prefix_len, 0);
+  CHECK_LE(cacheable_prefix_len, prompt_len);
+  MMData mm_data;
+  const auto i32_options = torch::TensorOptions().dtype(torch::kInt32);
+  const auto i64_options = torch::TensorOptions().dtype(torch::kInt64);
+  mm_data.add(MMType::EMBEDDING,
+              "segment_offsets",
+              torch::tensor({0, cacheable_prefix_len, prompt_len},
+                            i32_options));
+  mm_data.add(MMType::EMBEDDING,
+              "segment_rules",
+              torch::tensor({0, 2}, i32_options));
+  mm_data.add(MMType::EMBEDDING,
+              "token_ids",
+              torch::arange(prompt_len, i64_options));
+  return mm_data;
+}
+
 std::vector<std::shared_ptr<Request>> GenRequests(
     const std::vector<int32_t>& prompt_lens,
     const std::vector<int32_t>& max_tokens,
@@ -133,21 +175,43 @@ std::vector<std::shared_ptr<Request>> GenRequests(
     stopping_checker.set_max_generated_tokens(max_tokens[i]);
     stopping_checker.set_max_context_len(max_context_len);
     stopping_checker.set_ignore_eos(true);
-    RequestState req_state("x",
-                           prompt_token_ids,
-                           sampling_param,
-                           scheduler_param,
-                           stopping_checker,
-                           static_cast<size_t>(prompt_lens[i]) + 30000,
-                           1,
-                           1,
-                           false,
-                           false,
-                           false,
-                           false,
-                           false,
-                           nullptr,
-                           nullptr);
+    RequestState req_state;
+    if (rec_type == RecType::kMtgr) {
+      const int32_t cacheable_prefix_len = prompt_lens[i] / 2;
+      req_state = RequestState("x",
+                               prompt_token_ids,
+                               MakeMtgrMMData(prompt_lens[i],
+                                               cacheable_prefix_len),
+                               sampling_param,
+                               stopping_checker,
+                               static_cast<size_t>(prompt_lens[i]) + 30000,
+                               1,
+                               1,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               nullptr,
+                               nullptr);
+      req_state.scheduler_param = scheduler_param;
+    } else {
+      req_state = RequestState("x",
+                               prompt_token_ids,
+                               sampling_param,
+                               scheduler_param,
+                               stopping_checker,
+                               static_cast<size_t>(prompt_lens[i]) + 30000,
+                               1,
+                               1,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               nullptr,
+                               nullptr);
+    }
     req_state.rec_type = rec_type;
     auto request =
         std::make_shared<Request>("1", "1", "1", std::move(req_state), "1");
@@ -245,6 +309,161 @@ TEST(FixedStepsSchedulerTest, PrepareBatchMtgrAllocatesKvBlocks) {
   ASSERT_EQ(sequences.size(), 1u);
   EXPECT_GT(sequences[0]->kv_state().num_kv_blocks(), 0u);
   EXPECT_EQ(base->get_running_requests().size(), 1u);
+}
+
+TEST(FixedStepsSchedulerTest, PrepareBatchMtgrHopperAllocatesPrefixOnlyKv) {
+  const std::string old_backend = FLAGS_mtgr_attention_backend;
+  FLAGS_enable_prefix_cache = true;
+  FLAGS_mtgr_attention_backend = "hopper";
+  FLAGS_prefill_scheduling_memory_usage_threshold = 1.0;
+  auto engine = std::make_unique<FakeEngine>(64, 8);
+  auto opt = CreateOptions(10000, 256);
+  FixedStepsScheduler scheduler(engine.get(), opt);
+  auto requests = GenRequests({64}, {10}, RecType::kMtgr);
+  scheduler.add_request(requests[0]);
+
+  ContinuousScheduler* base = &scheduler;
+  std::vector<Batch> batches = base->prepare_batch_test();
+
+  ASSERT_FALSE(batches.empty());
+  auto sequences = batches[0].get_sequences();
+  ASSERT_EQ(sequences.size(), 1u);
+  EXPECT_EQ(sequences[0]->kv_state().current_max_tokens_capacity(), 32u);
+
+  FLAGS_mtgr_attention_backend = old_backend;
+}
+
+TEST(FixedStepsSchedulerTest,
+     PrepareBatchMtgrFlashInferBaseAllocatesFullSequenceKv) {
+  const std::string old_backend = FLAGS_mtgr_attention_backend;
+  FLAGS_enable_prefix_cache = true;
+  FLAGS_mtgr_attention_backend = "flashinfer_token_mask";
+  FLAGS_prefill_scheduling_memory_usage_threshold = 1.0;
+  auto engine = std::make_unique<FakeEngine>(64, 8);
+  auto opt = CreateOptions(10000, 256);
+  FixedStepsScheduler scheduler(engine.get(), opt);
+  auto requests = GenRequests({64}, {10}, RecType::kMtgr);
+  scheduler.add_request(requests[0]);
+
+  ContinuousScheduler* base = &scheduler;
+  std::vector<Batch> batches = base->prepare_batch_test();
+
+  ASSERT_FALSE(batches.empty());
+  auto sequences = batches[0].get_sequences();
+  ASSERT_EQ(sequences.size(), 1u);
+  EXPECT_EQ(sequences[0]->kv_state().current_max_tokens_capacity(), 64u);
+
+  FLAGS_mtgr_attention_backend = old_backend;
+}
+
+TEST(FixedStepsSchedulerTest, MtgrHopperPrefixCacheMatchesOnlyPrefix) {
+  const bool old_enable_prefix_cache = FLAGS_enable_prefix_cache;
+  const std::string old_backend = FLAGS_mtgr_attention_backend;
+  FLAGS_enable_prefix_cache = true;
+  FLAGS_mtgr_attention_backend = "hopper";
+  FLAGS_prefill_scheduling_memory_usage_threshold = 1.0;
+
+  auto engine = std::make_unique<FakeEngine>(
+      /*num_blocks=*/128, /*block_size=*/8, /*enable_prefix_cache=*/true);
+  auto opt = CreateOptions(10000, 256);
+
+  auto first_requests = GenRequests({64}, {10}, RecType::kMtgr);
+  {
+    FixedStepsScheduler scheduler(engine.get(), opt);
+    scheduler.add_request(first_requests[0]);
+    ContinuousScheduler* base = &scheduler;
+    std::vector<Batch> batches = base->prepare_batch_test();
+
+    ASSERT_FALSE(batches.empty());
+    ASSERT_FALSE(batches[0].empty());
+    ForwardInput input =
+        batches[0].prepare_rec_forward_input(1, 1, engine->model_args());
+    EXPECT_EQ(MtgrMatchedPrefix(input), 0);
+    auto sequences = batches[0].get_sequences();
+    ASSERT_EQ(sequences.size(), 1u);
+    EXPECT_EQ(sequences[0]->kv_state().kv_cache_tokens_num(), 32u);
+    EXPECT_EQ(sequences[0]->kv_state().current_max_tokens_capacity(), 32u);
+  }
+  engine->block_manager_pool()->deallocate(first_requests[0].get());
+
+  auto second_requests = GenRequests({64}, {10}, RecType::kMtgr);
+  {
+    FixedStepsScheduler scheduler(engine.get(), opt);
+    scheduler.add_request(second_requests[0]);
+    ContinuousScheduler* base = &scheduler;
+    std::vector<Batch> batches = base->prepare_batch_test();
+
+    ASSERT_FALSE(batches.empty());
+    ASSERT_FALSE(batches[0].empty());
+    ForwardInput input =
+        batches[0].prepare_rec_forward_input(1, 1, engine->model_args());
+    EXPECT_EQ(MtgrMatchedPrefix(input), 32);
+    auto sequences = batches[0].get_sequences();
+    ASSERT_EQ(sequences.size(), 1u);
+    EXPECT_EQ(sequences[0]->kv_state().kv_cache_tokens_num(), 32u);
+    EXPECT_EQ(sequences[0]->kv_state().current_max_tokens_capacity(), 32u);
+  }
+  engine->block_manager_pool()->deallocate(second_requests[0].get());
+  DrainPrefixCacheForDestruction(engine->block_manager_pool());
+
+  FLAGS_enable_prefix_cache = old_enable_prefix_cache;
+  FLAGS_mtgr_attention_backend = old_backend;
+}
+
+TEST(FixedStepsSchedulerTest,
+     MtgrFlashInferBasePrefixCacheCanMatchFullSequence) {
+  const bool old_enable_prefix_cache = FLAGS_enable_prefix_cache;
+  const std::string old_backend = FLAGS_mtgr_attention_backend;
+  FLAGS_enable_prefix_cache = true;
+  FLAGS_mtgr_attention_backend = "flashinfer_token_mask";
+  FLAGS_prefill_scheduling_memory_usage_threshold = 1.0;
+
+  auto engine = std::make_unique<FakeEngine>(
+      /*num_blocks=*/128, /*block_size=*/8, /*enable_prefix_cache=*/true);
+  auto opt = CreateOptions(10000, 256);
+
+  auto first_requests = GenRequests({64}, {10}, RecType::kMtgr);
+  {
+    FixedStepsScheduler scheduler(engine.get(), opt);
+    scheduler.add_request(first_requests[0]);
+    ContinuousScheduler* base = &scheduler;
+    std::vector<Batch> batches = base->prepare_batch_test();
+
+    ASSERT_FALSE(batches.empty());
+    ASSERT_FALSE(batches[0].empty());
+    ForwardInput input =
+        batches[0].prepare_rec_forward_input(1, 1, engine->model_args());
+    EXPECT_EQ(MtgrMatchedPrefix(input), 0);
+    auto sequences = batches[0].get_sequences();
+    ASSERT_EQ(sequences.size(), 1u);
+    EXPECT_EQ(sequences[0]->kv_state().kv_cache_tokens_num(), 64u);
+    EXPECT_EQ(sequences[0]->kv_state().current_max_tokens_capacity(), 64u);
+  }
+  engine->block_manager_pool()->deallocate(first_requests[0].get());
+
+  auto second_requests = GenRequests({64}, {10}, RecType::kMtgr);
+  {
+    FixedStepsScheduler scheduler(engine.get(), opt);
+    scheduler.add_request(second_requests[0]);
+    ContinuousScheduler* base = &scheduler;
+    std::vector<Batch> batches = base->prepare_batch_test();
+
+    ASSERT_FALSE(batches.empty());
+    ASSERT_FALSE(batches[0].empty());
+    ForwardInput input =
+        batches[0].prepare_rec_forward_input(1, 1, engine->model_args());
+    EXPECT_EQ(MtgrMatchedPrefix(input), 56);
+    EXPECT_GT(MtgrMatchedPrefix(input), 32);
+    auto sequences = batches[0].get_sequences();
+    ASSERT_EQ(sequences.size(), 1u);
+    EXPECT_EQ(sequences[0]->kv_state().kv_cache_tokens_num(), 64u);
+    EXPECT_EQ(sequences[0]->kv_state().current_max_tokens_capacity(), 64u);
+  }
+  engine->block_manager_pool()->deallocate(second_requests[0].get());
+  DrainPrefixCacheForDestruction(engine->block_manager_pool());
+
+  FLAGS_enable_prefix_cache = old_enable_prefix_cache;
+  FLAGS_mtgr_attention_backend = old_backend;
 }
 
 }  // namespace xllm

@@ -55,6 +55,13 @@ DEFINE_COUNTER(prefix_cache_latency_seconds_evict,
 DEFINE_COUNTER(prefix_cache_match_length_total,
                "Length of matched prefix in tokens");
 
+DEFINE_COUNTER(prefix_cache_evict_requests_total,
+               "Total number of prefix cache eviction attempts");
+DEFINE_COUNTER(prefix_cache_requested_evict_blocks_total,
+               "Total number of requested prefix cache eviction blocks");
+DEFINE_COUNTER(prefix_cache_evicted_blocks_total,
+               "Total number of evicted prefix cache blocks");
+
 DEFINE_COUNTER(allocate_blocks_latency_seconds,
                "Latency of blocks allocation in seconds");
 

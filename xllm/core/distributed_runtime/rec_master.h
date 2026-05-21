@@ -20,6 +20,7 @@ limitations under the License.
 #include <optional>
 #include <thread>
 
+#include "common/rec_model_utils.h"
 #include "framework/chat_template/jinja_chat_template.h"
 #include "framework/model/model_args.h"
 #include "framework/request/rec_type.h"
@@ -38,6 +39,7 @@ std::vector<int32_t> build_mtgr_prompt_tokens(
     const std::optional<std::vector<int32_t>>& prompt_tokens,
     int32_t total_seq_len,
     int32_t cacheable_prefix_len,
+    MTGRCachePolicy cache_policy,
     uint64_t unique_salt);
 
 }  // namespace rec_master_internal

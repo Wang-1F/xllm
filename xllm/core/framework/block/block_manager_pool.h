@@ -95,6 +95,7 @@ class BlockManagerPool : public KVCacheManager {
   bool process_beam_search(Sequence* sequence, bool need_swap = false);
   bool allocate_embedding_id(Sequence* sequence, int32_t dp_rank);
   void deallocate_embedding_id(Sequence* sequence, int32_t dp_rank);
+  void allocate_shared(Sequence* sequence, size_t num_tokens);
 
  private:
   std::vector<std::vector<BlockTransferInfo>> swap_block_transfer_infos_;

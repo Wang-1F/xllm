@@ -654,7 +654,7 @@ void run_mtgr_kv_writeback_reference(
   std::vector<int64_t> dst_slots;
   for (int64_t row = 0; row < batch_size; ++row) {
     const int64_t matched = matched_acc[row];
-    const int64_t cacheable_end = offsets_acc[row][num_segments - 1];
+    const int64_t cacheable_end = offsets_acc[row][num_segments];
     const int64_t q_start = q_starts_acc[row];
     CHECK_LE(matched, cacheable_end);
     for (int64_t logical_token = matched; logical_token < cacheable_end;

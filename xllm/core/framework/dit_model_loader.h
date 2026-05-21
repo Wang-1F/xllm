@@ -37,6 +37,7 @@ class DiTFolderLoader : public ModelLoader {
   std::string model_weights_path() const override {
     return model_weights_path_;
   }
+  bool has_model_weights() const override { return !model_weights_files_.empty(); }
 
  private:
   bool load_args(const std::string& model_weights_path);

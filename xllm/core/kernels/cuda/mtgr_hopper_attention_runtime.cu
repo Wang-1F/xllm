@@ -47,7 +47,7 @@ __global__ void mtgr_kv_cache_writeback_bf16_kernel(
     const int32_t* __restrict__ q_seq_starts,
     const int32_t* __restrict__ matched_prefix_lens,
     const int32_t* __restrict__ block_table,
-    int32_t num_segments,
+    int32_t cacheable_end_offset_index,
     int32_t segment_offsets_stride,
     int32_t block_table_stride,
     int32_t block_size,
@@ -61,7 +61,7 @@ __global__ void mtgr_kv_cache_writeback_bf16_kernel(
 
   const int32_t matched = matched_prefix_lens[row];
   const int32_t cacheable_end =
-      segment_offsets[row * segment_offsets_stride + num_segments - 1];
+      segment_offsets[row * segment_offsets_stride + cacheable_end_offset_index];
   const int64_t write_elems =
       static_cast<int64_t>(cacheable_end - matched) * elems_per_token;
   if (linear >= write_elems) {
@@ -184,6 +184,57 @@ __global__ void mtgr_build_flashinfer_token_mask_kernel(
   packed_mask[mask_begin + byte_delta] = packed;
 }
 
+__global__ void mtgr_gather_full_kv_cache_bf16_kernel(
+    const __nv_bfloat16* __restrict__ key_cache,
+    const __nv_bfloat16* __restrict__ value_cache,
+    __nv_bfloat16* __restrict__ full_key_snd,
+    __nv_bfloat16* __restrict__ full_value_snd,
+    const int32_t* __restrict__ segment_offsets,
+    const int32_t* __restrict__ kv_seq_starts,
+    const int32_t* __restrict__ block_table,
+    int32_t num_segments,
+    int32_t segment_offsets_stride,
+    int32_t block_table_stride,
+    int32_t block_size,
+    int32_t num_kv_heads,
+    int32_t head_dim) {
+  const int32_t row = static_cast<int32_t>(blockIdx.x);
+  const int64_t elems_per_token =
+      static_cast<int64_t>(num_kv_heads) * head_dim;
+  const int64_t linear =
+      static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+
+  const int32_t request_start = segment_offsets[row * segment_offsets_stride];
+  const int32_t total_len =
+      segment_offsets[row * segment_offsets_stride + num_segments] -
+      request_start;
+  const int64_t read_elems =
+      static_cast<int64_t>(total_len) * elems_per_token;
+  if (linear >= read_elems) {
+    return;
+  }
+
+  const int32_t token = static_cast<int32_t>(linear / elems_per_token);
+  const int32_t elem = static_cast<int32_t>(linear - token * elems_per_token);
+  const int32_t kv_head = elem / head_dim;
+  const int32_t dim = elem - kv_head * head_dim;
+  const int32_t logical_block = token / block_size;
+  const int32_t block_offset = token - logical_block * block_size;
+  const int32_t physical_block =
+      block_table[row * block_table_stride + logical_block];
+  const int64_t src_idx =
+      (((static_cast<int64_t>(physical_block) * block_size + block_offset) *
+            num_kv_heads +
+        kv_head) *
+           head_dim) +
+      dim;
+  const int64_t dst_token = kv_seq_starts[row] + token;
+  const int64_t dst_idx =
+      (dst_token * num_kv_heads + kv_head) * head_dim + dim;
+  full_key_snd[dst_idx] = key_cache[src_idx];
+  full_value_snd[dst_idx] = value_cache[src_idx];
+}
+
 struct MtgrFlashinferWorkspaceBuffers {
   torch::Tensor float_workspace;
   torch::Tensor int_workspace;
@@ -266,44 +317,26 @@ MtgrFlashinferPlan mtgr_build_token_mask_prefill_plan(
   const int64_t batch_size = q_cu_seq_lens_host.size(0) - 1;
   auto plan_func = get_function(plan.uri, "plan");
   ffi::Array<int64_t> plan_result =
-      xllm::Device::is_support_sm90a()
-          ? plan_func(to_ffi_tensor(ws.float_workspace),
-                      to_ffi_tensor(ws.int_workspace),
-                      to_ffi_tensor(ws.page_locked_int_workspace),
-                      to_ffi_tensor(q_cu_seq_lens_host),
-                      to_ffi_tensor(kv_cu_seq_lens_host),
-                      to_ffi_tensor(kv_len_arr_host),
-                      total_num_rows,
-                      batch_size,
-                      num_qo_heads,
-                      num_kv_heads,
-                      /*page_size=*/1,
-                      /*enable_cuda_graph=*/false,
-                      head_dim_qk,
-                      head_dim_vo,
-                      /*causal=*/false,
-                      /*window_size_left=*/-1)
-                .cast<ffi::Array<int64_t>>()
-          : plan_func(to_ffi_tensor(ws.float_workspace),
-                      to_ffi_tensor(ws.int_workspace),
-                      to_ffi_tensor(ws.page_locked_int_workspace),
-                      to_ffi_tensor(q_cu_seq_lens_host),
-                      to_ffi_tensor(kv_cu_seq_lens_host),
-                      to_ffi_tensor(kv_len_arr_host),
-                      total_num_rows,
-                      batch_size,
-                      num_qo_heads,
-                      num_kv_heads,
-                      /*page_size=*/1,
-                      /*enable_cuda_graph=*/false,
-                      head_dim_qk,
-                      head_dim_vo,
-                      /*causal=*/false,
-                      /*window_size_left=*/-1,
-                      /*fixed_split_size=*/-1,
-                      /*disable_split_kv=*/false,
-                      /*num_colocated_ctas=*/0)
-                .cast<ffi::Array<int64_t>>();
+      plan_func(to_ffi_tensor(ws.float_workspace),
+                to_ffi_tensor(ws.int_workspace),
+                to_ffi_tensor(ws.page_locked_int_workspace),
+                to_ffi_tensor(q_cu_seq_lens_host),
+                to_ffi_tensor(kv_cu_seq_lens_host),
+                to_ffi_tensor(kv_len_arr_host),
+                total_num_rows,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                /*page_size=*/1,
+                /*enable_cuda_graph=*/false,
+                head_dim_qk,
+                head_dim_vo,
+                /*causal=*/false,
+                /*window_size_left=*/-1,
+                /*fixed_split_size=*/-1,
+                /*disable_split_kv=*/false,
+                /*num_colocated_ctas=*/0)
+          .cast<ffi::Array<int64_t>>();
   plan.plan_info = mtgr_deep_copy_plan_info(plan_result);
   return plan;
 }
@@ -362,8 +395,6 @@ MtgrTokenMaskHostMetadata mtgr_build_token_mask_host_metadata(
         row + 1 < metadata.batch_size ? q_starts[row + 1]
                                       : static_cast<int32_t>(total_q);
     const int32_t q_len = q_end - q_start;
-    CHECK_EQ(matched[row], 0)
-        << "MTGR FlashInfer token-mask E2E base does not use prefix cache";
     CHECK_EQ(q_len, total_len - matched[row])
         << "MTGR token-mask base expects production live-Q layout";
     const int64_t mask_bytes = mtgr_packed_mask_bytes(q_len, total_len);
@@ -438,10 +469,6 @@ void mtgr_flashinfer_token_mask_attention_cuda(
     double sm_scale,
     torch::Tensor output_snd) {
   MTGR_NVTX_RANGE(1, "MTGR/kernel/flashinfer_token_mask_base");
-  (void)key_cache;
-  (void)value_cache;
-  (void)block_table_i32;
-  (void)block_size;
   if (query_snd.numel() == 0) {
     return;
   }
@@ -452,6 +479,19 @@ void mtgr_flashinfer_token_mask_attention_cuda(
   const int64_t num_q_heads = query_snd.size(1);
   const int64_t num_kv_heads = key_snd.size(1);
   const int64_t head_dim = query_snd.size(2);
+  CHECK_EQ(query_snd.dim(), 3);
+  CHECK_EQ(key_snd.dim(), 3);
+  CHECK_EQ(value_snd.sizes(), key_snd.sizes());
+  CHECK_EQ(key_snd.size(0), total_q)
+      << "MTGR FlashInfer token-mask base expects live K input";
+  CHECK_EQ(key_snd.size(2), head_dim);
+  CHECK_EQ(key_cache.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(value_cache.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(key_cache.size(2), num_kv_heads);
+  CHECK_EQ(value_cache.size(2), num_kv_heads);
+  CHECK_EQ(key_cache.size(3), head_dim);
+  CHECK_EQ(value_cache.size(3), head_dim);
+  CHECK_EQ(block_table_i32.scalar_type(), torch::kInt32);
 
   MtgrTokenMaskHostMetadata host_meta;
   {
@@ -469,10 +509,42 @@ void mtgr_flashinfer_token_mask_attention_cuda(
   auto q_cu_dev = q_cu_host.to(device).contiguous();
   auto kv_cu_dev = kv_cu_host.to(device).contiguous();
   auto mask_indptr_dev = mask_indptr_host.to(device).contiguous();
-  CHECK_EQ(key_snd.size(0), host_meta.total_kv_len)
-      << "MTGR FlashInfer token-mask base expects full logical K input";
-  CHECK_EQ(value_snd.size(0), host_meta.total_kv_len)
-      << "MTGR FlashInfer token-mask base expects full logical V input";
+  auto full_key_snd =
+      torch::empty({host_meta.total_kv_len, num_kv_heads, head_dim},
+                   key_snd.options());
+  auto full_value_snd =
+      torch::empty({host_meta.total_kv_len, num_kv_heads, head_dim},
+                   value_snd.options());
+  {
+    MTGR_NVTX_RANGE(2,
+                    "MTGR/kernel/flashinfer_token_mask_base/gather_full_kv");
+    constexpr int threads = 256;
+    const int64_t elems_per_request =
+        host_meta.max_kv_len * num_kv_heads * head_dim;
+    dim3 grid(static_cast<unsigned int>(host_meta.batch_size),
+              static_cast<unsigned int>((elems_per_request + threads - 1) /
+                                        threads));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    mtgr_gather_full_kv_cache_bf16_kernel<<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(
+            key_cache.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(
+            value_cache.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(
+            full_key_snd.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(
+            full_value_snd.data_ptr<at::BFloat16>()),
+        segment_offsets_i32.data_ptr<int32_t>(),
+        kv_cu_dev.data_ptr<int32_t>(),
+        block_table_i32.data_ptr<int32_t>(),
+        static_cast<int32_t>(host_meta.num_segments),
+        static_cast<int32_t>(segment_offsets_i32.stride(0)),
+        static_cast<int32_t>(block_table_i32.stride(0)),
+        static_cast<int32_t>(block_size),
+        static_cast<int32_t>(num_kv_heads),
+        static_cast<int32_t>(head_dim));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 
   auto packed_mask =
       torch::empty({host_meta.total_mask_bytes},
@@ -517,8 +589,8 @@ void mtgr_flashinfer_token_mask_attention_cuda(
         to_ffi_tensor(ws.int_workspace),
         plan.plan_info,
         to_ffi_tensor(query_snd),
-        to_ffi_tensor(key_snd),
-        to_ffi_tensor(value_snd),
+        to_ffi_tensor(full_key_snd),
+        to_ffi_tensor(full_value_snd),
         to_ffi_tensor(q_cu_dev),
         to_ffi_tensor(kv_cu_dev),
         to_ffi_tensor(output_snd),
@@ -599,6 +671,73 @@ void mtgr_kv_cache_writeback_cuda(
       matched_prefix_lens_i32.data_ptr<int32_t>(),
       block_table_i32.data_ptr<int32_t>(),
       static_cast<int32_t>(num_segments),
+      static_cast<int32_t>(segment_offsets_i32.stride(0)),
+      static_cast<int32_t>(block_table_i32.stride(0)),
+      static_cast<int32_t>(key_cache.size(1)),
+      static_cast<int32_t>(num_kv_heads),
+      static_cast<int32_t>(head_dim));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mtgr_kv_cache_prefix_writeback_cuda(
+    const torch::Tensor& key_snd,
+    const torch::Tensor& value_snd,
+    const torch::Tensor& segment_offsets_i32,
+    const torch::Tensor& q_seq_starts_i32,
+    const torch::Tensor& matched_prefix_lens_i32,
+    const torch::Tensor& block_table_i32,
+    const torch::Tensor& key_cache,
+    const torch::Tensor& value_cache,
+    int64_t max_request_len) {
+  MTGR_NVTX_RANGE(1, "MTGR/kernel/kv_prefix_writeback");
+  if (key_snd.numel() == 0 || block_table_i32.numel() == 0 ||
+      max_request_len <= 0) {
+    return;
+  }
+  CHECK_EQ(key_snd.dim(), 3);
+  CHECK_EQ(value_snd.sizes(), key_snd.sizes());
+  CHECK_EQ(key_snd.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(value_snd.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(key_cache.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(value_cache.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(segment_offsets_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(q_seq_starts_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(matched_prefix_lens_i32.scalar_type(), torch::kInt32);
+  CHECK_EQ(block_table_i32.scalar_type(), torch::kInt32);
+
+  c10::cuda::CUDAGuard guard(key_snd.device());
+  const int64_t batch_size = segment_offsets_i32.size(0);
+  const int64_t num_segments = segment_offsets_i32.size(1) - 1;
+  const int64_t num_kv_heads = key_snd.size(1);
+  const int64_t head_dim = key_snd.size(2);
+  CHECK_GE(num_segments, 1);
+  CHECK_EQ(key_cache.size(2), num_kv_heads);
+  CHECK_EQ(value_cache.size(2), num_kv_heads);
+  CHECK_EQ(key_cache.size(3), head_dim);
+  CHECK_EQ(value_cache.size(3), head_dim);
+
+  const int64_t elems_per_request = max_request_len * num_kv_heads * head_dim;
+  if (batch_size == 0 || elems_per_request == 0) {
+    return;
+  }
+
+  constexpr int threads = 256;
+  dim3 grid(static_cast<unsigned int>(batch_size),
+            static_cast<unsigned int>((elems_per_request + threads - 1) /
+                                      threads));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  mtgr_kv_cache_writeback_bf16_kernel<<<grid, threads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(
+          key_snd.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const __nv_bfloat16*>(
+          value_snd.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(key_cache.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(value_cache.data_ptr<at::BFloat16>()),
+      segment_offsets_i32.data_ptr<int32_t>(),
+      q_seq_starts_i32.data_ptr<int32_t>(),
+      matched_prefix_lens_i32.data_ptr<int32_t>(),
+      block_table_i32.data_ptr<int32_t>(),
+      static_cast<int32_t>(num_segments - 1),
       static_cast<int32_t>(segment_offsets_i32.stride(0)),
       static_cast<int32_t>(block_table_i32.stride(0)),
       static_cast<int32_t>(key_cache.size(1)),

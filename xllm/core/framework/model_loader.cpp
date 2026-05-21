@@ -31,7 +31,7 @@ namespace xllm {
 
 std::unique_ptr<ModelLoader> ModelLoader::create(
     const std::string& model_weights_path) {
-  ModelType model_type;
+  ModelType model_type = ModelType::INVALID;
   for (const auto& entry :
        std::filesystem::directory_iterator(model_weights_path)) {
     if (entry.path().extension() == ".safetensors" ||
@@ -41,10 +41,18 @@ std::unique_ptr<ModelLoader> ModelLoader::create(
     }
   }
 
+  if (model_type == ModelType::INVALID &&
+      std::filesystem::exists(
+          std::filesystem::path(model_weights_path) / "config.json")) {
+    model_type = ModelType::HF_MODEL_TYPE;
+  }
+
   if (model_type == ModelType::HF_MODEL_TYPE) {
     return std::make_unique<HFModelLoader>(model_weights_path);
   } else {
-    LOG(FATAL) << "Only support HF model type currently.";
+    LOG(FATAL) << "Only support HF model type currently. Expected config.json "
+                  "or model weights under "
+               << model_weights_path;
   }
 
   return nullptr;

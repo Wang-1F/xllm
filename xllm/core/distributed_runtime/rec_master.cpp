@@ -97,6 +97,7 @@ std::vector<int32_t> build_mtgr_prompt_tokens(
     const std::optional<std::vector<int32_t>>& prompt_tokens,
     int32_t total_seq_len,
     int32_t cacheable_prefix_len,
+    MTGRCachePolicy cache_policy,
     uint64_t unique_salt) {
   std::vector<int32_t> result(total_seq_len);
   if (prompt_tokens.has_value()) {
@@ -108,9 +109,13 @@ std::vector<int32_t> build_mtgr_prompt_tokens(
     return result;
   }
 
-  // MTGR only allows prefix-cache reuse before the target segment. Make the
-  // target segment request-unique so cached KV never skips the required target
-  // forward.
+  if (cache_policy == MTGRCachePolicy::kFullSequence) {
+    return result;
+  }
+
+  // Hopper experiment only allows prefix-cache reuse before the target segment.
+  // Make the target segment request-unique so cached KV never skips the
+  // required target forward.
   for (int32_t pos = cacheable_prefix_len; pos < total_seq_len; ++pos) {
     result[pos] = make_mtgr_non_cacheable_token(unique_salt, pos);
   }
@@ -425,6 +430,7 @@ void process_mtgr_inputs(
                 << (uses_token_ids ? "token_ids" : "input_embedding")
                 << " total_seq_len=" << total_seq_len
                 << " cacheable_prefix_len=" << cacheable_prefix_len
+                << " cache_policy=" << current_mtgr_cache_policy_name()
                 << " segment_offsets_shape=" << segment_offsets_i32->sizes()
                 << " segment_rules_shape=" << segment_rules_i32->sizes();
 
@@ -445,6 +451,7 @@ void process_mtgr_inputs(
       prompt_tokens_for_cache,
       total_seq_len,
       cacheable_prefix_len,
+      get_mtgr_cache_policy(),
       next_mtgr_prompt_token_salt());
 
   MMDict mm_dict;

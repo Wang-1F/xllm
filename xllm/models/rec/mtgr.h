@@ -20,6 +20,8 @@ limitations under the License.
 
 #include <algorithm>
 #include <cmath>
+#include <sstream>
+#include <string>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -151,6 +153,8 @@ class MTGRModelImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
+    validate_and_track_config_parameter_shapes(state_dict);
+
     for (size_t i = 0; i < layers_.size(); ++i) {
       layers_[i]->load_state_dict(
           state_dict.get_dict_with_prefix("layers." + std::to_string(i) + "."));
@@ -163,7 +167,214 @@ class MTGRModelImpl : public torch::nn::Module {
     }
   }
 
+  void begin_load_state_dict() {
+    fake_initialize_post_mlp_weights_from_config();
+    loaded_config_parameters_.clear();
+  }
+
+  void fake_initialize_all_weights_from_config() {
+    torch::NoGradGuard no_grad;
+    for (auto& param : parameters()) {
+      param.zero_();
+    }
+  }
+
+  void fake_initialize_post_mlp_weights_from_config() {
+    torch::NoGradGuard no_grad;
+    for (auto& param : post_mlp_->parameters()) {
+      param.zero_();
+    }
+  }
+
+  void finalize_load_state_dict() {
+    const auto specs = mtgr_config_parameter_specs();
+    std::vector<std::string> missing_required;
+    std::vector<std::string> missing_post_mlp;
+
+    for (const auto& spec : specs) {
+      if (loaded_config_parameters_.contains(spec.name)) {
+        continue;
+      }
+      if (is_post_mlp_parameter(spec.name)) {
+        missing_post_mlp.push_back(spec.name);
+      } else {
+        missing_required.push_back(spec.name);
+      }
+    }
+
+    CHECK(missing_required.empty())
+        << "Missing MTGR checkpoint weights required by config.json mapping: "
+        << join_strings(missing_required);
+
+    if (missing_post_mlp.empty()) {
+      return;
+    }
+
+    std::vector<std::string> loaded_post_mlp;
+    for (const auto& spec : mtgr_post_mlp_parameter_specs()) {
+      if (loaded_config_parameters_.contains(spec.name)) {
+        loaded_post_mlp.push_back(spec.name);
+      }
+    }
+    LOG(WARNING) << "Incomplete MTGR post_mlp checkpoint weights according to "
+                    "config.json mapping; fake-initialized missing weights to "
+                    "zero: missing "
+                 << join_strings(missing_post_mlp) << ", loaded "
+                 << join_strings(loaded_post_mlp);
+  }
+
  private:
+  struct MTGRParameterSpec {
+    std::string name;
+    std::vector<int64_t> shape;
+    std::vector<std::string> config_fields;
+  };
+
+  static bool is_post_mlp_parameter(const std::string& name) {
+    return name.rfind("post_mlp.", 0) == 0;
+  }
+
+  static std::string join_strings(const std::vector<std::string>& values) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (i > 0) {
+        oss << ", ";
+      }
+      oss << values[i];
+    }
+    oss << "]";
+    return oss.str();
+  }
+
+  static std::string shape_to_string(const std::vector<int64_t>& shape) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+      if (i > 0) {
+        oss << ", ";
+      }
+      oss << shape[i];
+    }
+    oss << "]";
+    return oss.str();
+  }
+
+  std::vector<MTGRParameterSpec> mtgr_config_parameter_specs() const {
+    // xLLM sees checkpoint names after load_model strips the top-level
+    // "model." prefix; vLLM uses the same mapping with that prefix attached.
+    const int64_t hidden_size = model_args_.hidden_size();
+    const int64_t intermediate_size = model_args_.intermediate_size();
+    const int64_t num_layers = model_args_.n_layers();
+    const int64_t num_heads = model_args_.n_heads();
+    const int64_t num_kv_heads =
+        model_args_.n_kv_heads().value_or(model_args_.n_heads());
+    const int64_t head_dim = model_args_.head_dim();
+    const bool attention_bias = model_args_.attention_bias();
+
+    std::vector<MTGRParameterSpec> specs;
+    specs.reserve(1 + num_layers * (attention_bias ? 15 : 12) + 4);
+
+    auto add = [&](std::string name,
+                   std::vector<int64_t> shape,
+                   std::vector<std::string> config_fields) {
+      specs.push_back(MTGRParameterSpec{
+          std::move(name), std::move(shape), std::move(config_fields)});
+    };
+
+    const std::vector<std::string> hidden_fields = {"hidden_size"};
+    const std::vector<std::string> mlp_fields = {
+        "hidden_size", "intermediate_size", "hidden_act"};
+    const std::vector<std::string> q_fields = {
+        "hidden_size", "num_attention_heads", "head_dim"};
+    const std::vector<std::string> kv_fields = {
+        "hidden_size", "num_key_value_heads", "head_dim"};
+
+    for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      const std::string prefix = "layers." + std::to_string(layer_id);
+      add(prefix + ".input_layernorm.weight", {hidden_size}, hidden_fields);
+      add(prefix + ".self_attn.q_proj.weight",
+          {num_heads * head_dim, hidden_size},
+          q_fields);
+      add(prefix + ".self_attn.k_proj.weight",
+          {num_kv_heads * head_dim, hidden_size},
+          kv_fields);
+      add(prefix + ".self_attn.v_proj.weight",
+          {num_kv_heads * head_dim, hidden_size},
+          kv_fields);
+      if (attention_bias) {
+        add(prefix + ".self_attn.q_proj.bias",
+            {num_heads * head_dim},
+            q_fields);
+        add(prefix + ".self_attn.k_proj.bias",
+            {num_kv_heads * head_dim},
+            kv_fields);
+        add(prefix + ".self_attn.v_proj.bias",
+            {num_kv_heads * head_dim},
+            kv_fields);
+      }
+      add(prefix + ".self_attn.o_proj.weight",
+          {hidden_size, num_heads * head_dim},
+          q_fields);
+      add(prefix + ".self_attn.q_norm.weight", {head_dim}, {"head_dim"});
+      add(prefix + ".self_attn.k_norm.weight", {head_dim}, {"head_dim"});
+      add(prefix + ".post_attention_layernorm.weight",
+          {hidden_size},
+          hidden_fields);
+      add(prefix + ".mlp.gate_proj.weight",
+          {intermediate_size, hidden_size},
+          mlp_fields);
+      add(prefix + ".mlp.up_proj.weight",
+          {intermediate_size, hidden_size},
+          mlp_fields);
+      add(prefix + ".mlp.down_proj.weight",
+          {hidden_size, intermediate_size},
+          mlp_fields);
+    }
+
+    add("norm.weight", {hidden_size}, hidden_fields);
+    for (auto& spec : mtgr_post_mlp_parameter_specs()) {
+      specs.push_back(std::move(spec));
+    }
+    return specs;
+  }
+
+  std::vector<MTGRParameterSpec> mtgr_post_mlp_parameter_specs() const {
+    const int64_t hidden_size = model_args_.hidden_size();
+    const int64_t intermediate_size = model_args_.intermediate_size();
+    const std::vector<std::string> mlp_fields = {
+        "hidden_size", "intermediate_size", "hidden_act"};
+    return {
+        {"post_mlp.gate_proj.weight",
+         {intermediate_size, hidden_size},
+         mlp_fields},
+        {"post_mlp.up_proj.weight",
+         {intermediate_size, hidden_size},
+         mlp_fields},
+        {"post_mlp.down_proj.weight",
+         {hidden_size, intermediate_size},
+         mlp_fields},
+    };
+  }
+
+  void validate_and_track_config_parameter_shapes(const StateDict& state_dict) {
+    for (const auto& spec : mtgr_config_parameter_specs()) {
+      auto tensor = state_dict.get_tensor(spec.name);
+      if (!tensor.defined()) {
+        continue;
+      }
+      const auto actual_shape = tensor.sizes().vec();
+      CHECK(actual_shape == spec.shape)
+          << "MTGR checkpoint parameter shape does not match config.json "
+             "mapping for "
+          << state_dict.prefix() << spec.name << ": got "
+          << shape_to_string(actual_shape) << ", expected "
+          << shape_to_string(spec.shape) << " from "
+          << join_strings(spec.config_fields);
+      loaded_config_parameters_.insert(spec.name);
+    }
+  }
+
   torch::Tensor fake_input_embedding_lookup(const torch::Tensor& token_ids) {
     auto ids = token_ids.to(device_).to(torch::kFloat32).reshape({-1, 1});
     auto dims = torch::arange(
@@ -209,6 +420,7 @@ class MTGRModelImpl : public torch::nn::Module {
   layer::AttentionMask attn_mask_;
   layer::Qwen3NextRMSNorm norm_{nullptr};
   layer::DenseMLP post_mlp_{nullptr};
+  std::unordered_set<std::string> loaded_config_parameters_;
 };
 TORCH_MODULE(MTGRModel);
 
@@ -242,6 +454,12 @@ class MTGRForConditionalGenerationImpl : public torch::nn::Module {
 
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") {
+    if (!loader->has_model_weights()) {
+      model_->fake_initialize_all_weights_from_config();
+      return;
+    }
+
+    model_->begin_load_state_dict();
     for (const auto& state_dict : loader->get_state_dicts()) {
       StateDict model_state_dict = state_dict->get_dict_with_prefix(prefix);
       if (model_state_dict.size() == 0) {
@@ -249,6 +467,7 @@ class MTGRForConditionalGenerationImpl : public torch::nn::Module {
       }
       model_->load_state_dict(model_state_dict);
     }
+    model_->finalize_load_state_dict();
   }
 
   void prepare_expert_weight(int32_t layer_id,

@@ -70,6 +70,7 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
 
  private:
   void allocate_host_shared(Sequence* sequence);
+  void allocate_host_shared(Sequence* sequence, size_t num_tokens);
 
  private:
   Engine* engine_;
