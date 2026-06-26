@@ -1,0 +1,21 @@
+name: ❓ Question
+description: Submit a question
+title: "[Question]: "
+labels: ["question"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed. please search: [existing issues](https://github.com/jd-opensource/xllm/issues).
+- type: textarea
+  attributes:
+    label: ❓ Describe the question
+    description: |
+      Please provide a clear and concise description of your question.
+  validations:
+    required: true
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!

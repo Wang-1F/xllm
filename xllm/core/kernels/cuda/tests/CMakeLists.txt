@@ -1,0 +1,47 @@
+include(cc_library)
+include(cc_test)
+
+cc_library(
+  NAME
+    mtgr_attention_harness_test_utils
+  HDRS
+    mtgr_attention_harness/mtgr_attention_contract.h
+  SRCS
+    mtgr_attention_harness/mtgr_attention_test_utils.cpp
+  DEPS
+    :kv_cache
+    torch
+    glog::glog
+)
+
+cc_test(
+  NAME
+    mtgr_qk_norm_e2e_test
+  SRCS
+    mtgr_qk_norm_harness/mtgr_qk_norm_e2e_test.cpp
+    mtgr_qk_norm_harness/mtgr_qk_norm_test_utils.cpp
+    mtgr_qk_norm_harness/mtgr_qk_norm_backends.cpp
+  DEPS
+    :cuda_layers
+    torch
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
+    mtgr_attention_harness_e2e_test
+  SRCS
+    mtgr_attention_harness/mtgr_attention_e2e_test.cpp
+    mtgr_attention_harness/mtgr_attention_backends.cu
+  DEPS
+    :cuda_layers
+    :cuda_mtgr_hopper_runtime
+    :cuda_kernels
+    :mtgr_attention_harness_test_utils
+    :flags
+    :kv_cache
+    torch
+    GTest::gtest_main
+    glog::glog
+)

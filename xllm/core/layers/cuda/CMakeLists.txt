@@ -1,0 +1,65 @@
+include(cc_library)
+include(cc_test)
+
+cc_library(
+  NAME
+    cuda_layers
+  HDRS
+    attention.h
+    base_attention_impl.h
+    custom_mask_attention.h
+    flashinfer_attention.h
+    mtgr_attention.h
+    mtgr_decoder_layer_impl.h
+    xattention.h
+    xattention_planinfo.h
+    flashinfer_workspace.h
+    xattention_workspace.h
+    flashinfer_planinfo.h
+  SRCS
+    attention.cpp
+    base_attention_impl.cpp
+    custom_mask_attention.cpp
+    xattention.cpp
+    xattention_planinfo.cpp
+    flashinfer_attention.cpp
+    mtgr_attention.cpp
+    mtgr_decoder_layer_impl.cpp
+    flashinfer_workspace.cpp
+    xattention_workspace.cpp
+    flashinfer_planinfo.cpp
+  DEPS
+    :common_layers
+    :cuda_mtgr_hopper_runtime
+)
+
+cc_test(
+  NAME
+    xattention_test
+  SRCS
+    xattention_test.cpp
+  DEPS
+    :cuda_layers
+    :cuda_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+)
+target_link_libraries(xattention_test PRIVATE brpc)
+
+cc_test(
+  NAME
+    custom_mask_attention_integration_test
+  SRCS
+    tests/custom_mask_attention_integration_test.cpp
+  DEPS
+    :cuda_layers
+    :cuda_kernels
+    :mtgr_attention_harness_test_utils
+    :flags
+    :kv_cache
+    torch
+    GTest::gtest_main
+    glog::glog
+)
+target_link_libraries(custom_mask_attention_integration_test PRIVATE brpc)
